@@ -1,0 +1,11 @@
+{
+  "tokens": [
+    {
+      "token_hash": "sha256-of-a-real-secret-token",
+      "actor_id": "000000000000000000",
+      "display_name": "example-user",
+      "enabled": true,
+      "allowed_sources": ["codex", "claude"]
+    }
+  ]
+}

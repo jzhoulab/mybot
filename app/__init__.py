@@ -1,0 +1,1 @@
+"""Shared chatbot application package."""
