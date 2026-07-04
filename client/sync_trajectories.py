@@ -145,16 +145,22 @@ def main() -> None:
             chunk_limit=args.chunk_limit,
         )
         batches = split_batches([record.to_payload() for record in records], args.batch_size)
-        source_totals = {
-            "sessions_discovered": len(sessions),
-            "records_prepared": len(records),
-            "accepted": 0,
-            "inserted": 0,
-            "updated": 0,
-            "unchanged": 0,
-            "rejected": 0,
-            "batch_count": len(batches),
-        }
+        source_totals = totals["sources"].setdefault(
+            adapter.source_name(),
+            {
+                "sessions_discovered": 0,
+                "records_prepared": 0,
+                "accepted": 0,
+                "inserted": 0,
+                "updated": 0,
+                "unchanged": 0,
+                "rejected": 0,
+                "batch_count": 0,
+            },
+        )
+        source_totals["sessions_discovered"] += len(sessions)
+        source_totals["records_prepared"] += len(records)
+        source_totals["batch_count"] += len(batches)
         for index, batch in enumerate(batches):
             batch_id = f"{args.client_id}:{adapter.source_name()}:{index}:{now}"
             result = client.import_batch(
@@ -169,8 +175,6 @@ def main() -> None:
             source_totals["updated"] += int(result.get("updated", 0))
             source_totals["unchanged"] += int(result.get("unchanged", 0))
             source_totals["rejected"] += int(result.get("rejected", 0))
-        totals["sources"][adapter.source_name()] = source_totals
-
     print(json.dumps(totals, indent=2))
 
 

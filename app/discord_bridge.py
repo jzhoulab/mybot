@@ -99,6 +99,26 @@ class BridgeConfig:
     request_timeout_seconds: int
     max_output_tokens: int | None
     command_guild_id: int | None
+    message_coalesce_seconds: float
+
+
+@dataclass
+class PendingChatRequest:
+    actor_id: str
+    user_key: str
+    session_key: str
+    message_text: str
+    memory_scope: str
+    target_user_id: str | None = None
+    discord_message: discord.Message | None = None
+    interaction: discord.Interaction | None = None
+
+
+@dataclass
+class ChatRequestBuffer:
+    requests: list[PendingChatRequest]
+    version: int = 0
+    task: asyncio.Task[None] | None = None
 
 
 class ChatbotApi:
@@ -212,6 +232,7 @@ class DiscordBridgeClient(discord.Client):
         self.api = api
         self.tree = app_commands.CommandTree(self)
         self.safe_mentions = discord.AllowedMentions.none()
+        self.chat_buffers: dict[str, ChatRequestBuffer] = {}
         self._register_commands()
 
     def _register_commands(self) -> None:
@@ -244,28 +265,18 @@ class DiscordBridgeClient(discord.Client):
                 return
 
             await interaction.response.defer(thinking=True)
-            try:
-                response = await self.api.chat(
+            await self._enqueue_chat_request(
+                PendingChatRequest(
                     actor_id=self._actor_id(interaction.user.id),
                     user_key=self._user_key(interaction.user.id),
                     session_key=self._session_key_for_channel(
                         user_id=interaction.user.id,
                         channel=interaction.channel,
                     ),
-                    message=text,
+                    message_text=text,
                     memory_scope="private",
-                    return_sources=False,
+                    interaction=interaction,
                 )
-            except RuntimeError as exc:
-                await interaction.followup.send(
-                    f"Chat request failed: {exc}",
-                    allowed_mentions=self.safe_mentions,
-                )
-                return
-
-            await self._send_interaction_text(
-                interaction,
-                response.get("text") or "(empty response)",
             )
 
         @self.tree.command(
@@ -333,6 +344,12 @@ class DiscordBridgeClient(discord.Client):
     async def on_ready(self) -> None:
         assert self.user is not None
         print(f"Discord bridge logged in as {self.user} ({self.user.id})")
+
+    async def on_disconnect(self) -> None:
+        print("Discord bridge disconnected from Discord; waiting for reconnect.")
+
+    async def on_resumed(self) -> None:
+        print("Discord bridge session resumed after reconnect.")
 
     async def on_message(self, message: discord.Message) -> None:
         if message.author.bot:
@@ -431,29 +448,16 @@ class DiscordBridgeClient(discord.Client):
             user_id=message.author.id,
             channel=message.channel,
         )
-        try:
-            async with message.channel.typing():
-                response = await self.api.chat(
-                    actor_id=self._actor_id(message.author.id),
-                    user_key=self._user_key(message.author.id),
-                    session_key=session_key,
-                    message=text,
-                    memory_scope=memory_scope,
-                    target_user_id=target_user_id,
-                    return_sources=False,
-                )
-        except RuntimeError as exc:
-            await message.channel.send(
-                f"Chat request failed: {exc}",
-                reference=message.to_reference(fail_if_not_exists=False),
-                allowed_mentions=self.safe_mentions,
+        await self._enqueue_chat_request(
+            PendingChatRequest(
+                actor_id=self._actor_id(message.author.id),
+                user_key=self._user_key(message.author.id),
+                session_key=session_key,
+                message_text=text,
+                memory_scope=memory_scope,
+                target_user_id=target_user_id,
+                discord_message=message,
             )
-            return
-
-        await self._send_channel_text(
-            message.channel,
-            response.get("text") or "(empty response)",
-            reference=message,
         )
 
     async def _handle_target_user_chat(self, message: discord.Message, text: str) -> None:
@@ -484,6 +488,148 @@ class DiscordBridgeClient(discord.Client):
             memory_scope="target_user",
             target_user_id=str(target.id),
         )
+
+    def _chat_buffer_key(self, request: PendingChatRequest) -> str:
+        return "|".join(
+            [
+                request.session_key,
+                request.memory_scope,
+                request.target_user_id or "",
+            ]
+        )
+
+    async def _enqueue_chat_request(self, request: PendingChatRequest) -> None:
+        key = self._chat_buffer_key(request)
+        buffer = self.chat_buffers.get(key)
+        if buffer is None:
+            buffer = ChatRequestBuffer(requests=[])
+            self.chat_buffers[key] = buffer
+        buffer.requests.append(request)
+        buffer.version += 1
+        if buffer.task is None or buffer.task.done():
+            buffer.task = asyncio.create_task(self._chat_buffer_worker(key))
+
+    async def _chat_buffer_worker(self, key: str) -> None:
+        try:
+            while True:
+                buffer = self.chat_buffers.get(key)
+                if buffer is None:
+                    return
+
+                delay = max(0.0, self.config.message_coalesce_seconds)
+                if delay:
+                    while True:
+                        version = buffer.version
+                        await asyncio.sleep(delay)
+                        if buffer.version == version:
+                            break
+
+                requests = list(buffer.requests)
+                buffer.requests.clear()
+                if not requests:
+                    return
+
+                await self._send_batched_chat_request(requests)
+                if not buffer.requests:
+                    return
+        finally:
+            buffer = self.chat_buffers.get(key)
+            if buffer is not None and buffer.task is asyncio.current_task():
+                if buffer.requests:
+                    buffer.task = asyncio.create_task(self._chat_buffer_worker(key))
+                else:
+                    self.chat_buffers.pop(key, None)
+
+    async def _send_batched_chat_request(self, requests: list[PendingChatRequest]) -> None:
+        if not requests:
+            return
+        target = requests[-1]
+        combined_message = self._combined_chat_message(requests)
+        try:
+            if target.discord_message is not None:
+                async with target.discord_message.channel.typing():
+                    response = await self.api.chat(
+                        actor_id=target.actor_id,
+                        user_key=target.user_key,
+                        session_key=target.session_key,
+                        message=combined_message,
+                        memory_scope=target.memory_scope,
+                        target_user_id=target.target_user_id,
+                        return_sources=False,
+                    )
+            else:
+                response = await self.api.chat(
+                    actor_id=target.actor_id,
+                    user_key=target.user_key,
+                    session_key=target.session_key,
+                    message=combined_message,
+                    memory_scope=target.memory_scope,
+                    target_user_id=target.target_user_id,
+                    return_sources=False,
+                )
+        except RuntimeError as exc:
+            await self._send_chat_error(target, f"Chat request failed: {exc}")
+            await self._acknowledge_folded_interactions(
+                requests[:-1],
+                "This message was folded into a combined request, but the request failed.",
+            )
+            return
+
+        await self._send_chat_response(target, response.get("text") or "(empty response)")
+        if len(requests) > 1:
+            await self._acknowledge_folded_interactions(
+                requests[:-1],
+                "I folded this into the combined response.",
+            )
+
+    def _combined_chat_message(self, requests: list[PendingChatRequest]) -> str:
+        if len(requests) == 1:
+            return requests[0].message_text
+        lines = ["The user sent these messages in sequence. Answer them together.", ""]
+        for index, request in enumerate(requests, start=1):
+            lines.append(f"{index}. {request.message_text}")
+        return "\n".join(lines)
+
+    async def _send_chat_response(self, request: PendingChatRequest, text: str) -> None:
+        if request.interaction is not None:
+            await self._send_interaction_text(request.interaction, text)
+            return
+        if request.discord_message is not None:
+            await self._send_channel_text(
+                request.discord_message.channel,
+                text,
+                reference=request.discord_message,
+            )
+
+    async def _send_chat_error(self, request: PendingChatRequest, text: str) -> None:
+        if request.interaction is not None:
+            await request.interaction.followup.send(
+                text,
+                allowed_mentions=self.safe_mentions,
+            )
+            return
+        if request.discord_message is not None:
+            await request.discord_message.channel.send(
+                text,
+                reference=request.discord_message.to_reference(fail_if_not_exists=False),
+                allowed_mentions=self.safe_mentions,
+            )
+
+    async def _acknowledge_folded_interactions(
+        self,
+        requests: list[PendingChatRequest],
+        text: str,
+    ) -> None:
+        for request in requests:
+            if request.interaction is None:
+                continue
+            try:
+                await request.interaction.followup.send(
+                    text,
+                    allowed_mentions=self.safe_mentions,
+                )
+            except discord.HTTPException:
+                pass
 
     async def _handle_promote(self, message: discord.Message, *, scope: str, note: str) -> None:
         try:
@@ -704,6 +850,7 @@ def load_config(args: argparse.Namespace) -> BridgeConfig:
     )
     raw_max_output_tokens = os.environ.get("DISCORD_MAX_OUTPUT_TOKENS", "").strip()
     raw_command_guild_id = os.environ.get("DISCORD_COMMAND_GUILD_ID", "").strip()
+    raw_message_coalesce_seconds = os.environ.get("DISCORD_MESSAGE_COALESCE_SECONDS", "1.25").strip()
 
     try:
         max_output_tokens = int(raw_max_output_tokens) if raw_max_output_tokens else None
@@ -714,6 +861,11 @@ def load_config(args: argparse.Namespace) -> BridgeConfig:
         command_guild_id = int(raw_command_guild_id) if raw_command_guild_id else None
     except ValueError as exc:
         raise SystemExit("DISCORD_COMMAND_GUILD_ID must be an integer") from exc
+
+    try:
+        message_coalesce_seconds = float(raw_message_coalesce_seconds)
+    except ValueError as exc:
+        raise SystemExit("DISCORD_MESSAGE_COALESCE_SECONDS must be a number") from exc
 
     return BridgeConfig(
         discord_bot_token=discord_bot_token,
@@ -726,6 +878,7 @@ def load_config(args: argparse.Namespace) -> BridgeConfig:
         request_timeout_seconds=args.request_timeout_seconds,
         max_output_tokens=max_output_tokens,
         command_guild_id=command_guild_id,
+        message_coalesce_seconds=max(0.0, message_coalesce_seconds),
     )
 
 
@@ -734,7 +887,7 @@ def main() -> None:
     config = load_config(args)
     api = ChatbotApi(config)
     client = DiscordBridgeClient(config, api)
-    client.run(config.discord_bot_token)
+    client.run(config.discord_bot_token, reconnect=True)
 
 
 if __name__ == "__main__":

@@ -190,7 +190,8 @@ class ImportRecord:
 
 
 class TrajectorySourceAdapter(ABC):
-    def __init__(self) -> None:
+    def __init__(self, *, account_name: str = "default") -> None:
+        self.account_name = account_name
         self._sessions: list[NormalizedTrajectory] = []
 
     @abstractmethod

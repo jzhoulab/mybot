@@ -1,0 +1,39 @@
+{
+  "version": 1,
+  "policy": {
+    "mode": "per_root_visibility",
+    "description": "Enabled roots use blacklist mode by default. Use visibility_mode=whitelist to allow only included workdirs/classes."
+  },
+  "sources": {
+    "codex": {
+      "roots": [
+        {
+          "name": "default",
+          "base_dir": "~/.codex",
+          "enabled": true,
+          "visibility_mode": "blacklist",
+          "included_workdirs": [],
+          "excluded_workdirs": [],
+          "included_workdir_classes": [],
+          "excluded_workdir_classes": [],
+          "excluded_entrypoints": []
+        }
+      ]
+    },
+    "claude": {
+      "roots": [
+        {
+          "name": "default",
+          "base_dir": "~/.claude/projects",
+          "enabled": true,
+          "visibility_mode": "blacklist",
+          "included_workdirs": [],
+          "excluded_workdirs": [],
+          "included_workdir_classes": [],
+          "excluded_workdir_classes": [],
+          "excluded_entrypoints": []
+        }
+      ]
+    }
+  }
+}

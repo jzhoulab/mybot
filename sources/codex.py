@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import os
 
+from .access import TrajectoryAccessAccount, discover_codex_workdir
 from .common import append_turn, choose_title, make_detailed_summary, make_short_summary, parse_timestamp, recent_files
 from .models import NormalizedTrajectory, TrajectorySourceAdapter
 
@@ -25,9 +26,22 @@ def load_codex_index(base_dir: str) -> dict[str, str]:
 
 
 class CodexSourceAdapter(TrajectorySourceAdapter):
-    def __init__(self, base_dir: str | None = None) -> None:
-        super().__init__()
-        self.base_dir = os.path.expanduser(base_dir or "~/.codex")
+    def __init__(
+        self,
+        base_dir: str | None = None,
+        *,
+        account: TrajectoryAccessAccount | None = None,
+    ) -> None:
+        account = account or TrajectoryAccessAccount(
+            source_name="codex",
+            name="default",
+            base_dir=base_dir or "~/.codex",
+        )
+        if base_dir is not None:
+            account.base_dir = base_dir
+        super().__init__(account_name=account.name)
+        self.account = account
+        self.base_dir = account.expanded_base_dir
 
     def source_name(self) -> str:
         return "codex"
@@ -42,9 +56,14 @@ class CodexSourceAdapter(TrajectorySourceAdapter):
         by_session: dict[str, NormalizedTrajectory] = {}
 
         for path in files:
+            _, discovered_cwd = discover_codex_workdir(path)
+            if not self.account.include_workdir(discovered_cwd):
+                continue
+
             first_ts = None
             last_ts = None
             session_id = ""
+            cwd = discovered_cwd
             turns = []
 
             with open(path) as handle:
@@ -63,10 +82,15 @@ class CodexSourceAdapter(TrajectorySourceAdapter):
 
                     if etype == "session_meta":
                         session_id = payload.get("id", session_id)
+                        cwd = payload.get("cwd") or cwd
                         source = payload.get("source")
                         if isinstance(source, dict) and "subagent" in source:
                             session_id = ""
                             break
+                        continue
+
+                    if etype == "turn_context":
+                        cwd = payload.get("cwd") or cwd
                         continue
 
                     if etype == "response_item" and payload.get("role") == "assistant" and payload.get("type") == "message":
@@ -90,6 +114,8 @@ class CodexSourceAdapter(TrajectorySourceAdapter):
 
             if not session_id:
                 continue
+            if not self.account.include_workdir(cwd):
+                continue
             user_turns = [turn.text for turn in turns if turn.role == "user"]
             assistant_turns = [turn.text for turn in turns if turn.role == "assistant"]
             if not user_turns:
@@ -98,7 +124,12 @@ class CodexSourceAdapter(TrajectorySourceAdapter):
             updated_at = (last_ts or first_ts)
             if updated_at is None:
                 continue
+            raw_session_id = session_id
+            session_id = self.account.scoped_session_id(raw_session_id)
+            if not self.account.include_session(session_id, raw_session_id):
+                continue
             session = NormalizedTrajectory(
+
                 source_name=self.source_name(),
                 session_id=session_id,
                 title=title,
@@ -107,7 +138,12 @@ class CodexSourceAdapter(TrajectorySourceAdapter):
                 turns=turns,
                 short_summary=make_short_summary(title, user_turns, assistant_turns),
                 detailed_summary=make_detailed_summary(title, user_turns, assistant_turns),
-                metadata={"tool": self.source_name()},
+                metadata={
+                    "tool": self.source_name(),
+                    "account": self.account.name,
+                    "raw_session_id": raw_session_id,
+                    "cwd": cwd,
+                },
             )
             existing = by_session.get(session.session_id)
             if existing is None or session.updated_at > existing.updated_at:

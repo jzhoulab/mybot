@@ -4,16 +4,19 @@
 from __future__ import annotations
 
 import json
+import math
 import os
 import re
 import sqlite3
 import threading
+from collections import Counter
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Any
 
 from sources.models import ImportRecord
 from sources.registry import get_source_adapters, list_source_names
+from sources.trajectory_lookup import proximity_score, query_tokens as meaningful_query_tokens
 from trajectory_memory import build_index, write_index
 
 
@@ -242,7 +245,7 @@ class SemanticMemoryStore:
         stamp = utc_now()
         for adapter in get_source_adapters(selected_sources):
             sessions = adapter.discover_sessions(max_files=max_files_per_tool)
-            counts_by_source[adapter.source_name()] = len(sessions)
+            counts_by_source[adapter.source_name()] = counts_by_source.get(adapter.source_name(), 0) + len(sessions)
             records.extend(
                 adapter.to_export_records(
                     actor_id=owner_id,
@@ -557,6 +560,156 @@ class SemanticMemoryStore:
             if len(deduped) >= limit:
                 break
         return deduped
+
+    def lexical_trajectory_search(
+        self,
+        *,
+        query: str,
+        actor_id: str,
+        memory_scope: str,
+        target_user_id: str | None = None,
+        limit: int = 8,
+    ) -> list[dict[str, Any]]:
+        if memory_scope not in VALID_MEMORY_SCOPES:
+            raise ValueError("memory_scope must be 'private', 'shared', or 'target_user'")
+        tokens = set(meaningful_query_tokens(normalize_text(query, 4000)))
+        if not tokens:
+            return []
+
+        if memory_scope == "private":
+            owner_id = normalize_text(actor_id, 128)
+            rows = self._select_rows(
+                """
+                SELECT * FROM memory_items
+                WHERE scope = ? AND owner_actor_id = ? AND source_type = 'trajectory' AND record_kind = 'session'
+                """,
+                ("private", owner_id),
+            )
+        elif memory_scope == "shared":
+            rows = self._select_rows(
+                """
+                SELECT * FROM memory_items
+                WHERE scope = ? AND source_type = 'trajectory' AND record_kind = 'session'
+                """,
+                ("shared",),
+            )
+        else:
+            owner_id = normalize_text(target_user_id or "", 128)
+            if not owner_id:
+                raise ValueError("target_user_id is required when memory_scope=target_user")
+            rows = self._select_rows(
+                """
+                SELECT * FROM memory_items
+                WHERE scope = ? AND owner_actor_id = ? AND source_type = 'trajectory' AND record_kind = 'session'
+                """,
+                ("private", owner_id),
+            )
+
+        phrase = normalize_text(query, 240).lower()
+        haystacks: list[tuple[sqlite3.Row, str, list[str], Counter[str]]] = []
+        document_frequency: dict[str, int] = {token: 0 for token in tokens}
+        for row in rows:
+            haystack = " ".join(
+                [
+                    str(row["title"]),
+                    str(row["summary_short"]),
+                    str(row["summary_detailed"]),
+                    str(row["text"]),
+                    str(row["raw_text"]),
+                    str(row["tags_json"]),
+                    str(row["metadata_json"]),
+                ]
+            ).lower()
+            haystack_token_list = re.findall(r"[A-Za-z0-9_./:-]{3,}", haystack)
+            haystack_counts = Counter(haystack_token_list)
+            haystacks.append((row, haystack, haystack_token_list, haystack_counts))
+            for token in tokens:
+                if haystack_counts.get(token, 0):
+                    document_frequency[token] += 1
+
+        total_documents = max(1, len(haystacks))
+        token_weights = {
+            token: 1.0 + math.log((total_documents + 1) / (document_frequency[token] + 1))
+            for token in tokens
+        }
+
+        ranked: list[tuple[float, sqlite3.Row]] = []
+        token_list = list(tokens)
+        for row, haystack, haystack_token_list, haystack_counts in haystacks:
+            score = 0.0
+            if phrase and len(phrase) >= 6 and phrase in haystack:
+                score += 50.0
+            distinct_matches = 0
+            for token in tokens:
+                count = haystack_counts.get(token, 0)
+                if count:
+                    distinct_matches += 1
+                    score += (1.0 + min(count, 2) * 0.25) * token_weights[token]
+            score += distinct_matches * distinct_matches * 2.0
+            score += proximity_score(haystack_token_list, token_list)
+            if score > 0:
+                ranked.append((score, row))
+
+        ranked.sort(key=lambda item: (item[0], item[1]["updated_at"]), reverse=True)
+        deduped: list[dict[str, Any]] = []
+        seen_refs: set[str] = set()
+        for score, row in ranked:
+            source = self._row_to_source(row, match_score=score)
+            dedupe_key = str(source.get("source_ref"))
+            if dedupe_key in seen_refs:
+                continue
+            seen_refs.add(dedupe_key)
+            deduped.append(source)
+            if len(deduped) >= limit:
+                break
+        return deduped
+
+    def get_trajectory_source(
+        self,
+        *,
+        source_ref: str,
+        actor_id: str,
+        memory_scope: str,
+        target_user_id: str | None = None,
+    ) -> dict[str, Any] | None:
+        if memory_scope not in VALID_MEMORY_SCOPES:
+            raise ValueError("memory_scope must be 'private', 'shared', or 'target_user'")
+        ref = normalize_text(source_ref, 300)
+        if ":chunk:" in ref:
+            ref = ref.split(":chunk:", 1)[0]
+        if not ref:
+            return None
+
+        if memory_scope == "private":
+            owner_id = normalize_text(actor_id, 128)
+            params = ("private", owner_id, ref)
+            query = """
+                SELECT * FROM memory_items
+                WHERE scope = ? AND owner_actor_id = ? AND source_type = 'trajectory'
+                  AND record_kind = 'session' AND source_ref = ?
+            """
+        elif memory_scope == "shared":
+            params = ("shared", ref)
+            query = """
+                SELECT * FROM memory_items
+                WHERE scope = ? AND source_type = 'trajectory'
+                  AND record_kind = 'session' AND source_ref = ?
+            """
+        else:
+            owner_id = normalize_text(target_user_id or "", 128)
+            if not owner_id:
+                raise ValueError("target_user_id is required when memory_scope=target_user")
+            params = ("private", owner_id, ref)
+            query = """
+                SELECT * FROM memory_items
+                WHERE scope = ? AND owner_actor_id = ? AND source_type = 'trajectory'
+                  AND record_kind = 'session' AND source_ref = ?
+            """
+
+        rows = self._select_rows(query, params)
+        if not rows:
+            return None
+        return self._row_to_source(rows[0], match_score=None)
 
     def get_stats(self) -> dict[str, Any]:
         with self._connect() as conn:
