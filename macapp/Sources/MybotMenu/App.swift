@@ -96,7 +96,9 @@ struct ContentView: View {
     var body: some View {
         VStack(spacing: 0) {
             headerBlock
-            if let project = model.detail {
+            if let session = model.trajectory {
+                TrajectoryView(model: model, session: session)
+            } else if let project = model.detail {
                 SessionDetail(model: model, project: project)
             } else {
                 controls
@@ -308,6 +310,12 @@ struct ContentView: View {
                 Divider()
                 Button("Shrink embeddings") { model.runMaintenance("compact_embeddings", label: "Shrinking embeddings") }
                 Button("Reclaim space") { model.runMaintenance("compact", label: "Reclaiming space") }
+                Divider()
+                if model.health.automatedSessions > 0 {
+                    Button("Exclude \(model.health.automatedSessions) automated sessions") { model.excludeAutomated() }
+                } else {
+                    Button("Re-include automated sessions (rebuild)") { model.includeAutomated() }
+                }
             } label: {
                 chipLabel("Maintain", "wrench.and.screwdriver.fill")
             }
@@ -455,7 +463,9 @@ struct SessionDetail: View {
                 ScrollView {
                     VStack(spacing: 6) {
                         ForEach(model.sessions) { session in
-                            SessionRow(session: session) { model.excludeSession(session) }
+                            SessionRow(session: session,
+                                       onOpen: { model.openTrajectory(session) },
+                                       exclude: { model.excludeSession(session) })
                         }
                     }
                     .padding(.horizontal, 12).padding(.vertical, 8)
@@ -468,25 +478,40 @@ struct SessionDetail: View {
 
 struct SessionRow: View {
     let session: Session
+    var onOpen: (() -> Void)? = nil
     let exclude: () -> Void
 
     var body: some View {
         HStack(spacing: 10) {
-            Image(systemName: "bubble.left.and.text.bubble.right")
-                .font(.system(size: 12)).foregroundStyle(.secondary)
-            VStack(alignment: .leading, spacing: 3) {
-                Text(session.displayTitle).font(.system(size: 12.5, weight: .semibold)).lineLimit(1)
-                HStack(spacing: 8) {
-                    Text(session.shortId).font(.system(size: 10, design: .monospaced)).foregroundStyle(.secondary)
-                    Text("·").foregroundStyle(.secondary)
-                    Text("\(session.chunks) chunks").font(.system(size: 10)).foregroundStyle(.secondary)
-                    if !session.updatedAgo.isEmpty {
-                        Text("·").foregroundStyle(.secondary)
-                        Text(session.updatedAgo).font(.system(size: 10)).foregroundStyle(.secondary)
+            Button { onOpen?() } label: {
+                HStack(spacing: 10) {
+                    Image(systemName: "bubble.left.and.text.bubble.right")
+                        .font(.system(size: 12)).foregroundStyle(.secondary)
+                    VStack(alignment: .leading, spacing: 3) {
+                        HStack(spacing: 6) {
+                            Text(session.displayTitle).font(.system(size: 12.5, weight: .semibold)).lineLimit(1)
+                            if session.isAutomated {
+                                Text("AUTO").font(.system(size: 8, weight: .heavy)).tracking(0.3)
+                                    .padding(.horizontal, 4).padding(.vertical, 1.5)
+                                    .background(Capsule().fill(Color.orange.opacity(0.22)))
+                                    .foregroundStyle(.orange)
+                            }
+                        }
+                        HStack(spacing: 8) {
+                            Text(session.shortId).font(.system(size: 10, design: .monospaced)).foregroundStyle(.secondary)
+                            Text("·").foregroundStyle(.secondary)
+                            Text("\(session.chunks) chunks").font(.system(size: 10)).foregroundStyle(.secondary)
+                            if !session.updatedAgo.isEmpty {
+                                Text("·").foregroundStyle(.secondary)
+                                Text(session.updatedAgo).font(.system(size: 10)).foregroundStyle(.secondary)
+                            }
+                        }
                     }
+                    Spacer(minLength: 6)
                 }
+                .contentShape(Rectangle())
             }
-            Spacer(minLength: 6)
+            .buttonStyle(.plain)
             Button(action: exclude) {
                 Text("Exclude")
                     .font(.system(size: 11, weight: .semibold))
@@ -495,9 +520,124 @@ struct SessionRow: View {
                     .foregroundStyle(.red)
             }
             .buttonStyle(.plain)
+            Image(systemName: "chevron.right")
+                .font(.system(size: 10, weight: .semibold))
+                .foregroundStyle(.secondary.opacity(0.6))
         }
         .padding(10)
         .background(RoundedRectangle(cornerRadius: 11, style: .continuous).fill(Color.primary.opacity(0.05)))
+    }
+}
+
+// MARK: - Trajectory viewer
+
+struct TrajectoryView: View {
+    @ObservedObject var model: AppModel
+    let session: Session
+
+    var body: some View {
+        VStack(spacing: 0) {
+            HStack(spacing: 6) {
+                Button { model.closeTrajectory() } label: {
+                    HStack(spacing: 3) {
+                        Image(systemName: "chevron.left").font(.system(size: 11, weight: .bold))
+                        Text("Sessions").font(.system(size: 12, weight: .semibold))
+                    }
+                    .padding(.horizontal, 9).padding(.vertical, 5)
+                    .background(Capsule().fill(Color.primary.opacity(0.06)))
+                }
+                .buttonStyle(.plain)
+                Spacer()
+            }
+            .padding(.horizontal, 14).padding(.top, 4).padding(.bottom, 6)
+
+            VStack(alignment: .leading, spacing: 2) {
+                Text(session.displayTitle).font(.system(size: 13, weight: .bold)).lineLimit(2)
+                Text("\(session.shortId) · \(model.trajectoryEvents.count) events")
+                    .font(.system(size: 10)).foregroundStyle(.secondary)
+            }
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .padding(.horizontal, 16).padding(.bottom, 6)
+
+            Divider().opacity(0.4)
+
+            if model.loadingTrajectory {
+                Spacer(); ProgressView().controlSize(.small); Spacer()
+            } else {
+                ScrollView {
+                    LazyVStack(spacing: 8) {
+                        ForEach(model.trajectoryEvents) { event in EventRow(event: event) }
+                        if model.trajectoryTruncated {
+                            Text("Trajectory truncated — showing the first \(model.trajectoryEvents.count) events")
+                                .font(.system(size: 10)).foregroundStyle(.secondary)
+                                .padding(.top, 4)
+                        }
+                    }
+                    .padding(.horizontal, 12).padding(.vertical, 8)
+                }
+            }
+        }
+        .frame(maxHeight: .infinity)
+    }
+}
+
+struct EventRow: View {
+    let event: TrajectoryEvent
+    @State private var expanded = false
+
+    var body: some View {
+        switch event.kind {
+        case "user": bubble(role: "You", tint: Color.accentColor, align: .trailing)
+        case "assistant": bubble(role: "Assistant", tint: .secondary, align: .leading)
+        case "thinking": foldable(icon: "brain", title: "Thinking", tint: .purple, mono: false, italic: true)
+        case "tool_use": foldable(icon: "wrench.and.screwdriver.fill",
+                                  title: event.tool.isEmpty ? "Tool call" : event.tool, tint: .orange, mono: true)
+        case "tool_result": foldable(icon: "arrow.turn.down.right",
+                                     title: "Result · \(event.text.count) chars", tint: .secondary, mono: true)
+        default: EmptyView()
+        }
+    }
+
+    private func bubble(role: String, tint: Color, align: HorizontalAlignment) -> some View {
+        VStack(alignment: align, spacing: 3) {
+            Text(role.uppercased()).font(.system(size: 8.5, weight: .heavy)).tracking(0.5)
+                .foregroundStyle(tint)
+            Text(event.text)
+                .font(.system(size: 12))
+                .textSelection(.enabled)
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .padding(9)
+                .background(RoundedRectangle(cornerRadius: 10, style: .continuous)
+                    .fill(align == .trailing ? Color.accentColor.opacity(0.12) : Color.primary.opacity(0.05)))
+        }
+        .frame(maxWidth: .infinity, alignment: align == .trailing ? .trailing : .leading)
+    }
+
+    private func foldable(icon: String, title: String, tint: Color, mono: Bool, italic: Bool = false) -> some View {
+        VStack(alignment: .leading, spacing: 0) {
+            Button { expanded.toggle() } label: {
+                HStack(spacing: 6) {
+                    Image(systemName: icon).font(.system(size: 10)).foregroundStyle(tint)
+                    Text(title).font(.system(size: 11, weight: .semibold)).foregroundStyle(tint).lineLimit(1)
+                    Spacer()
+                    Image(systemName: expanded ? "chevron.down" : "chevron.right")
+                        .font(.system(size: 9, weight: .semibold)).foregroundStyle(.secondary)
+                }
+                .contentShape(Rectangle())
+            }
+            .buttonStyle(.plain)
+            if expanded {
+                Text(event.text)
+                    .font(mono ? .system(size: 10.5, design: .monospaced) : .system(size: 11))
+                    .italic(italic)
+                    .textSelection(.enabled)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .padding(.top, 6)
+            }
+        }
+        .padding(9)
+        .background(RoundedRectangle(cornerRadius: 10, style: .continuous).fill(tint.opacity(0.06)))
+        .overlay(RoundedRectangle(cornerRadius: 10, style: .continuous).strokeBorder(tint.opacity(0.16)))
     }
 }
 
@@ -531,7 +671,7 @@ enum UIExporter {
 
             let sampleSessions = [
                 Session(ref: "codex:a1", sessionId: "3f9c2a7b8e01", title: "Fix cluster SU allocation lookup", updatedAt: "2026-07-06T08:00:00Z", chunks: 42),
-                Session(ref: "codex:a2", sessionId: "77d1e0a4bb2f", title: "", updatedAt: "2026-07-05T14:00:00Z", chunks: 18),
+                Session(ref: "codex:a2", sessionId: "77d1e0a4bb2f", title: "", updatedAt: "2026-07-05T14:00:00Z", chunks: 18, origin: "automated"),
                 Session(ref: "codex:a3", sessionId: "c40b9915ee77", title: "Refactor trajectory index embeddings", updatedAt: "2026-07-04T11:00:00Z", chunks: 65),
             ]
             let sessionRows = VStack(spacing: 6) {
@@ -539,6 +679,19 @@ enum UIExporter {
             }
             .padding(12).frame(width: 480).environment(\.colorScheme, scheme).background(bg)
             write(sessionRows, name.replacingOccurrences(of: "ui-", with: "sessions-"))
+
+            let events = [
+                TrajectoryEvent(kind: "user", tool: "", text: "can you read README.md and tell me the best model for variant-effect prediction?"),
+                TrajectoryEvent(kind: "thinking", tool: "", text: "The user wants me to read README.md and find the best model. Let me search for it first."),
+                TrajectoryEvent(kind: "tool_use", tool: "Glob", text: "{\n  \"pattern\": \"**/README.md\"\n}"),
+                TrajectoryEvent(kind: "tool_result", tool: "result", text: "Found: /Users/you/Code/demoapp/README.md"),
+                TrajectoryEvent(kind: "assistant", tool: "", text: "The best model for variant-effect prediction was the fine-tuned baseline-model variant — it beat the baseline by 12% AUROC."),
+            ]
+            let traj = VStack(spacing: 8) {
+                ForEach(events) { EventRow(event: $0) }
+            }
+            .padding(12).frame(width: 480).environment(\.colorScheme, scheme).background(bg)
+            write(traj, name.replacingOccurrences(of: "ui-", with: "traj-"))
         }
     }
 }

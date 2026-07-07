@@ -54,6 +54,12 @@ final class AppModel: ObservableObject {
     @Published var sessions: [Session] = []
     @Published var loadingSessions = false
 
+    // session → trajectory viewer
+    @Published var trajectory: Session?
+    @Published var trajectoryEvents: [TrajectoryEvent] = []
+    @Published var loadingTrajectory = false
+    @Published var trajectoryTruncated = false
+
     let config = MybotConfig.shared
     private var timer: Timer?
 
@@ -188,6 +194,7 @@ final class AppModel: ObservableObject {
             health.indexBytes = indexBytes
             health.memoryBytes = memoryBytes
             health.projectCount = rows.count
+            health.automatedSessions = snapshot.automated
 
             DispatchQueue.main.async {
                 self.projects = projects
@@ -277,6 +284,18 @@ final class AppModel: ObservableObject {
         runAction("\(label)…") { $0.maintenance(action) }
     }
 
+    func excludeAutomated() {
+        runAction("Excluding \(health.automatedSessions) automated sessions…") {
+            $0.run(["automated", "--action", "exclude"])
+        }
+    }
+
+    func includeAutomated() {
+        runAction("Re-including automated sessions…") {
+            $0.run(["automated", "--action", "include"])
+        }
+    }
+
     func openControlRoom() { NSWorkspace.shared.open(config.guiURL) }
 
     // ---- session drill-down -----------------------------------------------
@@ -289,7 +308,7 @@ final class AppModel: ObservableObject {
             let rows = IndexReader(dbPath: cfg.dbPath.path).sessions(source: project.source, cwd: project.cwd)
             let sessions = rows.map {
                 Session(ref: $0.ref, sessionId: $0.sessionId, title: $0.title,
-                        updatedAt: $0.updatedAt, chunks: $0.chunks)
+                        updatedAt: $0.updatedAt, chunks: $0.chunks, origin: $0.origin)
             }
             DispatchQueue.main.async {
                 guard self.detail?.id == project.id else { return }
@@ -302,6 +321,40 @@ final class AppModel: ObservableObject {
     func closeDetail() {
         detail = nil
         sessions = []
+    }
+
+    func openTrajectory(_ session: Session) {
+        trajectory = session
+        trajectoryEvents = []
+        trajectoryTruncated = false
+        loadingTrajectory = true
+        let source = detail?.source ?? session.ref.split(separator: ":").first.map(String.init) ?? ""
+        let admin = AdminClient(config: config)
+        let ref = session.ref
+        DispatchQueue.global(qos: .userInitiated).async {
+            let result = admin.run(["trajectory", "--source", source, "--ref", ref, "--limit", "600"])
+            let raw = (result.json["events"] as? [[String: Any]]) ?? []
+            let events = raw.map {
+                TrajectoryEvent(kind: $0["kind"] as? String ?? "",
+                                tool: $0["tool"] as? String ?? "",
+                                text: $0["text"] as? String ?? "")
+            }
+            let truncated = (result.json["truncated"] as? Bool) ?? false
+            DispatchQueue.main.async {
+                guard self.trajectory?.id == session.id else { return }
+                self.trajectoryEvents = events
+                self.trajectoryTruncated = truncated
+                self.loadingTrajectory = false
+                if !result.ok {
+                    self.lastError = (result.json["error"] as? String) ?? "could not load trajectory"
+                }
+            }
+        }
+    }
+
+    func closeTrajectory() {
+        trajectory = nil
+        trajectoryEvents = []
     }
 
     func excludeSession(_ session: Session) {

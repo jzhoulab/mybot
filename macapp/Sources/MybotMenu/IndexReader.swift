@@ -52,13 +52,14 @@ final class IndexReader {
     }
 
     func sessions(source: String, cwd: String)
-        -> [(ref: String, sessionId: String, title: String, updatedAt: String, chunks: Int)] {
+        -> [(ref: String, sessionId: String, title: String, updatedAt: String, chunks: Int, origin: String)] {
         guard let db = openReadOnly() else { return [] }
         defer { sqlite3_close(db) }
-        var out: [(String, String, String, String, Int)] = []
+        var out: [(String, String, String, String, Int, String)] = []
         var stmt: OpaquePointer?
         let sql = """
-            SELECT source_ref, MAX(session_id), MAX(title), MAX(updated_at), COUNT(*)
+            SELECT source_ref, MAX(session_id), MAX(title), MAX(updated_at), COUNT(*),
+                   MAX(json_extract(metadata_json, '$.origin'))
             FROM trajectory_chunks
             WHERE source_name = ? AND cwd = ?
             GROUP BY source_ref
@@ -72,14 +73,14 @@ final class IndexReader {
                     while sqlite3_step(stmt) == SQLITE_ROW {
                         out.append((
                             text(stmt, 0), text(stmt, 1), text(stmt, 2), text(stmt, 3),
-                            Int(sqlite3_column_int(stmt, 4))
+                            Int(sqlite3_column_int(stmt, 4)), text(stmt, 5)
                         ))
                     }
                 }
             }
         }
         sqlite3_finalize(stmt)
-        return out.map { (ref: $0.0, sessionId: $0.1, title: $0.2, updatedAt: $0.3, chunks: $0.4) }
+        return out.map { (ref: $0.0, sessionId: $0.1, title: $0.2, updatedAt: $0.3, chunks: $0.4, origin: $0.5) }
     }
 
     private func scalarInt(_ db: OpaquePointer, _ sql: String) -> Int {
@@ -104,9 +105,9 @@ final class IndexReader {
         return value
     }
 
-    /// Cheap health snapshot: two counts and a max — indexed columns, instant.
-    func health() -> (total: Int, embedded: Int, indexedAt: String) {
-        guard let db = openReadOnly() else { return (0, 0, "") }
+    /// Cheap health snapshot: a few counts and a max — instant.
+    func health() -> (total: Int, embedded: Int, indexedAt: String, automated: Int) {
+        guard let db = openReadOnly() else { return (0, 0, "", 0) }
         defer { sqlite3_close(db) }
         let total = scalarInt(db, "SELECT COUNT(*) FROM trajectory_chunks")
         let embedded = scalarInt(
@@ -114,6 +115,10 @@ final class IndexReader {
             "SELECT COUNT(*) FROM trajectory_chunks WHERE embedding_blob IS NOT NULL OR embedding_json != '[]'"
         )
         let indexedAt = scalarText(db, "SELECT MAX(indexed_at) FROM trajectory_chunks")
-        return (total, embedded, indexedAt)
+        let automated = scalarInt(
+            db,
+            "SELECT COUNT(DISTINCT source_ref) FROM trajectory_chunks WHERE json_extract(metadata_json, '$.origin') = 'automated'"
+        )
+        return (total, embedded, indexedAt, automated)
     }
 }

@@ -418,6 +418,222 @@ def cmd_review(args: argparse.Namespace) -> dict[str, Any]:
     return out
 
 
+# --------------------------------------------------------------------------- #
+# Trajectory viewer
+# --------------------------------------------------------------------------- #
+def _stringify(obj: Any) -> str:
+    if obj is None:
+        return ""
+    if isinstance(obj, str):
+        return obj
+    try:
+        return json.dumps(obj, ensure_ascii=False, indent=2)
+    except Exception:
+        return str(obj)
+
+
+def _trunc(text: str, cap: int = 8000) -> str:
+    text = text or ""
+    if len(text) <= cap:
+        return text
+    return text[:cap] + f"\n… (+{len(text) - cap:,} more chars)"
+
+
+def _push(events: list[dict[str, Any]], kind: str, text: str) -> None:
+    text = (text or "").strip()
+    if not text:
+        return
+    events.append({"kind": kind, "tool": "", "text": _trunc(text)})
+
+
+def _parse_codex_trajectory(path: str, cap: int) -> list[dict[str, Any]]:
+    events: list[dict[str, Any]] = []
+    with open(path) as handle:
+        for line in handle:
+            try:
+                entry = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            etype = entry.get("type")
+            payload = entry.get("payload", {})
+            if etype in ("session_meta", "turn_context"):
+                continue  # hidden: metadata
+            if etype == "event_msg" and payload.get("type") == "user_message":
+                _push(events, "user", payload.get("message", ""))
+            elif etype == "response_item":
+                rtype = payload.get("type")
+                role = payload.get("role")
+                if rtype == "message" and role == "assistant":
+                    text = "\n".join(
+                        b.get("text", "") for b in payload.get("content", [])
+                        if isinstance(b, dict) and b.get("type") == "output_text"
+                    )
+                    _push(events, "assistant", text)
+                elif rtype == "message" and role == "user":
+                    text = "".join(
+                        b.get("text", "") for b in payload.get("content", [])
+                        if isinstance(b, dict) and b.get("type") == "input_text"
+                    )
+                    _push(events, "user", text)
+                elif rtype == "reasoning":
+                    blocks = payload.get("summary") or payload.get("content") or []
+                    text = "".join(b.get("text", "") for b in blocks if isinstance(b, dict))
+                    _push(events, "thinking", text)
+                elif rtype in ("function_call", "custom_tool_call", "local_shell_call"):
+                    name = payload.get("name") or rtype.replace("_", " ")
+                    args = payload.get("arguments")
+                    if args is None:
+                        args = payload.get("action") or payload.get("input")
+                    events.append({"kind": "tool_use", "tool": str(name), "text": _trunc(_stringify(args))})
+                elif rtype in ("function_call_output", "custom_tool_call_output"):
+                    out = payload.get("output")
+                    if isinstance(out, dict) and "output" in out:
+                        out = out["output"]
+                    events.append({"kind": "tool_result", "tool": "output", "text": _trunc(_stringify(out))})
+            if len(events) >= cap:
+                break
+    return events
+
+
+def _parse_claude_trajectory(path: str, cap: int) -> list[dict[str, Any]]:
+    events: list[dict[str, Any]] = []
+    with open(path) as handle:
+        for line in handle:
+            try:
+                entry = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            etype = entry.get("type")
+            message = entry.get("message", {})
+            if etype == "assistant" and isinstance(message, dict):
+                for block in message.get("content", []):
+                    if not isinstance(block, dict):
+                        continue
+                    btype = block.get("type")
+                    if btype == "text":
+                        _push(events, "assistant", block.get("text", ""))
+                    elif btype == "thinking":
+                        _push(events, "thinking", block.get("thinking", "") or block.get("text", ""))
+                    elif btype == "tool_use":
+                        events.append({"kind": "tool_use", "tool": str(block.get("name", "tool")),
+                                       "text": _trunc(_stringify(block.get("input", {})))})
+            elif etype == "user" and isinstance(message, dict):
+                content = message.get("content", "")
+                if isinstance(content, str):
+                    text = content.strip()
+                    if text.startswith("<system-reminder>") and text.endswith("</system-reminder>"):
+                        continue  # hidden: injected reminder
+                    _push(events, "user", text)
+                elif isinstance(content, list):
+                    for block in content:
+                        if not isinstance(block, dict):
+                            continue
+                        btype = block.get("type")
+                        if btype == "text":
+                            _push(events, "user", block.get("text", ""))
+                        elif btype == "tool_result":
+                            events.append({"kind": "tool_result", "tool": "result",
+                                           "text": _trunc(_stringify(block.get("content", "")))})
+            if len(events) >= cap:
+                break
+    return events
+
+
+def cmd_trajectory(args: argparse.Namespace) -> dict[str, Any]:
+    cfg = _config()
+    ref = args.ref
+    with sqlite3.connect(cfg["db_path"]) as conn:
+        conn.row_factory = sqlite3.Row
+        row = conn.execute(
+            "SELECT MAX(file_path) AS file_path, MAX(title) AS title, MAX(cwd) AS cwd "
+            "FROM trajectory_chunks WHERE source_ref = ?",
+            (ref,),
+        ).fetchone()
+    if not row or not row["file_path"]:
+        return {"ok": False, "error": "session not found in index"}
+    path = str(row["file_path"])
+    if not os.path.exists(path):
+        return {"ok": False, "error": f"trajectory file missing: {path}"}
+    source = (args.source or ref.split(":", 1)[0]).strip().lower()
+    if source == "claude":
+        events = _parse_claude_trajectory(path, args.limit)
+    else:
+        events = _parse_codex_trajectory(path, args.limit)
+    return {
+        "ok": True,
+        "title": row["title"] or "",
+        "cwd": row["cwd"] or "",
+        "path": path,
+        "source": source,
+        "events": events,
+        "truncated": len(events) >= args.limit,
+    }
+
+
+def cmd_classify(_args: argparse.Namespace) -> dict[str, Any]:
+    """Backfill session 'origin' into existing chunk metadata, embeddings intact.
+
+    Claude is classified from indexed entrypoints (no file read); codex reads only
+    the session_meta first line. Writes metadata_json.origin via json_set.
+    """
+    from sources.origin import classify_codex_origin, classify_from_metadata
+
+    cfg = _config()
+    counts = {"interactive": 0, "automated": 0, "unknown": 0}
+    with sqlite3.connect(cfg["db_path"]) as conn:
+        conn.row_factory = sqlite3.Row
+        rows = conn.execute(
+            "SELECT source_ref, MAX(source_name) AS sn, MAX(file_path) AS fp, MAX(metadata_json) AS mj "
+            "FROM trajectory_chunks GROUP BY source_ref"
+        ).fetchall()
+        for row in rows:
+            try:
+                metadata = json.loads(row["mj"] or "{}")
+            except json.JSONDecodeError:
+                metadata = {}
+            origin = classify_from_metadata(str(row["sn"] or ""), metadata)
+            if not origin and str(row["sn"] or "") == "codex" and row["fp"] and os.path.exists(row["fp"]):
+                try:
+                    with open(row["fp"]) as handle:
+                        payload = json.loads(handle.readline()).get("payload", {})
+                    src = payload.get("source")
+                    origin = classify_codex_origin(
+                        src if isinstance(src, str) else "", str(payload.get("originator") or "")
+                    )
+                except Exception:
+                    origin = ""
+            if not origin:
+                counts["unknown"] += 1
+                continue
+            counts[origin] += 1
+            conn.execute(
+                "UPDATE trajectory_chunks SET metadata_json = json_set(metadata_json, '$.origin', ?) "
+                "WHERE source_ref = ?",
+                (origin, row["source_ref"]),
+            )
+        conn.commit()
+    return {"ok": True, "sessions": len(rows), "counts": counts}
+
+
+def cmd_automated(args: argparse.Namespace) -> dict[str, Any]:
+    """Toggle exclusion of automated (agent/exec/SDK) sessions across all sources."""
+    exclude = args.action == "exclude"
+    config = load_access_config()
+    for accounts in config.sources.values():
+        for account in accounts:
+            account.exclude_automated = exclude
+    save_access_config(config)
+    cfg = _config()
+    index = _build_index(cfg)
+    if exclude:
+        cmd_classify(argparse.Namespace())  # ensure origin is populated first
+        purge = index.purge_by_origin("automated")
+        return {"ok": True, "action": "exclude", "purge": purge}
+    result = index.refresh_changed(include_vectors=True, max_sessions=cfg["refresh_max_sessions"])
+    return {"ok": True, "action": "include", "refresh": result,
+            "note": "changed sessions re-index now; a full rebuild restores all automated history"}
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     sub = parser.add_subparsers(dest="command", required=True)
@@ -449,6 +665,16 @@ def main() -> None:
     pr.add_argument("--decision", required=True, choices=["keep", "exclude"])
     pr.add_argument("--account", default="default")
 
+    ptj = sub.add_parser("trajectory")
+    ptj.add_argument("--ref", required=True, help="source_ref, e.g. codex:<session_id>")
+    ptj.add_argument("--source", default="")
+    ptj.add_argument("--limit", type=int, default=500)
+
+    sub.add_parser("classify", help="backfill session origin into existing metadata")
+
+    pa = sub.add_parser("automated", help="exclude/include automated (agent-driven) sessions")
+    pa.add_argument("--action", required=True, choices=["exclude", "include"])
+
     args = parser.parse_args()
     handlers = {
         "state": cmd_state,
@@ -457,6 +683,9 @@ def main() -> None:
         "set_visibility": cmd_set_visibility,
         "maintenance": cmd_maintenance,
         "review": cmd_review,
+        "trajectory": cmd_trajectory,
+        "classify": cmd_classify,
+        "automated": cmd_automated,
     }
     try:
         result = handlers[args.command](args)

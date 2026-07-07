@@ -20,6 +20,13 @@ struct Project: Identifiable, Hashable {
     }
 }
 
+struct TrajectoryEvent: Identifiable, Hashable {
+    let id = UUID()
+    let kind: String   // user | assistant | thinking | tool_use | tool_result
+    let tool: String
+    let text: String
+}
+
 struct Session: Identifiable, Hashable {
     var id: String { ref }
     let ref: String
@@ -27,7 +34,9 @@ struct Session: Identifiable, Hashable {
     let title: String
     let updatedAt: String
     let chunks: Int
+    var origin: String = ""
 
+    var isAutomated: Bool { origin == "automated" }
     var displayTitle: String { title.isEmpty ? "session \(shortId)" : title }
     var shortId: String { String(sessionId.suffix(8)) }
 
@@ -58,6 +67,7 @@ struct Health {
     var latestIndexedAt = ""
     var latestSourceMtime: TimeInterval = 0
     var projectCount = 0
+    var automatedSessions = 0
 
     var coverage: Double { totalChunks == 0 ? 0 : Double(embeddedChunks) / Double(totalChunks) }
 

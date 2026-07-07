@@ -6,6 +6,7 @@ import os
 from .access import TrajectoryAccessAccount, discover_codex_workdir
 from .common import append_turn, choose_title, make_detailed_summary, make_short_summary, parse_timestamp, recent_files
 from .models import NormalizedTrajectory, TrajectorySourceAdapter
+from .origin import classify_codex_origin
 
 
 def load_codex_index(base_dir: str) -> dict[str, str]:
@@ -64,6 +65,8 @@ class CodexSourceAdapter(TrajectorySourceAdapter):
             last_ts = None
             session_id = ""
             cwd = discovered_cwd
+            session_source = ""
+            session_originator = ""
             turns = []
 
             with open(path) as handle:
@@ -87,6 +90,9 @@ class CodexSourceAdapter(TrajectorySourceAdapter):
                         if isinstance(source, dict) and "subagent" in source:
                             session_id = ""
                             break
+                        if isinstance(source, str):
+                            session_source = source
+                        session_originator = str(payload.get("originator") or session_originator)
                         continue
 
                     if etype == "turn_context":
@@ -128,6 +134,9 @@ class CodexSourceAdapter(TrajectorySourceAdapter):
             session_id = self.account.scoped_session_id(raw_session_id)
             if not self.account.include_session(session_id, raw_session_id):
                 continue
+            origin = classify_codex_origin(session_source, session_originator)
+            if self.account.exclude_automated and origin == "automated":
+                continue
             session = NormalizedTrajectory(
 
                 source_name=self.source_name(),
@@ -143,6 +152,7 @@ class CodexSourceAdapter(TrajectorySourceAdapter):
                     "account": self.account.name,
                     "raw_session_id": raw_session_id,
                     "cwd": cwd,
+                    "origin": origin,
                 },
             )
             existing = by_session.get(session.session_id)

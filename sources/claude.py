@@ -6,6 +6,7 @@ import os
 from .access import TrajectoryAccessAccount, discover_claude_metadata
 from .common import append_turn, choose_title, make_detailed_summary, make_short_summary, parse_timestamp, recent_files
 from .models import NormalizedTrajectory, TrajectorySourceAdapter
+from .origin import classify_claude_origin
 
 
 class ClaudeSourceAdapter(TrajectorySourceAdapter):
@@ -107,6 +108,9 @@ class ClaudeSourceAdapter(TrajectorySourceAdapter):
             session_id = self.account.scoped_session_id(raw_session_id)
             if not self.account.include_session(session_id, raw_session_id):
                 continue
+            origin = classify_claude_origin(entrypoints)
+            if self.account.exclude_automated and origin == "automated":
+                continue
             title = choose_title(slug, user_turns, "claude session")
             sessions.append(
                 NormalizedTrajectory(
@@ -124,6 +128,7 @@ class ClaudeSourceAdapter(TrajectorySourceAdapter):
                         "raw_session_id": raw_session_id,
                         "cwd": cwd,
                         "entrypoints": entrypoints,
+                        "origin": origin,
                     },
                 )
             )

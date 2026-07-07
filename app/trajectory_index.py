@@ -533,6 +533,28 @@ class TrajectoryChunkIndex:
             "source_refs": to_delete,
         }
 
+    def purge_by_origin(self, origin: str, *, source_names: list[str] | None = None) -> dict[str, Any]:
+        """Delete every indexed session whose metadata origin matches (FTS-safe).
+
+        Used to bulk-remove automated/agent-driven sessions the user doesn't want
+        in their memory. Requires origin to be populated in metadata_json.
+        """
+        query = "SELECT DISTINCT source_ref FROM trajectory_chunks WHERE json_extract(metadata_json, '$.origin') = ?"
+        params: list[Any] = [origin]
+        if source_names:
+            placeholders = ",".join("?" for _ in source_names)
+            query += f" AND source_name IN ({placeholders})"
+            params.extend(source_names)
+        with self._connect() as conn:
+            refs = [str(row["source_ref"]) for row in conn.execute(query, params).fetchall()]
+        deleted = 0
+        if refs:
+            with self._lock, self._connect() as conn:
+                deleted = self._delete_source_refs(conn, refs)
+            self._clear_vector_cache()
+            self.lookup.clear()
+        return {"purged_sessions": len(refs), "purged_chunks": deleted}
+
     def compact_embeddings(self, *, batch: int = 2000) -> dict[str, Any]:
         """Convert legacy JSON embeddings to the compact float32 blob column.
 

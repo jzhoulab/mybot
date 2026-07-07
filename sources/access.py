@@ -101,6 +101,7 @@ class TrajectoryAccessAccount:
     excluded_workdir_classes: list[str] = field(default_factory=list)
     excluded_entrypoints: list[str] = field(default_factory=list)
     excluded_session_ids: list[str] = field(default_factory=list)
+    exclude_automated: bool = False
 
     @property
     def expanded_base_dir(self) -> str:
@@ -194,6 +195,7 @@ class TrajectoryAccessAccount:
             "excluded_workdir_classes": self.excluded_workdir_classes,
             "excluded_entrypoints": self.excluded_entrypoints,
             "excluded_session_ids": self.excluded_session_ids,
+            "exclude_automated": self.exclude_automated,
         }
 
 
@@ -328,6 +330,7 @@ def _coerce_accounts(source_name: str, raw: Any) -> list[TrajectoryAccessAccount
                 excluded_workdir_classes=excluded_workdir_classes,
                 excluded_entrypoints=excluded_entrypoints,
                 excluded_session_ids=excluded_session_ids,
+                exclude_automated=bool(item.get("exclude_automated", False)),
             )
         )
 
