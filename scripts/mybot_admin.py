@@ -446,97 +446,134 @@ def _push(events: list[dict[str, Any]], kind: str, text: str) -> None:
     events.append({"kind": kind, "tool": "", "text": _trunc(text)})
 
 
-def _parse_codex_trajectory(path: str, cap: int) -> list[dict[str, Any]]:
-    events: list[dict[str, Any]] = []
-    with open(path) as handle:
-        for line in handle:
-            try:
-                entry = json.loads(line)
-            except json.JSONDecodeError:
-                continue
-            etype = entry.get("type")
-            payload = entry.get("payload", {})
-            if etype in ("session_meta", "turn_context"):
-                continue  # hidden: metadata
-            if etype == "event_msg" and payload.get("type") == "user_message":
-                _push(events, "user", payload.get("message", ""))
-            elif etype == "response_item":
-                rtype = payload.get("type")
-                role = payload.get("role")
-                if rtype == "message" and role == "assistant":
-                    text = "\n".join(
-                        b.get("text", "") for b in payload.get("content", [])
-                        if isinstance(b, dict) and b.get("type") == "output_text"
-                    )
-                    _push(events, "assistant", text)
-                elif rtype == "message" and role == "user":
-                    text = "".join(
-                        b.get("text", "") for b in payload.get("content", [])
-                        if isinstance(b, dict) and b.get("type") == "input_text"
-                    )
-                    _push(events, "user", text)
-                elif rtype == "reasoning":
-                    blocks = payload.get("summary") or payload.get("content") or []
-                    text = "".join(b.get("text", "") for b in blocks if isinstance(b, dict))
-                    _push(events, "thinking", text)
-                elif rtype in ("function_call", "custom_tool_call", "local_shell_call"):
-                    name = payload.get("name") or rtype.replace("_", " ")
-                    args = payload.get("arguments")
-                    if args is None:
-                        args = payload.get("action") or payload.get("input")
-                    events.append({"kind": "tool_use", "tool": str(name), "text": _trunc(_stringify(args))})
-                elif rtype in ("function_call_output", "custom_tool_call_output"):
-                    out = payload.get("output")
-                    if isinstance(out, dict) and "output" in out:
-                        out = out["output"]
-                    events.append({"kind": "tool_result", "tool": "output", "text": _trunc(_stringify(out))})
-            if len(events) >= cap:
-                break
-    return events
+TRAJECTORY_MAX_LINE_BYTES = 512 * 1024      # never buffer a single line bigger than this
+TRAJECTORY_MAX_TOTAL_BYTES = 48 * 1024 * 1024  # stop after reading this much of the file
 
 
-def _parse_claude_trajectory(path: str, cap: int) -> list[dict[str, Any]]:
-    events: list[dict[str, Any]] = []
-    with open(path) as handle:
-        for line in handle:
-            try:
-                entry = json.loads(line)
-            except json.JSONDecodeError:
-                continue
-            etype = entry.get("type")
-            message = entry.get("message", {})
-            if etype == "assistant" and isinstance(message, dict):
-                for block in message.get("content", []):
-                    if not isinstance(block, dict):
-                        continue
-                    btype = block.get("type")
-                    if btype == "text":
-                        _push(events, "assistant", block.get("text", ""))
-                    elif btype == "thinking":
-                        _push(events, "thinking", block.get("thinking", "") or block.get("text", ""))
-                    elif btype == "tool_use":
-                        events.append({"kind": "tool_use", "tool": str(block.get("name", "tool")),
-                                       "text": _trunc(_stringify(block.get("input", {})))})
-            elif etype == "user" and isinstance(message, dict):
-                content = message.get("content", "")
-                if isinstance(content, str):
-                    text = content.strip()
-                    if text.startswith("<system-reminder>") and text.endswith("</system-reminder>"):
-                        continue  # hidden: injected reminder
-                    _push(events, "user", text)
-                elif isinstance(content, list):
-                    for block in content:
-                        if not isinstance(block, dict):
-                            continue
-                        btype = block.get("type")
-                        if btype == "text":
-                            _push(events, "user", block.get("text", ""))
-                        elif btype == "tool_result":
-                            events.append({"kind": "tool_result", "tool": "result",
-                                           "text": _trunc(_stringify(block.get("content", "")))})
-            if len(events) >= cap:
+def _iter_trajectory_lines(path: str):
+    """Yield decoded json-line strings with bounded memory.
+
+    A single event can be hundreds of MB (embedded files/base64). Reading such a
+    line with `for line in f` would load it whole and hang the viewer. Here we
+    read in bounded chunks: any line over TRAJECTORY_MAX_LINE_BYTES is skipped
+    (yielding None so the caller can note it), and we stop after
+    TRAJECTORY_MAX_TOTAL_BYTES total.
+    """
+    total = 0
+    with open(path, "rb") as handle:
+        while True:
+            raw = handle.readline(TRAJECTORY_MAX_LINE_BYTES)
+            if not raw:
                 break
-    return events
+            total += len(raw)
+            if total > TRAJECTORY_MAX_TOTAL_BYTES:
+                break
+            if not raw.endswith(b"\n") and len(raw) >= TRAJECTORY_MAX_LINE_BYTES:
+                # oversized line — drain to the next newline without buffering it
+                while True:
+                    extra = handle.readline(TRAJECTORY_MAX_LINE_BYTES)
+                    total += len(extra)
+                    if not extra or extra.endswith(b"\n") or total > TRAJECTORY_MAX_TOTAL_BYTES:
+                        break
+                yield None
+                continue
+            yield raw.decode("utf-8", "replace")
+
+
+def _parse_codex_event(entry: dict[str, Any], events: list[dict[str, Any]]) -> None:
+    etype = entry.get("type")
+    payload = entry.get("payload", {})
+    if etype in ("session_meta", "turn_context"):
+        return  # hidden: metadata
+    if etype == "event_msg" and payload.get("type") == "user_message":
+        _push(events, "user", payload.get("message", ""))
+    elif etype == "response_item":
+        rtype = payload.get("type")
+        role = payload.get("role")
+        if rtype == "message" and role == "assistant":
+            text = "\n".join(
+                b.get("text", "") for b in payload.get("content", [])
+                if isinstance(b, dict) and b.get("type") == "output_text"
+            )
+            _push(events, "assistant", text)
+        elif rtype == "message" and role == "user":
+            text = "".join(
+                b.get("text", "") for b in payload.get("content", [])
+                if isinstance(b, dict) and b.get("type") == "input_text"
+            )
+            _push(events, "user", text)
+        elif rtype == "reasoning":
+            blocks = payload.get("summary") or payload.get("content") or []
+            text = "".join(b.get("text", "") for b in blocks if isinstance(b, dict))
+            _push(events, "thinking", text)
+        elif rtype in ("function_call", "custom_tool_call", "local_shell_call"):
+            name = payload.get("name") or rtype.replace("_", " ")
+            args = payload.get("arguments")
+            if args is None:
+                args = payload.get("action") or payload.get("input")
+            events.append({"kind": "tool_use", "tool": str(name), "text": _trunc(_stringify(args))})
+        elif rtype in ("function_call_output", "custom_tool_call_output"):
+            out = payload.get("output")
+            if isinstance(out, dict) and "output" in out:
+                out = out["output"]
+            events.append({"kind": "tool_result", "tool": "output", "text": _trunc(_stringify(out))})
+
+
+def _parse_claude_event(entry: dict[str, Any], events: list[dict[str, Any]]) -> None:
+    etype = entry.get("type")
+    message = entry.get("message", {})
+    if etype == "assistant" and isinstance(message, dict):
+        for block in message.get("content", []):
+            if not isinstance(block, dict):
+                continue
+            btype = block.get("type")
+            if btype == "text":
+                _push(events, "assistant", block.get("text", ""))
+            elif btype == "thinking":
+                _push(events, "thinking", block.get("thinking", "") or block.get("text", ""))
+            elif btype == "tool_use":
+                events.append({"kind": "tool_use", "tool": str(block.get("name", "tool")),
+                               "text": _trunc(_stringify(block.get("input", {})))})
+    elif etype == "user" and isinstance(message, dict):
+        content = message.get("content", "")
+        if isinstance(content, str):
+            text = content.strip()
+            if text.startswith("<system-reminder>") and text.endswith("</system-reminder>"):
+                return  # hidden: injected reminder
+            _push(events, "user", text)
+        elif isinstance(content, list):
+            for block in content:
+                if not isinstance(block, dict):
+                    continue
+                btype = block.get("type")
+                if btype == "text":
+                    _push(events, "user", block.get("text", ""))
+                elif btype == "tool_result":
+                    events.append({"kind": "tool_result", "tool": "result",
+                                   "text": _trunc(_stringify(block.get("content", "")))})
+
+
+def _parse_trajectory(path: str, source: str, cap: int) -> tuple[list[dict[str, Any]], int]:
+    """Bounded parse: skips oversized lines, stops at `cap` events. Returns
+    (events, omitted_large_line_count)."""
+    parse_event = _parse_claude_event if source == "claude" else _parse_codex_event
+    events: list[dict[str, Any]] = []
+    omitted = 0
+    for line in _iter_trajectory_lines(path):
+        if len(events) >= cap:
+            break
+        if line is None:
+            omitted += 1
+            continue
+        try:
+            entry = json.loads(line)
+        except (json.JSONDecodeError, ValueError):
+            continue
+        try:
+            parse_event(entry, events)
+        except Exception:
+            continue
+    return events, omitted
 
 
 def cmd_trajectory(args: argparse.Namespace) -> dict[str, Any]:
@@ -555,16 +592,14 @@ def cmd_trajectory(args: argparse.Namespace) -> dict[str, Any]:
     if not os.path.exists(path):
         return {"ok": False, "error": f"trajectory file missing: {path}"}
     source = (args.source or ref.split(":", 1)[0]).strip().lower()
-    if source == "claude":
-        events = _parse_claude_trajectory(path, args.limit)
-    else:
-        events = _parse_codex_trajectory(path, args.limit)
+    events, omitted = _parse_trajectory(path, source, args.limit)
     return {
         "ok": True,
         "title": row["title"] or "",
         "cwd": row["cwd"] or "",
         "path": path,
         "source": source,
+        "omitted_large": omitted,
         "events": events,
         "truncated": len(events) >= args.limit,
     }

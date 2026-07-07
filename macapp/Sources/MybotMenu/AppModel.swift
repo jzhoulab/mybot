@@ -59,6 +59,7 @@ final class AppModel: ObservableObject {
     @Published var trajectoryEvents: [TrajectoryEvent] = []
     @Published var loadingTrajectory = false
     @Published var trajectoryTruncated = false
+    @Published var trajectoryOmitted = 0
 
     let config = MybotConfig.shared
     private var timer: Timer?
@@ -332,7 +333,8 @@ final class AppModel: ObservableObject {
         let admin = AdminClient(config: config)
         let ref = session.ref
         DispatchQueue.global(qos: .userInitiated).async {
-            let result = admin.run(["trajectory", "--source", source, "--ref", ref, "--limit", "600"])
+            let result = admin.run(["trajectory", "--source", source, "--ref", ref, "--limit", "600"],
+                                   timeout: 25)
             let raw = (result.json["events"] as? [[String: Any]]) ?? []
             let events = raw.map {
                 TrajectoryEvent(kind: $0["kind"] as? String ?? "",
@@ -340,10 +342,12 @@ final class AppModel: ObservableObject {
                                 text: $0["text"] as? String ?? "")
             }
             let truncated = (result.json["truncated"] as? Bool) ?? false
+            let omitted = (result.json["omitted_large"] as? Int) ?? 0
             DispatchQueue.main.async {
                 guard self.trajectory?.id == session.id else { return }
                 self.trajectoryEvents = events
                 self.trajectoryTruncated = truncated
+                self.trajectoryOmitted = omitted
                 self.loadingTrajectory = false
                 if !result.ok {
                     self.lastError = (result.json["error"] as? String) ?? "could not load trajectory"

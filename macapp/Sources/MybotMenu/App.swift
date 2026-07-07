@@ -567,10 +567,17 @@ struct TrajectoryView: View {
                 ScrollView {
                     LazyVStack(spacing: 8) {
                         ForEach(model.trajectoryEvents) { event in EventRow(event: event) }
-                        if model.trajectoryTruncated {
-                            Text("Trajectory truncated — showing the first \(model.trajectoryEvents.count) events")
-                                .font(.system(size: 10)).foregroundStyle(.secondary)
-                                .padding(.top, 4)
+                        if model.trajectoryTruncated || model.trajectoryOmitted > 0 {
+                            VStack(spacing: 2) {
+                                if model.trajectoryTruncated {
+                                    Text("Showing the first \(model.trajectoryEvents.count) events (truncated)")
+                                }
+                                if model.trajectoryOmitted > 0 {
+                                    Text("\(model.trajectoryOmitted) oversized event\(model.trajectoryOmitted == 1 ? "" : "s") skipped to save memory")
+                                }
+                            }
+                            .font(.system(size: 10)).foregroundStyle(.secondary)
+                            .frame(maxWidth: .infinity).padding(.top, 4)
                         }
                     }
                     .padding(.horizontal, 12).padding(.vertical, 8)
