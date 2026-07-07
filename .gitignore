@@ -24,6 +24,8 @@ state/run/
 state/retrieval_budgets/
 profiles/*/.mybot/
 backups/
+macapp/.build/
+macapp/dist/
 *.log
 screenlog.*
 *.sqlite3
