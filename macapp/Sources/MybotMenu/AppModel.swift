@@ -37,6 +37,10 @@ final class AppModel: ObservableObject {
     @Published var newProjects: [NewProject] = []
     @Published var health = Health()
     @Published var clusters: [AutomatedCluster] = []
+    /// True while the index is being rewritten under us (read failed or looked
+    /// wiped). We keep showing the last good snapshot instead of zeros.
+    @Published var indexBusy = false
+    private var suspectEmptyReads = 0
     @Published var busyMessage: String?
     @Published var lastError: String?
 
@@ -171,8 +175,25 @@ final class AppModel: ObservableObject {
         DispatchQueue.global(qos: .userInitiated).async {
             let reader = IndexReader(dbPath: cfg.dbPath.path)
             let policy = AccessPolicy.load(cfg.accessConfigPath)
-            let rows = reader.projects()
-            let snapshot = reader.health()
+            guard let rows = reader.projects(), let snapshot = reader.health() else {
+                self.holdSnapshotWhileBusy()  // db locked mid-rebuild
+                return
+            }
+            // A suddenly-empty index while we had data is almost always a
+            // rebuild in flight, not a real wipe. Hold a few reads before
+            // believing it.
+            let hadData = DispatchQueue.main.sync { self.health.totalChunks > 0 }
+            if snapshot.total == 0 && hadData {
+                var giveUp = false
+                DispatchQueue.main.sync {
+                    self.suspectEmptyReads += 1
+                    giveUp = self.suspectEmptyReads > 3
+                }
+                if !giveUp {
+                    self.holdSnapshotWhileBusy()
+                    return
+                }
+            }
             let knownPath = cfg.dbPath.deletingLastPathComponent()
                 .appendingPathComponent("known_projects.json")
             let pending = KnownProjects.pending(knownPath)
@@ -217,7 +238,20 @@ final class AppModel: ObservableObject {
                 self.newProjects = pending
                 self.health = health
                 self.clusters = clusters
+                self.indexBusy = false
+                self.suspectEmptyReads = 0
                 self.renderIcon()
+            }
+        }
+    }
+
+    /// Index is mid-rewrite: keep the last good snapshot on screen, show the
+    /// "updating" hint, and retry shortly.
+    private nonisolated func holdSnapshotWhileBusy() {
+        DispatchQueue.main.async {
+            self.indexBusy = true
+            DispatchQueue.main.asyncAfter(deadline: .now() + 2) {
+                if self.indexBusy { self.reload() }
             }
         }
     }

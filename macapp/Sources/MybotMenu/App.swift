@@ -177,6 +177,7 @@ struct ContentView: View {
     }
 
     private var statusLine: String {
+        if model.indexBusy { return "Index updating… showing last snapshot" }
         let h = model.health
         if h.totalChunks > 0 && h.embeddedChunks == 0 { return "Semantic search off · lexical only" }
         return "Index \(h.stale ? "stale" : "fresh") · updated \(h.indexedAgo)"
