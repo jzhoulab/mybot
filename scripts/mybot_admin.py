@@ -446,38 +446,15 @@ def _push(events: list[dict[str, Any]], kind: str, text: str) -> None:
     events.append({"kind": kind, "tool": "", "text": _trunc(text)})
 
 
-TRAJECTORY_MAX_LINE_BYTES = 512 * 1024      # never buffer a single line bigger than this
 TRAJECTORY_MAX_TOTAL_BYTES = 48 * 1024 * 1024  # stop after reading this much of the file
 
 
 def _iter_trajectory_lines(path: str):
-    """Yield decoded json-line strings with bounded memory.
+    """Bounded jsonl lines for the viewer: oversized lines yield None, and we
+    stop after TRAJECTORY_MAX_TOTAL_BYTES (see sources.common)."""
+    from sources.common import iter_bounded_jsonl_lines
 
-    A single event can be hundreds of MB (embedded files/base64). Reading such a
-    line with `for line in f` would load it whole and hang the viewer. Here we
-    read in bounded chunks: any line over TRAJECTORY_MAX_LINE_BYTES is skipped
-    (yielding None so the caller can note it), and we stop after
-    TRAJECTORY_MAX_TOTAL_BYTES total.
-    """
-    total = 0
-    with open(path, "rb") as handle:
-        while True:
-            raw = handle.readline(TRAJECTORY_MAX_LINE_BYTES)
-            if not raw:
-                break
-            total += len(raw)
-            if total > TRAJECTORY_MAX_TOTAL_BYTES:
-                break
-            if not raw.endswith(b"\n") and len(raw) >= TRAJECTORY_MAX_LINE_BYTES:
-                # oversized line — drain to the next newline without buffering it
-                while True:
-                    extra = handle.readline(TRAJECTORY_MAX_LINE_BYTES)
-                    total += len(extra)
-                    if not extra or extra.endswith(b"\n") or total > TRAJECTORY_MAX_TOTAL_BYTES:
-                        break
-                yield None
-                continue
-            yield raw.decode("utf-8", "replace")
+    yield from iter_bounded_jsonl_lines(path, max_total_bytes=TRAJECTORY_MAX_TOTAL_BYTES)
 
 
 def _parse_codex_event(entry: dict[str, Any], events: list[dict[str, Any]]) -> None:
@@ -605,16 +582,59 @@ def cmd_trajectory(args: argparse.Namespace) -> dict[str, Any]:
     }
 
 
-def cmd_classify(_args: argparse.Namespace) -> dict[str, Any]:
-    """Backfill session 'origin' into existing chunk metadata, embeddings intact.
+def _probe_claude_session(path: str) -> tuple[bool, int, list[str]]:
+    """Bounded scan of a claude jsonl: (sidechain?, genuine human turns, entrypoints)."""
+    from sources.common import is_real_user_text, iter_bounded_jsonl_lines
 
-    Claude is classified from indexed entrypoints (no file read); codex reads only
-    the session_meta first line. Writes metadata_json.origin via json_set.
+    sidechain = False
+    human_turns = 0
+    entrypoints: list[str] = []
+    for line in iter_bounded_jsonl_lines(path):
+        if line is None:
+            continue
+        try:
+            entry = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        entrypoint = str(entry.get("entrypoint") or "").strip()
+        if entrypoint and entrypoint not in entrypoints:
+            entrypoints.append(entrypoint)
+        if entry.get("isSidechain") or entry.get("agentId"):
+            sidechain = True
+            continue
+        if entry.get("isMeta") or entry.get("type") != "user":
+            continue
+        if str(entry.get("userType") or "external") != "external":
+            continue
+        message = entry.get("message") or {}
+        content = message.get("content", "") if isinstance(message, dict) else ""
+        text = ""
+        if isinstance(content, str):
+            text = content
+        elif isinstance(content, list):
+            if any(isinstance(b, dict) and b.get("type") == "tool_result" for b in content):
+                continue
+            for block in content:
+                if isinstance(block, dict) and block.get("type") == "text":
+                    text = block.get("text", "")
+                    break
+        if is_real_user_text(text) and not text.strip().startswith("Caveat:"):
+            human_turns += 1
+    return sidechain, human_turns, entrypoints
+
+
+def cmd_classify(_args: argparse.Namespace) -> dict[str, Any]:
+    """Backfill session 'origin' (+detail) into chunk metadata, embeddings intact.
+
+    Claude: content-based — bounded file scan for sidechain/agentId markers and
+    genuine typed turns (entrypoint alone misclassifies subagents, which claim
+    entrypoint "cli"). Codex: session_meta source/originator. json_set only.
     """
-    from sources.origin import classify_codex_origin, classify_from_metadata
+    from sources.origin import classify_claude_origin_detailed, classify_codex_origin
 
     cfg = _config()
     counts = {"interactive": 0, "automated": 0, "unknown": 0}
+    details: dict[str, int] = {}
     with sqlite3.connect(cfg["db_path"]) as conn:
         conn.row_factory = sqlite3.Row
         rows = conn.execute(
@@ -626,28 +646,51 @@ def cmd_classify(_args: argparse.Namespace) -> dict[str, Any]:
                 metadata = json.loads(row["mj"] or "{}")
             except json.JSONDecodeError:
                 metadata = {}
-            origin = classify_from_metadata(str(row["sn"] or ""), metadata)
-            if not origin and str(row["sn"] or "") == "codex" and row["fp"] and os.path.exists(row["fp"]):
+            source_name = str(row["sn"] or "")
+            path = str(row["fp"] or "")
+            origin = ""
+            detail = ""
+            if source_name == "claude":
+                if path and os.path.exists(path):
+                    try:
+                        sidechain, human_turns, entrypoints = _probe_claude_session(path)
+                        origin, detail = classify_claude_origin_detailed(
+                            entrypoints or metadata.get("entrypoints"),
+                            sidechain=sidechain,
+                            human_turns=human_turns,
+                        )
+                    except Exception:
+                        origin = ""
+                if not origin:  # file gone — fall back to indexed entrypoints
+                    origin, detail = classify_claude_origin_detailed(metadata.get("entrypoints"))
+            elif source_name == "codex" and path and os.path.exists(path):
                 try:
-                    with open(row["fp"]) as handle:
-                        payload = json.loads(handle.readline()).get("payload", {})
+                    with open(path) as handle:
+                        payload = json.loads(handle.readline(512 * 1024)).get("payload", {})
                     src = payload.get("source")
                     origin = classify_codex_origin(
                         src if isinstance(src, str) else "", str(payload.get("originator") or "")
                     )
+                    detail = "exec" if origin == "automated" else ""
                 except Exception:
                     origin = ""
             if not origin:
+                origin = str(metadata.get("origin") or "")
+                detail = str(metadata.get("origin_detail") or "")
+            if origin not in ("interactive", "automated"):
                 counts["unknown"] += 1
                 continue
             counts[origin] += 1
+            if detail:
+                details[detail] = details.get(detail, 0) + 1
             conn.execute(
-                "UPDATE trajectory_chunks SET metadata_json = json_set(metadata_json, '$.origin', ?) "
+                "UPDATE trajectory_chunks SET metadata_json = "
+                "json_set(metadata_json, '$.origin', ?, '$.origin_detail', ?) "
                 "WHERE source_ref = ?",
-                (origin, row["source_ref"]),
+                (origin, detail, row["source_ref"]),
             )
         conn.commit()
-    return {"ok": True, "sessions": len(rows), "counts": counts}
+    return {"ok": True, "sessions": len(rows), "counts": counts, "automated_details": details}
 
 
 def cmd_automated(args: argparse.Namespace) -> dict[str, Any]:

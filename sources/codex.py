@@ -4,7 +4,15 @@ import json
 import os
 
 from .access import TrajectoryAccessAccount, discover_codex_workdir
-from .common import append_turn, choose_title, make_detailed_summary, make_short_summary, parse_timestamp, recent_files
+from .common import (
+    append_turn,
+    choose_title,
+    iter_bounded_jsonl_lines,
+    make_detailed_summary,
+    make_short_summary,
+    parse_timestamp,
+    recent_files,
+)
 from .models import NormalizedTrajectory, TrajectorySourceAdapter
 from .origin import classify_codex_origin
 
@@ -69,8 +77,8 @@ class CodexSourceAdapter(TrajectorySourceAdapter):
             session_originator = ""
             turns = []
 
-            with open(path) as handle:
-                for line in handle:
+            for line in iter_bounded_jsonl_lines(path):
+                if line is not None:  # oversized lines are skipped as None
                     try:
                         entry = json.loads(line)
                     except json.JSONDecodeError:

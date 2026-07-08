@@ -26,6 +26,39 @@ UUID_RE = re.compile(r"^[0-9a-f]{8}-[0-9a-f]{4}-")
 ROLLOUT_RE = re.compile(r"^rollout-\d{4}-\d{2}-\d{2}T")
 SLUG_RE = re.compile(r"^[a-z]+-[a-z]+-[a-z]+$")
 
+# A single trajectory event can be tens/hundreds of MB (embedded files/base64).
+# `for line in f` would buffer such a line whole and hang/OOM whoever reads it.
+MAX_JSONL_LINE_BYTES = 512 * 1024
+
+
+def iter_bounded_jsonl_lines(path: str, *, max_total_bytes: int | None = None):
+    """Yield decoded json-line strings with bounded memory.
+
+    Lines over MAX_JSONL_LINE_BYTES are skipped (yielded as None so callers can
+    count them). With max_total_bytes set, stops after reading that much.
+    """
+    total = 0
+    with open(path, "rb") as handle:
+        while True:
+            raw = handle.readline(MAX_JSONL_LINE_BYTES)
+            if not raw:
+                break
+            total += len(raw)
+            if max_total_bytes is not None and total > max_total_bytes:
+                break
+            if not raw.endswith(b"\n") and len(raw) >= MAX_JSONL_LINE_BYTES:
+                # oversized line — drain to the next newline without buffering it
+                while True:
+                    extra = handle.readline(MAX_JSONL_LINE_BYTES)
+                    total += len(extra)
+                    if not extra or extra.endswith(b"\n") or (
+                        max_total_bytes is not None and total > max_total_bytes
+                    ):
+                        break
+                yield None
+                continue
+            yield raw.decode("utf-8", "replace")
+
 
 def parse_timestamp(raw: str) -> datetime | None:
     if not raw or not isinstance(raw, str):

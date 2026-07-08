@@ -4,9 +4,18 @@ import json
 import os
 
 from .access import TrajectoryAccessAccount, discover_claude_metadata
-from .common import append_turn, choose_title, make_detailed_summary, make_short_summary, parse_timestamp, recent_files
+from .common import (
+    append_turn,
+    choose_title,
+    is_real_user_text,
+    iter_bounded_jsonl_lines,
+    make_detailed_summary,
+    make_short_summary,
+    parse_timestamp,
+    recent_files,
+)
 from .models import NormalizedTrajectory, TrajectorySourceAdapter
-from .origin import classify_claude_origin
+from .origin import classify_claude_origin_detailed
 
 
 class ClaudeSourceAdapter(TrajectorySourceAdapter):
@@ -36,6 +45,8 @@ class ClaudeSourceAdapter(TrajectorySourceAdapter):
         sessions: list[NormalizedTrajectory] = []
 
         for path in files:
+            if f"{os.sep}subagents{os.sep}" in path:
+                continue  # spawned-subagent transcript, never a user session
             _, discovered_cwd, discovered_entrypoints = discover_claude_metadata(path)
             if not self.account.include_workdir(discovered_cwd):
                 continue
@@ -48,13 +59,18 @@ class ClaudeSourceAdapter(TrajectorySourceAdapter):
             cwd = discovered_cwd
             entrypoints = list(discovered_entrypoints)
             turns = []
+            sidechain = False
+            human_turns = 0
 
-            with open(path) as handle:
-                for line in handle:
+            for line in iter_bounded_jsonl_lines(path):
+                if line is not None:
                     try:
                         entry = json.loads(line)
                     except json.JSONDecodeError:
                         continue
+                    if entry.get("isSidechain") or entry.get("agentId"):
+                        # subagent transcript lines (these claim entrypoint "cli")
+                        sidechain = True
                     etype = entry.get("type")
                     ts = parse_timestamp(entry.get("timestamp", ""))
                     ts_text = ts.isoformat() if ts else None
@@ -91,6 +107,21 @@ class ClaudeSourceAdapter(TrajectorySourceAdapter):
                                 if isinstance(block, str):
                                     text = block
                                     break
+                        # a *genuine* typed turn: not a tool result / meta /
+                        # sidechain line, and not injected boilerplate
+                        has_tool_result = isinstance(content, list) and any(
+                            isinstance(block, dict) and block.get("type") == "tool_result"
+                            for block in content
+                        )
+                        if (
+                            not has_tool_result
+                            and not entry.get("isSidechain")
+                            and not entry.get("isMeta")
+                            and str(entry.get("userType") or "external") == "external"
+                            and is_real_user_text(text)
+                            and not text.strip().startswith("Caveat:")
+                        ):
+                            human_turns += 1
                         append_turn(turns, "user", text, ts_text)
 
             user_turns = [turn.text for turn in turns if turn.role == "user"]
@@ -108,7 +139,9 @@ class ClaudeSourceAdapter(TrajectorySourceAdapter):
             session_id = self.account.scoped_session_id(raw_session_id)
             if not self.account.include_session(session_id, raw_session_id):
                 continue
-            origin = classify_claude_origin(entrypoints)
+            origin, origin_detail = classify_claude_origin_detailed(
+                entrypoints, sidechain=sidechain, human_turns=human_turns
+            )
             if self.account.exclude_automated and origin == "automated":
                 continue
             title = choose_title(slug, user_turns, "claude session")
@@ -129,6 +162,8 @@ class ClaudeSourceAdapter(TrajectorySourceAdapter):
                         "cwd": cwd,
                         "entrypoints": entrypoints,
                         "origin": origin,
+                        "origin_detail": origin_detail,
+                        "human_turns": human_turns,
                     },
                 )
             )

@@ -8,6 +8,7 @@ from collections import Counter
 from dataclasses import dataclass, field
 from typing import Any
 
+from .common import iter_bounded_jsonl_lines
 from .models import NormalizedTrajectory, TrajectorySourceAdapter, normalize_text
 from .registry import get_source_adapters
 
@@ -247,35 +248,13 @@ def _summarize_codex_payload(payload: dict[str, Any]) -> str:
     return f"[{name}] {_compact_json(arguments or payload, 1000)}"
 
 
-# A single trajectory event can be tens/hundreds of MB (embedded files/base64).
-# Reading such a line whole would hang or OOM the /chat request that touches a
-# big session, so we read in bounded chunks and skip oversized lines.
-_READ_MAX_LINE_BYTES = 512 * 1024
+# Cap how much of a huge session an evidence read will scan (memory + latency);
+# line-level bounding comes from iter_bounded_jsonl_lines.
 _READ_MAX_TOTAL_BYTES = 64 * 1024 * 1024
 
 
 def _iter_bounded_lines(path: str):
-    """Yield decoded json-line strings with bounded memory; skip (yield None
-    for) any line over _READ_MAX_LINE_BYTES; stop after _READ_MAX_TOTAL_BYTES."""
-    total = 0
-    with open(path, "rb") as handle:
-        while True:
-            raw = handle.readline(_READ_MAX_LINE_BYTES)
-            if not raw:
-                break
-            total += len(raw)
-            if total > _READ_MAX_TOTAL_BYTES:
-                break
-            if not raw.endswith(b"\n") and len(raw) >= _READ_MAX_LINE_BYTES:
-                # oversized line — drain to the next newline without buffering it
-                while True:
-                    extra = handle.readline(_READ_MAX_LINE_BYTES)
-                    total += len(extra)
-                    if not extra or extra.endswith(b"\n") or total > _READ_MAX_TOTAL_BYTES:
-                        break
-                yield None
-                continue
-            yield raw.decode("utf-8", "replace")
+    yield from iter_bounded_jsonl_lines(path, max_total_bytes=_READ_MAX_TOTAL_BYTES)
 
 
 def _read_claude_events(path: str) -> list[ParsedEvent]:
