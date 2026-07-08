@@ -96,23 +96,40 @@ struct ContentView: View {
     var body: some View {
         VStack(spacing: 0) {
             headerBlock
-            if let session = model.trajectory {
-                TrajectoryView(model: model, session: session)
-            } else if let project = model.detail {
-                SessionDetail(model: model, project: project)
-            } else {
-                controls
-                projectScroll
-                if model.selecting {
-                    batchBar
-                } else if !model.newProjects.isEmpty {
-                    newProjectsBar
+            if let busy = model.busyMessage { busyBanner(busy) }
+            Group {
+                if let session = model.trajectory {
+                    TrajectoryView(model: model, session: session)
+                } else if let project = model.detail {
+                    SessionDetail(model: model, project: project)
+                } else {
+                    controls
+                    projectScroll
+                    if model.selecting {
+                        batchBar
+                    } else if !model.newProjects.isEmpty {
+                        newProjectsBar
+                    }
                 }
             }
+            .disabled(model.busyMessage != nil)
+            .opacity(model.busyMessage != nil ? 0.45 : 1)
             footer
         }
         .frame(width: 480, height: 640)
         .background(background)
+    }
+
+    private func busyBanner(_ message: String) -> some View {
+        HStack(spacing: 9) {
+            ProgressView().controlSize(.small)
+            Text(message).font(.system(size: 12, weight: .semibold)).lineLimit(1)
+            Spacer()
+            Text("working…").font(.system(size: 10)).foregroundStyle(.secondary)
+        }
+        .padding(.horizontal, 14).padding(.vertical, 9)
+        .background(Color.accentColor.opacity(0.16))
+        .overlay(Rectangle().frame(height: 1).foregroundStyle(Color.accentColor.opacity(0.3)), alignment: .bottom)
     }
 
     private var background: some View {
@@ -144,6 +161,7 @@ struct ContentView: View {
                 .buttonStyle(.plain)
                 .frame(width: 30, height: 30)
                 .background(Circle().fill(Color.primary.opacity(0.07)))
+                .disabled(model.busyMessage != nil)
                 .help("Refresh from disk")
             }
             HStack(spacing: 8) {
@@ -159,7 +177,6 @@ struct ContentView: View {
     }
 
     private var statusLine: String {
-        if let busy = model.busyMessage { return busy }
         let h = model.health
         if h.totalChunks > 0 && h.embeddedChunks == 0 { return "Semantic search off · lexical only" }
         return "Index \(h.stale ? "stale" : "fresh") · updated \(h.indexedAgo)"
@@ -320,6 +337,7 @@ struct ContentView: View {
                 chipLabel("Maintain", "wrench.and.screwdriver.fill")
             }
             .menuStyle(.borderlessButton).fixedSize()
+            .disabled(model.busyMessage != nil)
 
             Button { model.openControlRoom() } label: { chipLabel("Web UI", "safari.fill") }
                 .buttonStyle(.plain)
@@ -667,6 +685,11 @@ enum UIExporter {
         for (name, scheme) in [("ui-dark", ColorScheme.dark), ("ui-light", ColorScheme.light)] {
             let bg = scheme == .dark ? Color(white: 0.12) : Color(white: 0.95)
             write(ContentView(model: AppModel.sample()).environment(\.colorScheme, scheme).background(bg), name)
+
+            let busyModel = AppModel.sample()
+            busyModel.busyMessage = "Excluding 394 automated sessions…"
+            write(ContentView(model: busyModel).environment(\.colorScheme, scheme).background(bg),
+                  name.replacingOccurrences(of: "ui-", with: "busy-"))
 
             // Rows render blank inside ScrollView in ImageRenderer, so preview
             // them in a plain VStack to judge the row styling.

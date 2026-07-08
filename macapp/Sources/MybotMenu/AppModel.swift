@@ -68,7 +68,10 @@ final class AppModel: ObservableObject {
         renderIcon()
         reload()
         timer = Timer.scheduledTimer(withTimeInterval: 15, repeats: true) { [weak self] _ in
-            Task { @MainActor in self?.reload() }
+            Task { @MainActor in
+                guard let self, self.busyMessage == nil else { return }  // don't shift numbers mid-op
+                self.reload()
+            }
         }
     }
 
