@@ -22,6 +22,9 @@ except ImportError as exc:  # pragma: no cover - import guard for runtime only
         "discord.py is required. Install it with: python3 -m pip install -U discord.py"
     ) from exc
 
+from app.logging_setup import get_logger
+
+log = get_logger("mybot.discord", "discord.log")
 
 TRUTHY = {"1", "true", "yes", "on"}
 
@@ -343,13 +346,13 @@ class DiscordBridgeClient(discord.Client):
 
     async def on_ready(self) -> None:
         assert self.user is not None
-        print(f"Discord bridge logged in as {self.user} ({self.user.id})")
+        log.info("logged in as %s (%s)", self.user, self.user.id)
 
     async def on_disconnect(self) -> None:
-        print("Discord bridge disconnected from Discord; waiting for reconnect.")
+        log.warning("disconnected from Discord; waiting for reconnect (messages sent now are missed)")
 
     async def on_resumed(self) -> None:
-        print("Discord bridge session resumed after reconnect.")
+        log.info("session resumed after reconnect")
 
     async def on_message(self, message: discord.Message) -> None:
         if message.author.bot:
@@ -371,6 +374,10 @@ class DiscordBridgeClient(discord.Client):
         if not text:
             return
 
+        log.info(
+            "message received: author=%s channel=%s len=%d preview=%r",
+            message.author.id, getattr(message.channel, "id", "?"), len(text), text[:80],
+        )
         handled = await self._handle_command_message(message, text)
         if handled:
             return
@@ -545,37 +552,44 @@ class DiscordBridgeClient(discord.Client):
             return
         target = requests[-1]
         combined_message = self._combined_chat_message(requests)
+        log.info(
+            "chat request: user=%s session=%s batched=%d chars=%d",
+            target.user_key, target.session_key, len(requests), len(combined_message),
+        )
         try:
             if target.discord_message is not None:
                 async with target.discord_message.channel.typing():
-                    response = await self.api.chat(
-                        actor_id=target.actor_id,
-                        user_key=target.user_key,
-                        session_key=target.session_key,
-                        message=combined_message,
-                        memory_scope=target.memory_scope,
-                        target_user_id=target.target_user_id,
-                        return_sources=False,
-                    )
+                    response = await self._call_chat(target, combined_message)
             else:
-                response = await self.api.chat(
-                    actor_id=target.actor_id,
-                    user_key=target.user_key,
-                    session_key=target.session_key,
-                    message=combined_message,
-                    memory_scope=target.memory_scope,
-                    target_user_id=target.target_user_id,
-                    return_sources=False,
+                response = await self._call_chat(target, combined_message)
+            text = response.get("text") or "(empty response)"
+            await self._send_chat_response(target, text)
+            log.info("chat reply sent: user=%s reply_chars=%d", target.user_key, len(text))
+        except Exception as exc:  # never leave a message silently unanswered
+            log.exception(
+                "chat request failed: user=%s session=%s", target.user_key, target.session_key
+            )
+            try:
+                await self._send_chat_error(
+                    target, f"Sorry — I couldn't answer that ({exc}). Please try again."
                 )
-        except RuntimeError as exc:
-            await self._send_chat_error(target, f"Chat request failed: {exc}")
+            except Exception:
+                log.exception("failed to deliver error reply to Discord")
             await self._acknowledge_folded_interactions(
                 requests[:-1],
                 "This message was folded into a combined request, but the request failed.",
             )
-            return
 
-        await self._send_chat_response(target, response.get("text") or "(empty response)")
+    async def _call_chat(self, target: "PendingChatRequest", combined_message: str) -> dict[str, Any]:
+        return await self.api.chat(
+            actor_id=target.actor_id,
+            user_key=target.user_key,
+            session_key=target.session_key,
+            message=combined_message,
+            memory_scope=target.memory_scope,
+            target_user_id=target.target_user_id,
+            return_sources=False,
+        )
         if len(requests) > 1:
             await self._acknowledge_folded_interactions(
                 requests[:-1],
@@ -830,7 +844,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--request-timeout-seconds",
         type=int,
-        default=int(os.environ.get("CHATBOT_REQUEST_TIMEOUT_SECONDS", "180")),
+        # 90s: long enough for agentic retrieval + a model turn, short enough that a
+        # wedged request fails visibly instead of hanging silently for minutes.
+        default=int(os.environ.get("CHATBOT_REQUEST_TIMEOUT_SECONDS", "90")),
     )
     return parser.parse_args()
 

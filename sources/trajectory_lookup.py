@@ -247,6 +247,37 @@ def _summarize_codex_payload(payload: dict[str, Any]) -> str:
     return f"[{name}] {_compact_json(arguments or payload, 1000)}"
 
 
+# A single trajectory event can be tens/hundreds of MB (embedded files/base64).
+# Reading such a line whole would hang or OOM the /chat request that touches a
+# big session, so we read in bounded chunks and skip oversized lines.
+_READ_MAX_LINE_BYTES = 512 * 1024
+_READ_MAX_TOTAL_BYTES = 64 * 1024 * 1024
+
+
+def _iter_bounded_lines(path: str):
+    """Yield decoded json-line strings with bounded memory; skip (yield None
+    for) any line over _READ_MAX_LINE_BYTES; stop after _READ_MAX_TOTAL_BYTES."""
+    total = 0
+    with open(path, "rb") as handle:
+        while True:
+            raw = handle.readline(_READ_MAX_LINE_BYTES)
+            if not raw:
+                break
+            total += len(raw)
+            if total > _READ_MAX_TOTAL_BYTES:
+                break
+            if not raw.endswith(b"\n") and len(raw) >= _READ_MAX_LINE_BYTES:
+                # oversized line — drain to the next newline without buffering it
+                while True:
+                    extra = handle.readline(_READ_MAX_LINE_BYTES)
+                    total += len(extra)
+                    if not extra or extra.endswith(b"\n") or total > _READ_MAX_TOTAL_BYTES:
+                        break
+                yield None
+                continue
+            yield raw.decode("utf-8", "replace")
+
+
 def _read_claude_events(path: str) -> list[ParsedEvent]:
     events: list[ParsedEvent] = []
     pending_assistant: list[str] = []
@@ -263,8 +294,8 @@ def _read_claude_events(path: str) -> list[ParsedEvent]:
         pending_tools = []
         pending_ts = ""
 
-    with open(path) as handle:
-        for line in handle:
+    for line in _iter_bounded_lines(path):
+        if line is not None:  # skip oversized lines (yielded as None)
             try:
                 entry = json.loads(line)
             except (json.JSONDecodeError, ValueError):
@@ -316,8 +347,8 @@ def _read_claude_events(path: str) -> list[ParsedEvent]:
 
 def _read_codex_events(path: str) -> list[ParsedEvent]:
     events: list[ParsedEvent] = []
-    with open(path) as handle:
-        for line in handle:
+    for line in _iter_bounded_lines(path):
+        if line is not None:  # skip oversized lines (yielded as None)
             try:
                 entry = json.loads(line)
             except (json.JSONDecodeError, ValueError):

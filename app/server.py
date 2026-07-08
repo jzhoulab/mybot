@@ -25,6 +25,7 @@ from typing import Any
 
 from app.auth import SyncAuthStore
 from app.gui import GUI_HTML, build_gui_state
+from app.logging_setup import get_logger
 from app.semantic_memory import SemanticMemoryStore, VALID_MEMORY_SCOPES, parse_tags
 from app.trajectory_index import TrajectoryChunkIndex
 from sources.access import (
@@ -44,6 +45,8 @@ from sources.trajectory_lookup import (
 )
 from trajectory_memory import load_index
 
+
+log = get_logger("mybot.server", "server.log")
 
 WORKSPACE_FILES = ["AGENTS.md", "SOUL.md", "USER.md", "IDENTITY.md", "MEMORY.md"]
 LOCAL_LOOKUP_PRIORITY_THRESHOLD = 50.0
@@ -2186,6 +2189,16 @@ class ChatHandler(BaseHTTPRequestHandler):
             self.respond_json(400, {"ok": False, "error": str(exc)})
             return
 
+        try:
+            self._dispatch_post(body)
+        except Exception as exc:  # never drop the connection silently
+            log.exception("unhandled error handling POST %s", self.path)
+            try:
+                self.respond_json(500, {"ok": False, "error": f"internal error: {exc}"})
+            except Exception:
+                log.exception("failed to send 500 response for %s", self.path)
+
+    def _dispatch_post(self, body: dict[str, Any]) -> None:
         if self.path == "/chat":
             self.handle_chat(body)
             return
@@ -2237,6 +2250,7 @@ class ChatHandler(BaseHTTPRequestHandler):
         self.respond_json(404, {"ok": False, "error": "not found"})
 
     def handle_chat(self, body: dict[str, Any]) -> None:
+        started = time.time()
         message = normalize_text(str(body.get("message") or body.get("input") or ""))
         if not message:
             self.respond_json(400, {"ok": False, "error": "message is required"})
@@ -2261,6 +2275,10 @@ class ChatHandler(BaseHTTPRequestHandler):
             new_session=coerce_bool(body.get("new_session")),
         )
         use_memory = coerce_bool(body.get("use_trajectory_memory"), True)
+        log.info(
+            "chat start user=%s scope=%s session=%s msg_chars=%d use_memory=%s",
+            user, memory_scope, session_key, len(message), use_memory,
+        )
         all_messages = self.server.state.sessions.load_messages(session_key, limit=None)
         summary_state = self.server.state.sessions.get_session_summary(session_key) or {}
         summary_text = str(summary_state.get("summary") or "")
@@ -2293,6 +2311,7 @@ class ChatHandler(BaseHTTPRequestHandler):
             self.respond_json(400, {"ok": False, "error": str(exc)})
             return
         except RuntimeError as exc:
+            log.warning("chat build_system_prompt failed user=%s: %s", user, exc)
             self.respond_json(500, {"ok": False, "error": str(exc)})
             return
 
@@ -2319,12 +2338,17 @@ class ChatHandler(BaseHTTPRequestHandler):
                 tool_env=tool_env,
             )
         except RuntimeError as exc:
+            log.warning("chat provider failed user=%s: %s", user, exc)
             self.respond_json(502, {"ok": False, "error": str(exc)})
             return
 
         retrieval_budgets = self.server.state.read_retrieval_budget_log(retrieval_budget_log_path)
         answer = append_retrieval_budget_summary(provider_result["text"], retrieval_budgets)
         response_hash = hashlib.sha256(answer.encode("utf-8")).hexdigest()[:16]
+        log.info(
+            "chat done user=%s session=%s reply_chars=%d sources=%d elapsed=%.1fs",
+            user, session_key, len(answer), len(memory_sources), time.time() - started,
+        )
 
         source_records: list[dict[str, Any]] = []
         if session_summary_used:
