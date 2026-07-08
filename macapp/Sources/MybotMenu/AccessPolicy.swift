@@ -8,6 +8,8 @@ struct AccessPolicy {
         let visibility: String
         let included: [String]
         let excluded: [String]
+        let excludeAutomated: Bool
+        let excludedOriginDetails: [String]
     }
     var rootsBySource: [String: [Root]] = [:]
 
@@ -28,7 +30,9 @@ struct AccessPolicy {
                 Root(
                     visibility: (root["visibility_mode"] as? String) ?? "blacklist",
                     included: (root["included_workdirs"] as? [String]) ?? [],
-                    excluded: (root["excluded_workdirs"] as? [String]) ?? []
+                    excluded: (root["excluded_workdirs"] as? [String]) ?? [],
+                    excludeAutomated: (root["exclude_automated"] as? Bool) ?? false,
+                    excludedOriginDetails: (root["excluded_origin_details"] as? [String]) ?? []
                 )
             }
         }
@@ -45,6 +49,19 @@ struct AccessPolicy {
 
     private func matches(_ cwd: String, _ rule: String) -> Bool {
         cwd == rule || cwd.hasPrefix(rule + "/")
+    }
+
+    /// Automated clusters excluded on ANY account. The legacy exclude_automated
+    /// flag means every cluster.
+    func excludedClusters() -> Set<String> {
+        var out = Set<String>()
+        for roots in rootsBySource.values {
+            for root in roots {
+                if root.excludeAutomated { out.formUnion(AutomatedCluster.order) }
+                out.formUnion(root.excludedOriginDetails.map { $0.lowercased() })
+            }
+        }
+        return out
     }
 
     /// Excluded workdirs (source, cwd). These have been purged from the index, so

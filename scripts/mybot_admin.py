@@ -693,22 +693,49 @@ def cmd_classify(_args: argparse.Namespace) -> dict[str, Any]:
     return {"ok": True, "sessions": len(rows), "counts": counts, "automated_details": details}
 
 
+AUTOMATED_CLUSTERS = ["subagent", "sdk", "exec", "no-user-turns"]
+
+
 def cmd_automated(args: argparse.Namespace) -> dict[str, Any]:
-    """Toggle exclusion of automated (agent/exec/SDK) sessions across all sources."""
+    """Toggle exclusion of automated sessions — whole category or per cluster.
+
+    Clusters are origin_detail values (subagent/sdk/exec/no-user-turns), stored
+    per account as excluded_origin_details. No --cluster = the whole category.
+    """
     exclude = args.action == "exclude"
+    clusters = [c.strip().lower() for c in (getattr(args, "cluster", None) or [])]
+    whole_category = not clusters
     config = load_access_config()
     for accounts in config.sources.values():
         for account in accounts:
-            account.exclude_automated = exclude
+            if whole_category:
+                account.exclude_automated = exclude
+                if not exclude:
+                    account.excluded_origin_details = []
+            else:
+                current = {d.strip().lower() for d in account.excluded_origin_details}
+                if account.exclude_automated:
+                    # expand the legacy all-on flag so per-cluster edits apply
+                    account.exclude_automated = False
+                    current |= set(AUTOMATED_CLUSTERS)
+                current = current | set(clusters) if exclude else current - set(clusters)
+                account.excluded_origin_details = sorted(current)
     save_access_config(config)
     cfg = _config()
     index = _build_index(cfg)
     if exclude:
-        cmd_classify(argparse.Namespace())  # ensure origin is populated first
-        purge = index.purge_by_origin("automated")
-        return {"ok": True, "action": "exclude", "purge": purge}
+        cmd_classify(argparse.Namespace())  # ensure origin(+detail) is populated first
+        if whole_category:
+            purge: dict[str, Any] = index.purge_by_origin("automated")
+        else:
+            purge = {"purged_sessions": 0, "purged_chunks": 0}
+            for cluster in clusters:
+                got = index.purge_by_origin_detail(cluster)
+                purge["purged_sessions"] += got["purged_sessions"]
+                purge["purged_chunks"] += got["purged_chunks"]
+        return {"ok": True, "action": "exclude", "clusters": clusters or "all", "purge": purge}
     result = index.refresh_changed(include_vectors=True, max_sessions=cfg["refresh_max_sessions"])
-    return {"ok": True, "action": "include", "refresh": result,
+    return {"ok": True, "action": "include", "clusters": clusters or "all", "refresh": result,
             "note": "changed sessions re-index now; a full rebuild restores all automated history"}
 
 
@@ -752,6 +779,12 @@ def main() -> None:
 
     pa = sub.add_parser("automated", help="exclude/include automated (agent-driven) sessions")
     pa.add_argument("--action", required=True, choices=["exclude", "include"])
+    pa.add_argument(
+        "--cluster",
+        nargs="+",
+        choices=AUTOMATED_CLUSTERS,
+        help="limit to specific clusters (default: the whole automated category)",
+    )
 
     args = parser.parse_args()
     handlers = {

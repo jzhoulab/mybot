@@ -539,8 +539,22 @@ class TrajectoryChunkIndex:
         Used to bulk-remove automated/agent-driven sessions the user doesn't want
         in their memory. Requires origin to be populated in metadata_json.
         """
-        query = "SELECT DISTINCT source_ref FROM trajectory_chunks WHERE json_extract(metadata_json, '$.origin') = ?"
-        params: list[Any] = [origin]
+        return self._purge_by_metadata("$.origin", origin, source_names=source_names)
+
+    def purge_by_origin_detail(
+        self, detail: str, *, source_names: list[str] | None = None
+    ) -> dict[str, Any]:
+        """Delete one automated cluster ("subagent"/"sdk"/"exec"/"no-user-turns")."""
+        return self._purge_by_metadata("$.origin_detail", detail, source_names=source_names)
+
+    def _purge_by_metadata(
+        self, json_path: str, value: str, *, source_names: list[str] | None = None
+    ) -> dict[str, Any]:
+        query = (
+            "SELECT DISTINCT source_ref FROM trajectory_chunks "
+            f"WHERE json_extract(metadata_json, '{json_path}') = ?"
+        )
+        params: list[Any] = [value]
         if source_names:
             placeholders = ",".join("?" for _ in source_names)
             query += f" AND source_name IN ({placeholders})"

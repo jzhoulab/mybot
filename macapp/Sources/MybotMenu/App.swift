@@ -328,10 +328,33 @@ struct ContentView: View {
                 Button("Shrink embeddings") { model.runMaintenance("compact_embeddings", label: "Shrinking embeddings") }
                 Button("Reclaim space") { model.runMaintenance("compact", label: "Reclaiming space") }
                 Divider()
-                if model.health.automatedSessions > 0 {
-                    Button("Exclude \(model.health.automatedSessions) automated sessions") { model.excludeAutomated() }
+                if model.clusters.isEmpty {
+                    if model.health.automatedSessions > 0 {
+                        Button("Exclude \(model.health.automatedSessions) automated sessions") { model.excludeAutomated() }
+                    } else {
+                        Button("Re-include automated sessions (rebuild)") { model.includeAutomated() }
+                    }
                 } else {
-                    Button("Re-include automated sessions (rebuild)") { model.includeAutomated() }
+                    Menu("AI-driven sessions") {
+                        ForEach(model.clusters) { cluster in
+                            if cluster.excluded {
+                                Button("Re-include \(cluster.displayName)") {
+                                    model.setCluster(cluster, exclude: false)
+                                }
+                            } else {
+                                Button("Exclude \(cluster.displayName) (\(cluster.count))") {
+                                    model.setCluster(cluster, exclude: true)
+                                }
+                            }
+                        }
+                        Divider()
+                        if model.clusters.contains(where: { !$0.excluded }) {
+                            Button("Exclude all automated") { model.excludeAutomated() }
+                        }
+                        if model.clusters.contains(where: { $0.excluded }) {
+                            Button("Re-include all automated") { model.includeAutomated() }
+                        }
+                    }
                 }
             } label: {
                 chipLabel("Maintain", "wrench.and.screwdriver.fill")

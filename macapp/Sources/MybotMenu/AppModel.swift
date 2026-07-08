@@ -36,6 +36,7 @@ final class AppModel: ObservableObject {
     @Published var projects: [Project] = []
     @Published var newProjects: [NewProject] = []
     @Published var health = Health()
+    @Published var clusters: [AutomatedCluster] = []
     @Published var busyMessage: String?
     @Published var lastError: String?
 
@@ -200,10 +201,22 @@ final class AppModel: ObservableObject {
             health.projectCount = rows.count
             health.automatedSessions = snapshot.automated
 
+            // Automated clusters: counts from the index, exclusion from policy.
+            // An excluded cluster is purged, so it exists only in the policy.
+            let counts = reader.automatedClusters()
+            let excluded = policy.excludedClusters()
+            let clusters = AutomatedCluster.order.compactMap { detail -> AutomatedCluster? in
+                let count = counts[detail] ?? 0
+                let isExcluded = excluded.contains(detail)
+                guard count > 0 || isExcluded else { return nil }
+                return AutomatedCluster(detail: detail, count: count, excluded: isExcluded)
+            }
+
             DispatchQueue.main.async {
                 self.projects = projects
                 self.newProjects = pending
                 self.health = health
+                self.clusters = clusters
                 self.renderIcon()
             }
         }
@@ -297,6 +310,16 @@ final class AppModel: ObservableObject {
     func includeAutomated() {
         runAction("Re-including automated sessions…") {
             $0.run(["automated", "--action", "include"])
+        }
+    }
+
+    func setCluster(_ cluster: AutomatedCluster, exclude: Bool) {
+        let verb = exclude
+            ? "Excluding \(cluster.count) \(cluster.displayName) sessions…"
+            : "Re-including \(cluster.displayName) sessions…"
+        runAction(verb) {
+            $0.run(["automated", "--action", exclude ? "exclude" : "include",
+                    "--cluster", cluster.detail])
         }
     }
 

@@ -47,6 +47,27 @@ struct Session: Identifiable, Hashable {
     }
 }
 
+/// One automated-session cluster (origin_detail) with its index count and
+/// whether the access policy currently excludes it.
+struct AutomatedCluster: Identifiable, Hashable {
+    var id: String { detail }
+    let detail: String
+    var count: Int
+    var excluded: Bool
+
+    static let order = ["subagent", "sdk", "exec", "no-user-turns"]
+
+    var displayName: String {
+        switch detail {
+        case "subagent": return "Subagent runs"
+        case "sdk": return "Claude SDK / headless"
+        case "exec": return "Codex exec"
+        case "no-user-turns": return "No user turns"
+        default: return detail
+        }
+    }
+}
+
 struct NewProject: Identifiable, Hashable {
     var id: String { "\(source)|\(cwd)" }
     let source: String

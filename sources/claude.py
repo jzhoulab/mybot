@@ -142,7 +142,7 @@ class ClaudeSourceAdapter(TrajectorySourceAdapter):
             origin, origin_detail = classify_claude_origin_detailed(
                 entrypoints, sidechain=sidechain, human_turns=human_turns
             )
-            if self.account.exclude_automated and origin == "automated":
+            if self.account.is_origin_excluded(origin, origin_detail):
                 continue
             title = choose_title(slug, user_turns, "claude session")
             sessions.append(

@@ -105,6 +105,30 @@ final class IndexReader {
         return value
     }
 
+    /// Automated sessions per cluster (origin_detail), e.g. sdk/exec/subagent.
+    func automatedClusters() -> [String: Int] {
+        guard let db = openReadOnly() else { return [:] }
+        defer { sqlite3_close(db) }
+        var out: [String: Int] = [:]
+        var stmt: OpaquePointer?
+        let sql = """
+            SELECT COALESCE(json_extract(metadata_json, '$.origin_detail'), ''),
+                   COUNT(DISTINCT source_ref)
+            FROM trajectory_chunks
+            WHERE json_extract(metadata_json, '$.origin') = 'automated'
+            GROUP BY 1
+            """
+        if sqlite3_prepare_v2(db, sql, -1, &stmt, nil) == SQLITE_OK {
+            while sqlite3_step(stmt) == SQLITE_ROW {
+                let detail = text(stmt, 0)
+                guard !detail.isEmpty else { continue }  // legacy rows: run classify to backfill
+                out[detail, default: 0] += Int(sqlite3_column_int(stmt, 1))
+            }
+        }
+        sqlite3_finalize(stmt)
+        return out
+    }
+
     /// Cheap health snapshot: a few counts and a max — instant.
     func health() -> (total: Int, embedded: Int, indexedAt: String, automated: Int) {
         guard let db = openReadOnly() else { return (0, 0, "", 0) }

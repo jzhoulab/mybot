@@ -102,6 +102,9 @@ class TrajectoryAccessAccount:
     excluded_entrypoints: list[str] = field(default_factory=list)
     excluded_session_ids: list[str] = field(default_factory=list)
     exclude_automated: bool = False
+    # Per-cluster automated exclusion (origin_detail values: "subagent", "sdk",
+    # "exec", "no-user-turns"). exclude_automated=True still means all of them.
+    excluded_origin_details: list[str] = field(default_factory=list)
 
     @property
     def expanded_base_dir(self) -> str:
@@ -183,6 +186,16 @@ class TrajectoryAccessAccount:
     def include_session(self, session_id: str, raw_session_id: str = "") -> bool:
         return not self.is_session_blocked(session_id, raw_session_id)
 
+    def is_origin_excluded(self, origin: str, origin_detail: str = "") -> bool:
+        if origin != "automated":
+            return False
+        if self.exclude_automated:
+            return True
+        detail = (origin_detail or "").strip().lower()
+        return bool(detail) and detail in {
+            str(value).strip().lower() for value in self.excluded_origin_details
+        }
+
     def to_json(self) -> dict[str, Any]:
         return {
             "name": self.name,
@@ -196,6 +209,7 @@ class TrajectoryAccessAccount:
             "excluded_entrypoints": self.excluded_entrypoints,
             "excluded_session_ids": self.excluded_session_ids,
             "exclude_automated": self.exclude_automated,
+            "excluded_origin_details": self.excluded_origin_details,
         }
 
 
@@ -331,6 +345,11 @@ def _coerce_accounts(source_name: str, raw: Any) -> list[TrajectoryAccessAccount
                 excluded_entrypoints=excluded_entrypoints,
                 excluded_session_ids=excluded_session_ids,
                 exclude_automated=bool(item.get("exclude_automated", False)),
+                excluded_origin_details=[
+                    str(value).strip().lower()
+                    for value in item.get("excluded_origin_details", []) or []
+                    if str(value).strip()
+                ],
             )
         )
 

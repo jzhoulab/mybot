@@ -143,7 +143,8 @@ class CodexSourceAdapter(TrajectorySourceAdapter):
             if not self.account.include_session(session_id, raw_session_id):
                 continue
             origin = classify_codex_origin(session_source, session_originator)
-            if self.account.exclude_automated and origin == "automated":
+            origin_detail = "exec" if origin == "automated" else ""
+            if self.account.is_origin_excluded(origin, origin_detail):
                 continue
             session = NormalizedTrajectory(
 
@@ -161,6 +162,7 @@ class CodexSourceAdapter(TrajectorySourceAdapter):
                     "raw_session_id": raw_session_id,
                     "cwd": cwd,
                     "origin": origin,
+                    "origin_detail": origin_detail,
                 },
             )
             existing = by_session.get(session.session_id)
