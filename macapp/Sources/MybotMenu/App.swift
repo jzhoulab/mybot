@@ -323,6 +323,31 @@ struct ContentView: View {
         .padding(.horizontal, 12).padding(.vertical, 6)
     }
 
+    // MARK: model switcher
+    private var modelMenu: some View {
+        Menu {
+            Picker("Agent model", selection: Binding(
+                get: { model.currentModel.id },
+                set: { id in if let p = ModelPreset.find(id) { model.setModel(p) } }
+            )) {
+                ForEach(ModelPreset.all) { preset in
+                    Text(preset.label).tag(preset.id)
+                }
+            }
+        } label: {
+            HStack(spacing: 5) {
+                Image(systemName: "brain")
+                    .font(.system(size: 11, weight: .semibold))
+                Text(model.currentModel.family == "claude" ? "Opus 4.8" : "gpt-5.5")
+                    .font(.system(size: 11, weight: .semibold)).lineLimit(1)
+            }
+            .foregroundStyle(Palette.source(model.currentModel.family == "claude" ? "claude" : "codex"))
+        }
+        .menuStyle(.borderlessButton).fixedSize()
+        .disabled(model.busyMessage != nil)
+        .help("Agent model: \(model.currentModel.label)")
+    }
+
     // MARK: mode tabs
     private var modeTabs: some View {
         Picker("", selection: $model.mode) {
@@ -382,6 +407,8 @@ struct ContentView: View {
 
             Button { model.openControlRoom() } label: { chipLabel("Web UI", "safari.fill") }
                 .buttonStyle(.plain)
+
+            modelMenu
 
             Spacer()
 

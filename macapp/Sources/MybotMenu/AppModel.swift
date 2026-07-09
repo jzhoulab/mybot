@@ -37,6 +37,7 @@ final class AppModel: ObservableObject {
     @Published var newProjects: [NewProject] = []
     @Published var health = Health()
     @Published var clusters: [AutomatedCluster] = []
+    @Published var currentModel: ModelPreset = ModelPreset.all[0]
     /// True while the index is being rewritten under us (read failed or looked
     /// wiped). We keep showing the last good snapshot instead of zeros.
     @Published var indexBusy = false
@@ -234,6 +235,14 @@ final class AppModel: ObservableObject {
             // An excluded cluster is purged, so it exists only in the policy.
             let counts = reader.automatedClusters()
             let excluded = policy.excludedClusters()
+
+            // Current agent model, read straight from model_config.json (local).
+            var modelPreset = ModelPreset.all[0]
+            if let data = try? Data(contentsOf: cfg.modelConfigPath),
+               let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+               let preset = obj["preset"] as? String, let found = ModelPreset.find(preset) {
+                modelPreset = found
+            }
             let clusters = AutomatedCluster.order.compactMap { detail -> AutomatedCluster? in
                 let count = counts[detail] ?? 0
                 let isExcluded = excluded.contains(detail)
@@ -246,6 +255,7 @@ final class AppModel: ObservableObject {
                 self.newProjects = pending
                 self.health = health
                 self.clusters = clusters
+                self.currentModel = modelPreset
                 self.indexBusy = false
                 self.suspectEmptyReads = 0
                 self.renderIcon()
@@ -366,6 +376,12 @@ final class AppModel: ObservableObject {
     }
 
     func openControlRoom() { NSWorkspace.shared.open(config.guiURL) }
+
+    func setModel(_ preset: ModelPreset) {
+        guard preset.id != currentModel.id else { return }
+        currentModel = preset  // optimistic; reload() confirms from disk
+        runAction("Switching to \(preset.label)…") { $0.setModel(preset.id) }
+    }
 
     // ---- ask: local FTS search (debounced) + server chat -------------------
     func searchMemory(_ query: String) {

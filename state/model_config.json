@@ -1,0 +1,6 @@
+{
+  "backend": "claude_cli",
+  "model": "claude-opus-4-8",
+  "thinking": "ultra",
+  "preset": "opus-ultra"
+}

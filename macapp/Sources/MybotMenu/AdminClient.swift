@@ -77,4 +77,8 @@ struct AdminClient {
     func maintenance(_ action: String) -> Result {
         run(["maintenance", "--action", action])
     }
+
+    func setModel(_ presetId: String) -> Result {
+        run(["model", "--action", "set", "--preset", presetId])
+    }
 }

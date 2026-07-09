@@ -47,6 +47,22 @@ struct Session: Identifiable, Hashable {
     }
 }
 
+/// A selectable agent model preset. Mirrors MODEL_PRESETS in mybot_admin.py.
+struct ModelPreset: Identifiable, Hashable {
+    let id: String
+    let label: String
+    let family: String   // "claude" | "codex" — for the tag color
+
+    static let all: [ModelPreset] = [
+        ModelPreset(id: "opus-ultra", label: "Claude Opus 4.8 · ultra", family: "claude"),
+        ModelPreset(id: "opus-high", label: "Claude Opus 4.8 · high", family: "claude"),
+        ModelPreset(id: "sonnet-high", label: "Claude Sonnet 5 · high", family: "claude"),
+        ModelPreset(id: "codex-xhigh", label: "Codex gpt-5.5 · xhigh", family: "codex"),
+        ModelPreset(id: "codex-high", label: "Codex gpt-5.5 · high", family: "codex"),
+    ]
+    static func find(_ id: String) -> ModelPreset? { all.first { $0.id == id } }
+}
+
 /// One full-text hit in the trajectory index, grouped by session.
 struct SearchHit: Identifiable, Hashable {
     var id: String { ref }

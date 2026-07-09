@@ -750,6 +750,53 @@ def cmd_retitle(_args: argparse.Namespace) -> dict[str, Any]:
 
 AUTOMATED_CLUSTERS = ["subagent", "sdk", "exec", "no-user-turns"]
 
+# Selectable agent presets for the menu switcher. label is what the UI shows.
+MODEL_PRESETS = [
+    {"id": "opus-ultra", "label": "Claude Opus 4.8 · ultra",
+     "backend": "claude_cli", "model": "claude-opus-4-8", "thinking": "ultra"},
+    {"id": "opus-high", "label": "Claude Opus 4.8 · high",
+     "backend": "claude_cli", "model": "claude-opus-4-8", "thinking": "high"},
+    {"id": "sonnet-high", "label": "Claude Sonnet 5 · high",
+     "backend": "claude_cli", "model": "claude-sonnet-5", "thinking": "high"},
+    {"id": "codex-xhigh", "label": "Codex gpt-5.5 · xhigh",
+     "backend": "codex_cli", "model": "gpt-5.5", "thinking": "xhigh"},
+    {"id": "codex-high", "label": "Codex gpt-5.5 · high",
+     "backend": "codex_cli", "model": "gpt-5.5", "thinking": "high"},
+]
+
+
+def _model_config_path() -> Path:
+    override = os.environ.get("MODEL_CONFIG_PATH")
+    if override:
+        return Path(override)
+    return REPO_ROOT / "state" / "model_config.json"
+
+
+def cmd_model(args: argparse.Namespace) -> dict[str, Any]:
+    """Get or set the live agent model (menu switcher). Writes model_config.json
+    which the server reads per-request — no restart needed."""
+    path = _model_config_path()
+    current: dict[str, Any] = {}
+    try:
+        current = json.loads(path.read_text())
+    except (OSError, json.JSONDecodeError):
+        current = {}
+
+    if args.action == "set":
+        preset = next((p for p in MODEL_PRESETS if p["id"] == args.preset), None)
+        if not preset:
+            return {"ok": False, "error": f"unknown preset {args.preset!r}",
+                    "presets": [p["id"] for p in MODEL_PRESETS]}
+        payload = {"backend": preset["backend"], "model": preset["model"],
+                   "thinking": preset["thinking"], "preset": preset["id"]}
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps(payload, indent=2))
+        return {"ok": True, "action": "set", "current": payload, "presets": MODEL_PRESETS}
+
+    # get
+    return {"ok": True, "action": "get", "current": current, "presets": MODEL_PRESETS,
+            "config_path": str(path)}
+
 
 def cmd_automated(args: argparse.Namespace) -> dict[str, Any]:
     """Toggle exclusion of automated sessions — whole category or per cluster.
@@ -832,6 +879,9 @@ def main() -> None:
 
     sub.add_parser("classify", help="backfill session origin into existing metadata")
     sub.add_parser("retitle", help="recompute junk session titles in place")
+    pm = sub.add_parser("model", help="get/set the live agent model (menu switcher)")
+    pm.add_argument("--action", choices=["get", "set"], default="get")
+    pm.add_argument("--preset", default="")
 
     pa = sub.add_parser("automated", help="exclude/include automated (agent-driven) sessions")
     pa.add_argument("--action", required=True, choices=["exclude", "include"])
@@ -853,6 +903,7 @@ def main() -> None:
         "trajectory": cmd_trajectory,
         "classify": cmd_classify,
         "retitle": cmd_retitle,
+        "model": cmd_model,
         "automated": cmd_automated,
     }
     try:

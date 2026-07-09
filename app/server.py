@@ -338,6 +338,11 @@ class AppConfig:
     codex_service_tier: str
     codex_reasoning_effort: str
     codex_planner_reasoning_effort: str
+    claude_command: str
+    claude_model: str
+    claude_thinking: str
+    claude_planner_thinking: str
+    model_config_path: str
     mybot_tool_python: str
     embedding_model_name: str
     imported_owner_actor_id: str
@@ -632,6 +637,98 @@ class ProviderClient:
         parts.append("Respond directly to the user.")
         return "\n\n".join(parts)
 
+    # Claude thinking presets → token budget (Claude Code reads MAX_THINKING_TOKENS).
+    _CLAUDE_THINKING_TOKENS = {
+        "off": 0, "low": 4000, "medium": 10000, "high": 20000, "ultra": 31999, "xhigh": 31999,
+    }
+
+    def active_model(self) -> dict[str, str]:
+        """Effective backend/model/thinking, honoring a live override file so the
+        menu app can switch models without a server restart. Falls back to the
+        startup config. mtime-cached to avoid re-reading every request."""
+        path = self.config.model_config_path
+        override: dict[str, Any] = {}
+        try:
+            mtime = os.path.getmtime(path)
+            cached = getattr(self, "_model_override_cache", None)
+            if cached and cached[0] == mtime:
+                override = cached[1]
+            else:
+                with open(path, encoding="utf-8") as handle:
+                    loaded = json.load(handle)
+                override = loaded if isinstance(loaded, dict) else {}
+                self._model_override_cache = (mtime, override)
+        except (OSError, json.JSONDecodeError):
+            override = {}
+
+        backend = str(override.get("backend") or self.config.provider_backend).strip().lower()
+        if backend == "claude_cli":
+            model = str(override.get("model") or self.config.claude_model)
+            thinking = str(override.get("thinking") or self.config.claude_thinking)
+        elif backend == "codex_cli":
+            model = str(override.get("model") or self.config.model_name or "gpt-5.5")
+            thinking = str(override.get("thinking") or self.config.codex_reasoning_effort)
+        else:
+            model = str(override.get("model") or self.config.model_name or "")
+            thinking = str(override.get("thinking") or "")
+        return {"backend": backend, "model": model, "thinking": thinking}
+
+    def _run_claude(
+        self,
+        *,
+        system_prompt: str,
+        message: str,
+        model: str,
+        thinking: str,
+        ephemeral: bool,
+        tool_env: dict[str, str] | None,
+    ) -> dict[str, Any]:
+        # The internal planner (ephemeral) runs tool-free + cheap thinking; the
+        # user-facing answer gets restricted Bash to run mybot_tool + full thinking.
+        think_key = (self.config.claude_planner_thinking if ephemeral else thinking).lower()
+        tokens = self._CLAUDE_THINKING_TOKENS.get(think_key, self._CLAUDE_THINKING_TOKENS["ultra"])
+
+        cmd = [self.config.claude_command, "-p", "--model", model,
+               "--output-format", "json", "--permission-mode", "default"]
+        if system_prompt:
+            cmd.extend(["--append-system-prompt", system_prompt])
+        # allowedTools is a strict whitelist in headless mode: anything not listed
+        # is auto-denied. The planner (ephemeral) gets no tools; the answer gets
+        # ONLY the mybot tool via a Bash command prefix — no file/edit/web access.
+        if not ephemeral:
+            tool_prefix = f"{self.config.mybot_tool_python} {self.config.mybot_tool_path}"
+            cmd.extend(["--allowedTools", f"Bash({tool_prefix}:*)"])
+        # NOTE: prompt goes via stdin, NOT as a positional arg — the variadic
+        # --allowedTools/--append flags would otherwise swallow it.
+
+        env = os.environ.copy()
+        env["MAX_THINKING_TOKENS"] = str(tokens)
+        if tool_env:
+            env.update(tool_env)
+        proc = subprocess.run(cmd, input=message, capture_output=True, text=True, env=env)
+        if proc.returncode != 0:
+            stderr = normalize_text(proc.stderr, 1500)
+            stdout = normalize_text(proc.stdout, 1500)
+            raise RuntimeError(f"Claude CLI failed (exit {proc.returncode}). stderr={stderr} stdout={stdout}")
+
+        text = ""
+        raw: Any = None
+        try:
+            raw = json.loads(proc.stdout)
+            if isinstance(raw, dict):
+                text = str(raw.get("result") or "")
+                if raw.get("is_error"):
+                    raise RuntimeError(f"Claude CLI reported error: {text[:500]}")
+        except json.JSONDecodeError:
+            text = proc.stdout.strip()
+        return {
+            "text": text.strip(),
+            "raw": raw,
+            "provider_style": "claude_cli",
+            "backend_session_id": None,
+            "usage": (raw or {}).get("usage") if isinstance(raw, dict) else None,
+        }
+
     def _run_codex(
         self,
         *,
@@ -639,6 +736,8 @@ class ProviderClient:
         backend_session_id: str | None,
         ephemeral: bool = False,
         tool_env: dict[str, str] | None = None,
+        model: str | None = None,
+        reasoning_effort: str | None = None,
     ) -> dict[str, Any]:
         if self.config.codex_disable_backend_resume:
             backend_session_id = None
@@ -648,7 +747,7 @@ class ProviderClient:
             cmd.extend(["-c", f'service_tier="{self.config.codex_service_tier}"'])
         # Reasoning effort per call: the internal query planner (ephemeral) runs
         # cheap so retrieval stays fast; user-facing answers think at full depth.
-        effort = (
+        effort = reasoning_effort or (
             self.config.codex_planner_reasoning_effort
             if ephemeral
             else self.config.codex_reasoning_effort
@@ -675,8 +774,9 @@ class ProviderClient:
                 cmd.append("--ephemeral")
             if not self.config.codex_permission_profile:
                 cmd.extend(["--sandbox", self.config.codex_sandbox])
-        if self.config.model_name:
-            cmd.extend(["--model", self.config.model_name])
+        effective_model = model or self.config.model_name
+        if effective_model:
+            cmd.extend(["--model", effective_model])
         if backend_session_id:
             cmd.append(backend_session_id)
         cmd.append(prompt)
@@ -733,13 +833,29 @@ class ProviderClient:
         ephemeral: bool = False,
         tool_env: dict[str, str] | None = None,
     ) -> dict[str, Any]:
-        if self.config.provider_backend == "codex_cli":
+        active = self.active_model()
+        if active["backend"] == "claude_cli":
+            # Claude gets the mybot context via --append-system-prompt and the
+            # history+message folded into the positional prompt (same shape as codex).
+            user_prompt = self._build_codex_prompt(system_prompt="", history=history, message=message)
+            return self._run_claude(
+                system_prompt=system_prompt,
+                message=user_prompt,
+                model=active["model"],
+                thinking=active["thinking"],
+                ephemeral=ephemeral,
+                tool_env=tool_env,
+            )
+
+        if active["backend"] == "codex_cli":
             prompt = self._build_codex_prompt(system_prompt=system_prompt, history=history, message=message)
             return self._run_codex(
                 prompt=prompt,
                 backend_session_id=backend_session_id,
                 ephemeral=ephemeral,
                 tool_env=tool_env,
+                model=active["model"],
+                reasoning_effort=(active["thinking"] if not ephemeral else None),
             )
 
         base_url = self.config.model_base_url.rstrip("/")
@@ -2181,11 +2297,14 @@ class ChatHandler(BaseHTTPRequestHandler):
             return
         if path == "/health":
             cfg = self.server.state.config
+            active = self.server.state.provider.active_model()
             self.respond_json(
                 200,
                 {
                     "ok": True,
-                    "provider_backend": cfg.provider_backend,
+                    "provider_backend": active["backend"],
+                    "active_model": active["model"],
+                    "active_thinking": active["thinking"],
                     "model_base_url": cfg.model_base_url,
                     "model_name": cfg.model_name,
                     "model_api_style": cfg.model_api_style,
@@ -2963,8 +3082,8 @@ def parse_args() -> argparse.Namespace:
 
 def load_config(args: argparse.Namespace) -> AppConfig:
     provider_backend = os.environ.get("MODEL_BACKEND", "openai_compatible").strip().lower()
-    if provider_backend not in {"openai_compatible", "codex_cli"}:
-        raise SystemExit("MODEL_BACKEND must be 'openai_compatible' or 'codex_cli'")
+    if provider_backend not in {"openai_compatible", "codex_cli", "claude_cli"}:
+        raise SystemExit("MODEL_BACKEND must be 'openai_compatible', 'codex_cli', or 'claude_cli'")
 
     model_api_key = os.environ.get("MODEL_API_KEY", "").strip() or None
     model_api_style = os.environ.get("MODEL_API_STYLE", "chat_completions").strip().lower()
@@ -3031,6 +3150,11 @@ def load_config(args: argparse.Namespace) -> AppConfig:
         # planner so retrieval doesn't crawl.
         codex_reasoning_effort=os.environ.get("CODEX_REASONING_EFFORT", "xhigh").strip(),
         codex_planner_reasoning_effort=os.environ.get("CODEX_PLANNER_REASONING_EFFORT", "low").strip(),
+        claude_command=os.environ.get("CLAUDE_COMMAND", "claude").strip() or "claude",
+        claude_model=os.environ.get("CLAUDE_MODEL", "claude-opus-4-8").strip() or "claude-opus-4-8",
+        claude_thinking=os.environ.get("CLAUDE_THINKING", "ultra").strip() or "ultra",
+        claude_planner_thinking=os.environ.get("CLAUDE_PLANNER_THINKING", "off").strip() or "off",
+        model_config_path=os.environ.get("MODEL_CONFIG_PATH", str(Path(args.state_dir) / "model_config.json")),
         mybot_tool_python=os.environ.get("MYBOT_TOOL_PYTHON", sys.executable or "python3"),
         embedding_model_name=os.environ.get("EMBEDDING_MODEL_NAME", "sentence-transformers/all-MiniLM-L6-v2"),
         imported_owner_actor_id=os.environ.get("MEMORY_IMPORTED_OWNER_ID", "local-owner"),

@@ -10,6 +10,7 @@ struct MybotConfig {
     let dbPath: URL
     let accessConfigPath: URL
     let memoryDbPath: URL
+    let modelConfigPath: URL
     let guiURL: URL
     /// The actor that owns the imported memories (MEMORY_IMPORTED_OWNER_ID).
     /// Chat must identify as this actor or the server blocks trajectory lookup
@@ -40,6 +41,7 @@ struct MybotConfig {
             dbPath: resolvePath("TRAJECTORY_INDEX_DB_PATH", "state/trajectory_index.sqlite3"),
             accessConfigPath: resolvePath("TRAJECTORY_ACCESS_CONFIG_PATH", "config/access.json"),
             memoryDbPath: resolvePath("MEMORY_DB_PATH", "state/semantic_memory.sqlite3"),
+            modelConfigPath: resolvePath("MODEL_CONFIG_PATH", "state/model_config.json"),
             guiURL: URL(string: "http://127.0.0.1:\(port)/gui")!,
             ownerActorID: env["MEMORY_IMPORTED_OWNER_ID"] ?? "local-owner"
         )
