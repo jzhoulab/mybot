@@ -48,7 +48,8 @@ from trajectory_memory import load_index
 
 log = get_logger("mybot.server", "server.log")
 
-WORKSPACE_FILES = ["AGENTS.md", "SOUL.md", "USER.md", "IDENTITY.md", "MEMORY.md"]
+# USER.md is handled separately as the owner profile (prominent, generated).
+WORKSPACE_FILES = ["AGENTS.md", "SOUL.md", "IDENTITY.md", "MEMORY.md"]
 LOCAL_LOOKUP_PRIORITY_THRESHOLD = 50.0
 LOCAL_LOOKUP_RANK_BOOST = 60.0
 CHUNK_INDEX_RANK_BOOST = 15.0
@@ -2129,6 +2130,63 @@ class AppState:
                     budgets.append(record)
         return budgets
 
+    OWNER_PROFILE_FILE = "USER.md"
+    OWNER_INVESTIGATION_PROMPT = (
+        "Investigate my own trajectory memory and write a concise profile of ME, the owner "
+        "of this assistant — so future answers are grounded in who I am. Search across my "
+        "sessions and cover: my role/field, the domains and systems I work on, my active "
+        "projects and tools, and my working style/preferences. Be specific and grounded in "
+        "evidence; do not invent. Output ONLY the profile as 4-8 short markdown bullets, no preamble."
+    )
+
+    def owner_profile_path(self) -> Path:
+        return Path(self.config.workspace_dir) / self.OWNER_PROFILE_FILE
+
+    def get_owner_profile(self) -> str:
+        try:
+            return self.owner_profile_path().read_text().strip()
+        except OSError:
+            return ""
+
+    def save_owner_profile(self, text: str) -> None:
+        path = self.owner_profile_path()
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(text.strip() + "\n")
+
+    def generate_owner_profile(self) -> str:
+        """Run the agent to investigate trajectories and draft an owner profile.
+        Returns the draft; the caller decides whether to save it."""
+        actor_id = normalize_text(self.config.imported_owner_actor_id, 128)
+        system_prompt, _sources, _summary = self.build_system_prompt(
+            query=self.OWNER_INVESTIGATION_PROMPT,
+            actor_id=actor_id,
+            memory_scope="private",
+            target_user_id=None,
+            session_summary="",
+            use_memory=True,
+            match_limit=self.config.memory_match_limit,
+        )
+        budget_log = (
+            self.new_retrieval_budget_log_path()
+            if self.config.agentic_tool_routing else None
+        )
+        tool_env = self.tool_env_for_request(
+            actor_id=actor_id, memory_scope="private", target_user_id=None,
+            retrieval_budget_log_path=str(budget_log) if budget_log else None,
+        )
+        result = self.provider.chat(
+            system_prompt=system_prompt, history=[],
+            message=self.OWNER_INVESTIGATION_PROMPT, tool_env=tool_env,
+        )
+        text = str(result.get("text") or "").strip()
+        # Drop any preamble before the first bullet/heading (the model sometimes
+        # adds "Here's the profile:" despite instructions).
+        lines = text.splitlines()
+        for i, line in enumerate(lines):
+            if line.lstrip().startswith(("-", "*", "#")):
+                return "\n".join(lines[i:]).strip()
+        return text
+
     def build_system_prompt(
         self,
         *,
@@ -2144,6 +2202,15 @@ class AppState:
         workspace_prompt = self.workspace.render()
         if workspace_prompt:
             sections.append(workspace_prompt)
+
+        owner_profile = self.get_owner_profile()
+        if owner_profile:
+            sections.append(
+                "## Who You Serve (Owner Profile)\n"
+                "This assistant answers for a single owner. Ground interpretation of vague "
+                "requests, shorthand, and 'my/our' references in this profile:\n"
+                f"{owner_profile}"
+            )
 
         sections.append(
             "## Grounding Policy\n"
@@ -2348,6 +2415,9 @@ class ChatHandler(BaseHTTPRequestHandler):
         if self.path == "/chat":
             self.handle_chat(body)
             return
+        if self.path == "/owner/profile":
+            self.handle_owner_profile(body)
+            return
         if self.path == "/gui/query":
             self.handle_gui_query(body)
             return
@@ -2394,6 +2464,37 @@ class ChatHandler(BaseHTTPRequestHandler):
             self.handle_session_reset(body)
             return
         self.respond_json(404, {"ok": False, "error": "not found"})
+
+    def handle_owner_profile(self, body: dict[str, Any]) -> None:
+        action = str(body.get("action") or "get").strip().lower()
+        state = self.server.state
+        if action == "get":
+            self.respond_json(200, {"ok": True, "profile": state.get_owner_profile()})
+            return
+        if action == "save":
+            text = str(body.get("text") or "").strip()[:8000]  # keep markdown newlines
+            if not text:
+                self.respond_json(400, {"ok": False, "error": "text is required to save"})
+                return
+            state.save_owner_profile(text)
+            self.respond_json(200, {"ok": True, "profile": state.get_owner_profile()})
+            return
+        if action == "generate":
+            started = time.time()
+            log.info("owner profile generation started")
+            try:
+                draft = state.generate_owner_profile()
+            except RuntimeError as exc:
+                log.warning("owner profile generation failed: %s", exc)
+                self.respond_json(502, {"ok": False, "error": str(exc)})
+                return
+            save = coerce_bool(body.get("save"), False)
+            if save and draft:
+                state.save_owner_profile(draft)
+            log.info("owner profile generated in %.1fs (saved=%s)", time.time() - started, save and bool(draft))
+            self.respond_json(200, {"ok": True, "draft": draft, "saved": save and bool(draft)})
+            return
+        self.respond_json(400, {"ok": False, "error": f"unknown action {action!r}"})
 
     def handle_chat(self, body: dict[str, Any]) -> None:
         started = time.time()
