@@ -3039,7 +3039,7 @@ def load_config(args: argparse.Namespace) -> AppConfig:
         trajectory_query_planner=coerce_bool(os.environ.get("TRAJECTORY_QUERY_PLANNER"), True),
         trajectory_query_planner_max_rounds=int(os.environ.get("TRAJECTORY_QUERY_PLANNER_MAX_ROUNDS", "2")),
         trajectory_query_planner_max_queries=int(os.environ.get("TRAJECTORY_QUERY_PLANNER_MAX_QUERIES", "4")),
-        trajectory_search_time_budget_seconds=float(os.environ.get("TRAJECTORY_SEARCH_TIME_BUDGET_SECONDS", "15")),
+        trajectory_search_time_budget_seconds=float(os.environ.get("TRAJECTORY_SEARCH_TIME_BUDGET_SECONDS", "25")),
         agentic_tool_routing=coerce_bool(os.environ.get("AGENTIC_TOOL_ROUTING"), True),
         mybot_tool_path=os.environ.get("MYBOT_TOOL_PATH", str(Path(codex_cwd) / "bin" / "mybot_tool.py")),
         sync_tokens_path=sync_tokens_path,

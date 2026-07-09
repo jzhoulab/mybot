@@ -155,9 +155,9 @@ def enforce_total_budget(command: str) -> None:
     if command not in ("memory-search", "trajectory-search"):
         return
     try:
-        budget = float(os.environ.get("MYBOT_TOOL_TOTAL_BUDGET_SECONDS", "45"))
+        budget = float(os.environ.get("MYBOT_TOOL_TOTAL_BUDGET_SECONDS", "90"))
     except ValueError:
-        budget = 45.0
+        budget = 90.0
     spent = spent_seconds()
     if spent <= budget:
         return
