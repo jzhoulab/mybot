@@ -54,7 +54,7 @@ final class AppModel: ObservableObject {
 
     @Published var search = ""
     @Published var sourceFilter = "all"
-    @Published var statusFilter: StatusFilter = .all
+    @Published var statusFilter: StatusFilter = .included
     @Published var sortOrder: SortOrder = .sessions
     @Published var statusIcon = NSImage()
 

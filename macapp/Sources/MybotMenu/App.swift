@@ -476,6 +476,11 @@ struct ProjectRow: View {
 struct SessionDetail: View {
     @ObservedObject var model: AppModel
     let project: Project
+    @State private var showAutomated = false
+
+    private var humanSessions: [Session] { model.sessions.filter { !$0.isAutomated } }
+    private var automatedSessions: [Session] { model.sessions.filter { $0.isAutomated } }
+    private var visibleSessions: [Session] { showAutomated ? model.sessions : humanSessions }
 
     var body: some View {
         VStack(spacing: 0) {
@@ -508,11 +513,13 @@ struct SessionDetail: View {
                 }
                 Text(project.cwd).font(.system(size: 10)).foregroundStyle(.secondary)
                     .lineLimit(1).truncationMode(.middle)
-                Text("\(model.sessions.count) session\(model.sessions.count == 1 ? "" : "s") indexed")
+                Text(sessionCountLine)
                     .font(.system(size: 10, weight: .semibold)).foregroundStyle(.secondary)
             }
             .frame(maxWidth: .infinity, alignment: .leading)
             .padding(.horizontal, 16).padding(.bottom, 8)
+
+            if !automatedSessions.isEmpty { automatedToggle }
 
             Divider().opacity(0.4)
 
@@ -521,10 +528,16 @@ struct SessionDetail: View {
             } else {
                 ScrollView {
                     VStack(spacing: 6) {
-                        ForEach(model.sessions) { session in
+                        ForEach(visibleSessions) { session in
                             SessionRow(session: session,
                                        onOpen: { model.openTrajectory(session) },
                                        exclude: { model.excludeSession(session) })
+                        }
+                        if visibleSessions.isEmpty {
+                            Text(showAutomated ? "No sessions indexed"
+                                               : "Only AI-driven sessions here — toggle above to see them")
+                                .font(.system(size: 11)).foregroundStyle(.secondary)
+                                .frame(maxWidth: .infinity).padding(.top, 30)
                         }
                     }
                     .padding(.horizontal, 12).padding(.vertical, 8)
@@ -532,6 +545,41 @@ struct SessionDetail: View {
             }
         }
         .frame(maxHeight: .infinity)
+    }
+
+    private var sessionCountLine: String {
+        let human = humanSessions.count
+        var line = "\(human) session\(human == 1 ? "" : "s")"
+        if !automatedSessions.isEmpty { line += " · \(automatedSessions.count) AI-driven" }
+        return line
+    }
+
+    /// Prominent, always-visible switch for the hidden AI-driven sessions.
+    private var automatedToggle: some View {
+        Button { withAnimation(.easeOut(duration: 0.15)) { showAutomated.toggle() } } label: {
+            HStack(spacing: 8) {
+                Image(systemName: "sparkles")
+                    .font(.system(size: 11, weight: .semibold))
+                Text(showAutomated
+                     ? "Showing \(automatedSessions.count) AI-driven session\(automatedSessions.count == 1 ? "" : "s")"
+                     : "\(automatedSessions.count) AI-driven session\(automatedSessions.count == 1 ? "" : "s") hidden")
+                    .font(.system(size: 11.5, weight: .semibold))
+                Spacer()
+                Text(showAutomated ? "HIDE" : "SHOW")
+                    .font(.system(size: 10, weight: .heavy)).tracking(0.5)
+                    .padding(.horizontal, 9).padding(.vertical, 3.5)
+                    .background(Capsule().fill(Color.purple.opacity(0.18)))
+            }
+            .foregroundStyle(showAutomated ? Color.purple : Color.purple.opacity(0.85))
+            .padding(.horizontal, 11).padding(.vertical, 7)
+            .background(RoundedRectangle(cornerRadius: 9, style: .continuous)
+                .fill(Color.purple.opacity(showAutomated ? 0.10 : 0.07)))
+            .overlay(RoundedRectangle(cornerRadius: 9, style: .continuous)
+                .strokeBorder(Color.purple.opacity(0.25)))
+            .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
+        .padding(.horizontal, 12).padding(.bottom, 8)
     }
 }
 
@@ -1045,6 +1093,15 @@ enum UIExporter {
             }
             .padding(12).frame(width: 480).environment(\.colorScheme, scheme).background(bg)
             write(sessionRows, name.replacingOccurrences(of: "ui-", with: "sessions-"))
+
+            // Full session-detail with the AI-driven toggle (2 human + 1 AI)
+            let detailModel = AppModel.sample()
+            detailModel.sessions = sampleSessions
+            let detail = SessionDetail(model: detailModel,
+                                       project: Project(source: "codex", cwd: "/Users/you/Code/demoapp",
+                                                        sessions: 3, chunks: 125, updatedAt: "2026-07-06T08:00:00Z", included: true))
+                .frame(width: 480, height: 360).environment(\.colorScheme, scheme).background(bg)
+            write(detail, name.replacingOccurrences(of: "ui-", with: "detail-"))
 
             let events = [
                 TrajectoryEvent(kind: "user", tool: "", text: "can you read README.md and tell me the best model for variant-effect prediction?"),
