@@ -105,11 +105,12 @@ struct AutomatedCluster: Identifiable, Hashable {
     var count: Int
     var excluded: Bool
 
-    static let order = ["subagent", "sdk", "exec", "no-user-turns"]
+    static let order = ["subagent", "orchestrated", "sdk", "exec", "no-user-turns"]
 
     var displayName: String {
         switch detail {
         case "subagent": return "Subagent runs"
+        case "orchestrated": return "Orchestrated (worktree agents)"
         case "sdk": return "Claude SDK / headless"
         case "exec": return "Codex exec"
         case "no-user-turns": return "No user turns"

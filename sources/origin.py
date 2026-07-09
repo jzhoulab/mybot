@@ -17,12 +17,25 @@ Signals, strongest first (claude):
 
 from __future__ import annotations
 
+import re
 from typing import Any
 
 AUTOMATED_CLAUDE_ENTRYPOINTS = {"sdk-cli", "sdk-py", "sdk-ts", "sdk", "headless", "print"}
 
+# Agent orchestrators (agentctl dispatcher, etc.) run agents in dedicated git worktrees
+# named like `.agent-worktrees/`, `.worktrees/`, `.agent-worktrees/`. A dot-prefixed
+# "*worktrees" path segment is a strong "launched by an orchestrator" signal — the
+# turns inside are injected task prompts, not a human typing, even at entrypoint=cli.
+AGENT_WORKTREE_RE = re.compile(r"/\.[^/]*worktrees?/", re.IGNORECASE)
 
-def classify_codex_origin(source: str, originator: str) -> str:
+
+def is_agent_worktree(cwd: str | None) -> bool:
+    return bool(cwd) and bool(AGENT_WORKTREE_RE.search(str(cwd)))
+
+
+def classify_codex_origin(source: str, originator: str, cwd: str | None = None) -> str:
+    if is_agent_worktree(cwd):
+        return "automated"
     src = (source or "").strip().lower()
     orig = (originator or "").strip().lower()
     if src == "exec" or "exec" in orig:
@@ -35,10 +48,15 @@ def classify_claude_origin_detailed(
     *,
     sidechain: bool = False,
     human_turns: int | None = None,
+    cwd: str | None = None,
 ) -> tuple[str, str]:
     """Return (origin, detail). detail explains WHY a session is automated."""
     if sidechain:
         return "automated", "subagent"
+    # Orchestrated agent runs (worktrees) look interactive by entrypoint + have
+    # "user" turns, but those turns are machine-injected tasks — check before them.
+    if is_agent_worktree(cwd):
+        return "automated", "orchestrated"
     for entrypoint in entrypoints or []:
         if str(entrypoint).strip().lower() in AUTOMATED_CLAUDE_ENTRYPOINTS:
             return "automated", "sdk"
@@ -52,9 +70,10 @@ def classify_claude_origin(
     *,
     sidechain: bool = False,
     human_turns: int | None = None,
+    cwd: str | None = None,
 ) -> str:
     return classify_claude_origin_detailed(
-        entrypoints, sidechain=sidechain, human_turns=human_turns
+        entrypoints, sidechain=sidechain, human_turns=human_turns, cwd=cwd
     )[0]
 
 

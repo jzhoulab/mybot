@@ -140,7 +140,7 @@ class ClaudeSourceAdapter(TrajectorySourceAdapter):
             if not self.account.include_session(session_id, raw_session_id):
                 continue
             origin, origin_detail = classify_claude_origin_detailed(
-                entrypoints, sidechain=sidechain, human_turns=human_turns
+                entrypoints, sidechain=sidechain, human_turns=human_turns, cwd=cwd
             )
             if self.account.is_origin_excluded(origin, origin_detail):
                 continue

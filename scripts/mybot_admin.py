@@ -646,8 +646,10 @@ def cmd_classify(_args: argparse.Namespace) -> dict[str, Any]:
                 metadata = json.loads(row["mj"] or "{}")
             except json.JSONDecodeError:
                 metadata = {}
+            from sources.origin import is_agent_worktree
             source_name = str(row["sn"] or "")
             path = str(row["fp"] or "")
+            cwd = str(metadata.get("cwd") or "")
             origin = ""
             detail = ""
             if source_name == "claude":
@@ -658,20 +660,25 @@ def cmd_classify(_args: argparse.Namespace) -> dict[str, Any]:
                             entrypoints or metadata.get("entrypoints"),
                             sidechain=sidechain,
                             human_turns=human_turns,
+                            cwd=cwd,
                         )
                     except Exception:
                         origin = ""
                 if not origin:  # file gone — fall back to indexed entrypoints
-                    origin, detail = classify_claude_origin_detailed(metadata.get("entrypoints"))
+                    origin, detail = classify_claude_origin_detailed(
+                        metadata.get("entrypoints"), cwd=cwd)
             elif source_name == "codex" and path and os.path.exists(path):
                 try:
                     with open(path) as handle:
                         payload = json.loads(handle.readline(512 * 1024)).get("payload", {})
                     src = payload.get("source")
+                    cwd = str(payload.get("cwd") or cwd)
                     origin = classify_codex_origin(
-                        src if isinstance(src, str) else "", str(payload.get("originator") or "")
+                        src if isinstance(src, str) else "", str(payload.get("originator") or ""),
+                        cwd=cwd,
                     )
-                    detail = "exec" if origin == "automated" else ""
+                    detail = "" if origin == "interactive" else (
+                        "orchestrated" if is_agent_worktree(cwd) else "exec")
                 except Exception:
                     origin = ""
             if not origin:
@@ -748,7 +755,7 @@ def cmd_retitle(_args: argparse.Namespace) -> dict[str, Any]:
     return {"ok": True, "junk_sessions": len(rows), "retitled": retitled, "skipped": skipped}
 
 
-AUTOMATED_CLUSTERS = ["subagent", "sdk", "exec", "no-user-turns"]
+AUTOMATED_CLUSTERS = ["subagent", "sdk", "exec", "orchestrated", "no-user-turns"]
 
 import re
 import shutil

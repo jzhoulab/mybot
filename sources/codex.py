@@ -14,7 +14,7 @@ from .common import (
     recent_files,
 )
 from .models import NormalizedTrajectory, TrajectorySourceAdapter
-from .origin import classify_codex_origin
+from .origin import classify_codex_origin, is_agent_worktree
 
 
 def load_codex_index(base_dir: str) -> dict[str, str]:
@@ -142,8 +142,10 @@ class CodexSourceAdapter(TrajectorySourceAdapter):
             session_id = self.account.scoped_session_id(raw_session_id)
             if not self.account.include_session(session_id, raw_session_id):
                 continue
-            origin = classify_codex_origin(session_source, session_originator)
-            origin_detail = "exec" if origin == "automated" else ""
+            origin = classify_codex_origin(session_source, session_originator, cwd=cwd)
+            origin_detail = "" if origin == "interactive" else (
+                "orchestrated" if is_agent_worktree(cwd) else "exec"
+            )
             if self.account.is_origin_excluded(origin, origin_detail):
                 continue
             session = NormalizedTrajectory(
