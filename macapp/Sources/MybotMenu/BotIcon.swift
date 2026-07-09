@@ -2,8 +2,8 @@ import SwiftUI
 
 enum BotMood { case happy, alert, error, sleepy }
 
-/// A little robot face for the menu bar. The head color + expression encode
-/// index health; a red badge shows how many projects await review.
+/// A little robot-bunny face. The head color + expression encode index health;
+/// a red badge shows how many projects await review.
 struct BotIcon: View {
     var mood: BotMood
     var accent: Color
@@ -11,6 +11,7 @@ struct BotIcon: View {
 
     private let ink = Color(white: 0.16)
     private let face = Color(white: 0.98)
+    private let innerEar = Color(red: 1, green: 0.72, blue: 0.78)
 
     var body: some View {
         Canvas { ctx, size in
@@ -20,37 +21,37 @@ struct BotIcon: View {
                 Path(roundedRect: CGRect(x: x * s, y: y * s, width: w * s, height: h * s), cornerRadius: r * s)
             }
 
-            // antenna
-            var stem = Path()
-            stem.move(to: pt(11, 5)); stem.addLine(to: pt(11, 2.6))
-            ctx.stroke(stem, with: .color(ink), lineWidth: 1.3 * s)
-            ctx.fill(Path(ellipseIn: CGRect(x: 9.3 * s, y: 0.4 * s, width: 3.4 * s, height: 3.4 * s)),
-                     with: .color(accent))
-            ctx.stroke(Path(ellipseIn: CGRect(x: 9.3 * s, y: 0.4 * s, width: 3.4 * s, height: 3.4 * s)),
-                       with: .color(ink.opacity(0.5)), lineWidth: 0.7 * s)
-
-            // ears
-            for ex in [1.6, 18.8] as [CGFloat] {
-                ctx.fill(roundRect(ex, 9.5, 1.9, 4, 0.9), with: .color(accent))
-                ctx.stroke(roundRect(ex, 9.5, 1.9, 4, 0.9), with: .color(ink.opacity(0.7)), lineWidth: 0.7 * s)
+            // bunny ears — tall, slightly splayed, pink inner ear
+            for (cx, deg) in [(CGFloat(7.3), -9.0), (CGFloat(14.7), 9.0)] {
+                var ear = ctx
+                ear.translateBy(x: cx * s, y: 5.4 * s)
+                ear.rotate(by: .degrees(deg))
+                let outer = Path(ellipseIn: CGRect(x: -1.9 * s, y: -4.9 * s, width: 3.8 * s, height: 9.8 * s))
+                ear.fill(outer, with: .color(accent))
+                ear.stroke(outer, with: .color(ink.opacity(0.85)), lineWidth: 1.0 * s)
+                ear.fill(Path(ellipseIn: CGRect(x: -0.95 * s, y: -3.1 * s, width: 1.9 * s, height: 6.4 * s)),
+                         with: .color(innerEar))
             }
 
-            // head
-            let head = roundRect(3.2, 5, 15.6, 14, 5)
+            // head — erase the ear stems underneath first so the semi-opaque
+            // gradient fill doesn't let their outlines ghost through
+            let head = roundRect(3.2, 8.2, 15.6, 12.6, 5.4)
+            var punch = ctx; punch.blendMode = .destinationOut
+            punch.fill(head, with: .color(.black))
             ctx.fill(head, with: .linearGradient(
                 Gradient(colors: [accent, accent.opacity(0.82)]),
-                startPoint: pt(11, 5), endPoint: pt(11, 19)))
+                startPoint: pt(11, 8), endPoint: pt(11, 21)))
             ctx.stroke(head, with: .color(ink.opacity(0.85)), lineWidth: 1.1 * s)
 
             // face plate
-            let plate = roundRect(5.4, 8, 11.2, 8, 3.6)
+            let plate = roundRect(5.4, 10.5, 11.2, 7.7, 3.5)
             ctx.fill(plate, with: .color(face))
 
             drawFace(ctx, s: s)
 
             // cheeks
-            for cx in [6.5, 15.5] as [CGFloat] {
-                ctx.fill(Path(ellipseIn: CGRect(x: (cx - 0.9) * s, y: 12.4 * s, width: 1.9 * s, height: 1.3 * s)),
+            for cx in [6.6, 15.4] as [CGFloat] {
+                ctx.fill(Path(ellipseIn: CGRect(x: (cx - 0.9) * s, y: 14.7 * s, width: 1.9 * s, height: 1.3 * s)),
                          with: .color(Color(red: 1, green: 0.5, blue: 0.55).opacity(0.55)))
             }
 
@@ -68,7 +69,7 @@ struct BotIcon: View {
     }
 
     private func drawFace(_ ctx: GraphicsContext, s: CGFloat) {
-        let eyeY: CGFloat = 11
+        let eyeY: CGFloat = 13.3
         let eyes: [CGFloat] = [8.4, 13.6]
         switch mood {
         case .happy, .alert:
@@ -80,10 +81,10 @@ struct BotIcon: View {
             }
             var mouth = Path()
             if mood == .happy {
-                mouth.move(to: CGPoint(x: 9 * s, y: 13.9 * s))
-                mouth.addQuadCurve(to: CGPoint(x: 13 * s, y: 13.9 * s), control: CGPoint(x: 11 * s, y: 15.6 * s))
+                mouth.move(to: CGPoint(x: 9.2 * s, y: 16 * s))
+                mouth.addQuadCurve(to: CGPoint(x: 12.8 * s, y: 16 * s), control: CGPoint(x: 11 * s, y: 17.5 * s))
             } else {
-                mouth.addEllipse(in: CGRect(x: 10.2 * s, y: 13.8 * s, width: 1.6 * s, height: 1.6 * s))
+                mouth.addEllipse(in: CGRect(x: 10.2 * s, y: 15.9 * s, width: 1.6 * s, height: 1.6 * s))
             }
             ctx.stroke(mouth, with: .color(ink), lineWidth: 1.0 * s)
         case .error:
@@ -94,8 +95,8 @@ struct BotIcon: View {
                 ctx.stroke(x2, with: .color(ink), lineWidth: 1.1 * s)
             }
             var mouth = Path()
-            mouth.move(to: CGPoint(x: 9 * s, y: 15 * s))
-            mouth.addQuadCurve(to: CGPoint(x: 13 * s, y: 15 * s), control: CGPoint(x: 11 * s, y: 13.6 * s))
+            mouth.move(to: CGPoint(x: 9.2 * s, y: 17.1 * s))
+            mouth.addQuadCurve(to: CGPoint(x: 12.8 * s, y: 17.1 * s), control: CGPoint(x: 11 * s, y: 15.8 * s))
             ctx.stroke(mouth, with: .color(ink), lineWidth: 1.0 * s)
         case .sleepy:
             for ex in eyes {
@@ -103,8 +104,29 @@ struct BotIcon: View {
                 line.move(to: CGPoint(x: (ex - 1.1) * s, y: eyeY * s)); line.addLine(to: CGPoint(x: (ex + 1.1) * s, y: eyeY * s))
                 ctx.stroke(line, with: .color(ink), lineWidth: 1.1 * s)
             }
-            let z = Text("z").font(.system(size: 5 * s, weight: .bold)).foregroundColor(ink)
-            ctx.draw(ctx.resolve(z), at: CGPoint(x: 15 * s, y: 8 * s))
+            let z = Text("z").font(.system(size: 4.6 * s, weight: .bold)).foregroundColor(ink)
+            ctx.draw(ctx.resolve(z), at: CGPoint(x: 11 * s, y: 4.6 * s))
+        }
+    }
+}
+
+/// The in-app avatar: the same look as the app icon (white bunny-bot on the
+/// teal→blue gradient tile), scaled down. Mood still shows in the face.
+struct BotAvatar: View {
+    var mood: BotMood
+
+    var body: some View {
+        GeometryReader { geo in
+            ZStack {
+                RoundedRectangle(cornerRadius: geo.size.width * 0.28, style: .continuous)
+                    .fill(LinearGradient(
+                        colors: [Color(red: 0.36, green: 0.80, blue: 0.72),
+                                 Color(red: 0.22, green: 0.58, blue: 0.86)],
+                        startPoint: .topLeading, endPoint: .bottomTrailing))
+                BotIcon(mood: mood, accent: Color(red: 0.98, green: 0.99, blue: 1.0))
+                    .frame(width: geo.size.width * 0.72, height: geo.size.height * 0.72)
+                    .offset(y: geo.size.height * 0.02)
+            }
         }
     }
 }
@@ -126,15 +148,19 @@ struct BotIconMono: View {
                 Path(roundedRect: CGRect(x: x * s, y: y * s, width: w * s, height: h * s), cornerRadius: r * s)
             }
 
-            // antenna
-            var stem = Path(); stem.move(to: CGPoint(x: 11 * s, y: 5 * s)); stem.addLine(to: CGPoint(x: 11 * s, y: 2.6 * s))
-            stroke(stem, 1.3)
-            fill(Path(ellipseIn: CGRect(x: 9.7 * s, y: 0.9 * s, width: 2.6 * s, height: 2.6 * s)))
-            // ears
-            fill(roundRect(1.5, 10, 1.9, 3.6, 0.9))
-            fill(roundRect(18.6, 10, 1.9, 3.6, 0.9))
-            // head (outline)
-            stroke(roundRect(3.4, 5, 15.2, 14, 5), 1.5)
+            // bunny ears (outline, slightly splayed)
+            for (cx, deg) in [(CGFloat(7.3), -9.0), (CGFloat(14.7), 9.0)] {
+                var ear = ctx
+                ear.translateBy(x: cx * s, y: 5.2 * s)
+                ear.rotate(by: .degrees(deg))
+                ear.stroke(Path(ellipseIn: CGRect(x: -1.8 * s, y: -4.6 * s, width: 3.6 * s, height: 9.2 * s)),
+                           with: .color(ink), lineWidth: 1.4 * s)
+            }
+            // head — erase the ear arcs that dip inside, then outline
+            let head = roundRect(3.4, 8.2, 15.2, 12.4, 5.2)
+            var punch = ctx; punch.blendMode = .destinationOut
+            punch.fill(head, with: .color(.black))
+            stroke(head, 1.5)
 
             drawFace(ctx, s: s, fill: fill, stroke: stroke)
 
@@ -150,17 +176,17 @@ struct BotIconMono: View {
 
     private func drawFace(_ ctx: GraphicsContext, s: CGFloat,
                           fill: (Path) -> Void, stroke: (Path, CGFloat) -> Void) {
-        let eyeY: CGFloat = 11
+        let eyeY: CGFloat = 13.3
         let eyes: [CGFloat] = [8.4, 13.6]
         switch mood {
         case .happy, .alert:
             for ex in eyes { fill(Path(ellipseIn: CGRect(x: (ex - 1) * s, y: (eyeY - 1) * s, width: 2 * s, height: 2 * s))) }
             var mouth = Path()
             if mood == .happy {
-                mouth.move(to: CGPoint(x: 9.2 * s, y: 14 * s))
-                mouth.addQuadCurve(to: CGPoint(x: 12.8 * s, y: 14 * s), control: CGPoint(x: 11 * s, y: 15.5 * s))
+                mouth.move(to: CGPoint(x: 9.2 * s, y: 16.1 * s))
+                mouth.addQuadCurve(to: CGPoint(x: 12.8 * s, y: 16.1 * s), control: CGPoint(x: 11 * s, y: 17.6 * s))
             } else {
-                mouth.addEllipse(in: CGRect(x: 10.3 * s, y: 13.9 * s, width: 1.4 * s, height: 1.4 * s))
+                mouth.addEllipse(in: CGRect(x: 10.3 * s, y: 16 * s, width: 1.4 * s, height: 1.4 * s))
             }
             stroke(mouth, 1.1)
         case .error:
@@ -169,7 +195,7 @@ struct BotIconMono: View {
                 var b = Path(); b.move(to: CGPoint(x: (ex + 1) * s, y: (eyeY - 1) * s)); b.addLine(to: CGPoint(x: (ex - 1) * s, y: (eyeY + 1) * s))
                 stroke(a, 1.1); stroke(b, 1.1)
             }
-            var mouth = Path(); mouth.move(to: CGPoint(x: 9.2 * s, y: 15 * s)); mouth.addQuadCurve(to: CGPoint(x: 12.8 * s, y: 15 * s), control: CGPoint(x: 11 * s, y: 13.7 * s))
+            var mouth = Path(); mouth.move(to: CGPoint(x: 9.2 * s, y: 17.1 * s)); mouth.addQuadCurve(to: CGPoint(x: 12.8 * s, y: 17.1 * s), control: CGPoint(x: 11 * s, y: 15.8 * s))
             stroke(mouth, 1.1)
         case .sleepy:
             for ex in eyes {

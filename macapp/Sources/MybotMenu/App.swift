@@ -148,8 +148,8 @@ struct ContentView: View {
         let h = model.health
         return VStack(spacing: 12) {
             HStack(spacing: 11) {
-                BotIcon(mood: model.mood, accent: model.accentColor)
-                    .frame(width: 34, height: 34)
+                BotAvatar(mood: model.mood)
+                    .frame(width: 36, height: 36)
                 VStack(alignment: .leading, spacing: 1) {
                     Text("mybot memory").font(.system(size: 15, weight: .bold))
                     Text(statusLine).font(.system(size: 11)).foregroundStyle(.secondary).lineLimit(1)
