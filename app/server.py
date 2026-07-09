@@ -336,6 +336,8 @@ class AppConfig:
     codex_disable_backend_resume: bool
     codex_ephemeral: bool
     codex_service_tier: str
+    codex_reasoning_effort: str
+    codex_planner_reasoning_effort: str
     mybot_tool_python: str
     embedding_model_name: str
     imported_owner_actor_id: str
@@ -644,6 +646,15 @@ class ProviderClient:
         cmd = [self.config.codex_command]
         if self.config.codex_service_tier:
             cmd.extend(["-c", f'service_tier="{self.config.codex_service_tier}"'])
+        # Reasoning effort per call: the internal query planner (ephemeral) runs
+        # cheap so retrieval stays fast; user-facing answers think at full depth.
+        effort = (
+            self.config.codex_planner_reasoning_effort
+            if ephemeral
+            else self.config.codex_reasoning_effort
+        )
+        if effort:
+            cmd.extend(["-c", f'model_reasoning_effort="{effort}"'])
         if self.config.codex_permission_profile:
             cmd.extend(self._codex_permission_profile_args())
         elif self.config.codex_sandbox == "workspace-write" and self.config.codex_network_access:
@@ -2974,6 +2985,10 @@ def load_config(args: argparse.Namespace) -> AppConfig:
     model_name = os.environ.get("MODEL_NAME", "").strip() or None
     if provider_backend == "openai_compatible" and model_name is None:
         model_name = "gpt-4.1-mini"
+    # codex ignores ~/.codex/config.toml here (--ignore-user-config), so default
+    # to the latest model explicitly instead of codex's built-in fallback.
+    if provider_backend == "codex_cli" and model_name is None:
+        model_name = os.environ.get("CODEX_MODEL", "gpt-5.5").strip() or None
 
     sync_tokens_path = os.environ.get("SYNC_TOKENS_PATH", "").strip() or args.sync_tokens_path
     if sync_tokens_path != args.sync_tokens_path and not os.path.exists(sync_tokens_path):
@@ -3010,6 +3025,12 @@ def load_config(args: argparse.Namespace) -> AppConfig:
         ),
         codex_ephemeral=coerce_bool(os.environ.get("CODEX_EPHEMERAL"), False),
         codex_service_tier=os.environ.get("CODEX_SERVICE_TIER", "fast").strip(),
+        # mybot runs codex with --ignore-user-config, so ~/.codex/config.toml
+        # (model, reasoning) is NOT applied — we must pass these explicitly.
+        # xhigh for the user-facing answer; a cheap tier for the internal query
+        # planner so retrieval doesn't crawl.
+        codex_reasoning_effort=os.environ.get("CODEX_REASONING_EFFORT", "xhigh").strip(),
+        codex_planner_reasoning_effort=os.environ.get("CODEX_PLANNER_REASONING_EFFORT", "low").strip(),
         mybot_tool_python=os.environ.get("MYBOT_TOOL_PYTHON", sys.executable or "python3"),
         embedding_model_name=os.environ.get("EMBEDDING_MODEL_NAME", "sentence-transformers/all-MiniLM-L6-v2"),
         imported_owner_actor_id=os.environ.get("MEMORY_IMPORTED_OWNER_ID", "local-owner"),
