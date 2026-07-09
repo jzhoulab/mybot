@@ -15,12 +15,19 @@ AUTO_PREFIXES = (
     "<turn_aborted>",
     "<system-reminder>",
     "<command-name>",
+    "<command-message>",
     "<task-notification>",
     "<local-command-stdout>",
+    "<local-command-caveat>",
     "Automation:",
     "Automation ID:",
     "<subagent_notification>",
     "Independently run a",
+    "Caveat: The messages below",
+    # injected agent prompts (sdk/automated sessions) — never a human title
+    "You are a ",
+    "You are an ",
+    "You are the ",
 )
 UUID_RE = re.compile(r"^[0-9a-f]{8}-[0-9a-f]{4}-")
 ROLLOUT_RE = re.compile(r"^rollout-\d{4}-\d{2}-\d{2}T")

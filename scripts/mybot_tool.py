@@ -129,7 +129,53 @@ def write_budget_log(budget: dict[str, Any], payload: dict[str, Any]) -> None:
         return
 
 
+def spent_seconds() -> float:
+    """Total retrieval seconds already spent in THIS chat request (from the
+    per-request budget log the server points us at)."""
+    log_path = os.environ.get("MYBOT_TOOL_BUDGET_LOG", "").strip()
+    if not log_path or not os.path.exists(log_path):
+        return 0.0
+    total = 0.0
+    try:
+        with open(log_path, encoding="utf-8") as handle:
+            for line in handle:
+                try:
+                    total += float(json.loads(line).get("seconds") or 0)
+                except (json.JSONDecodeError, TypeError, ValueError):
+                    continue
+    except OSError:
+        return 0.0
+    return total
+
+
+def enforce_total_budget(command: str) -> None:
+    """Stop runaway search loops: after the per-request budget is spent, tell
+    the model to answer with the evidence it already has instead of searching
+    again. Reads stay allowed — using found evidence is the goal."""
+    if command not in ("memory-search", "trajectory-search"):
+        return
+    try:
+        budget = float(os.environ.get("MYBOT_TOOL_TOTAL_BUDGET_SECONDS", "45"))
+    except ValueError:
+        budget = 45.0
+    spent = spent_seconds()
+    if spent <= budget:
+        return
+    print_json({
+        "ok": False,
+        "budget_exhausted": True,
+        "error": (
+            f"Retrieval budget exhausted ({spent:.0f}s spent of {budget:.0f}s). "
+            "Do NOT search again. Answer the user now using the evidence already "
+            "retrieved; if nothing relevant was found, say the memory has no "
+            "grounded record of it."
+        ),
+    })
+    raise SystemExit(0)
+
+
 def call_and_print(args: argparse.Namespace, path: str, payload: dict[str, Any]) -> None:
+    enforce_total_budget(args.command)
     started_at = time.monotonic()
     result = post_json(args.base_url, path, payload)
     result = attach_budget(

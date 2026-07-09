@@ -361,6 +361,7 @@ class AppConfig:
     trajectory_query_planner: bool
     trajectory_query_planner_max_rounds: int
     trajectory_query_planner_max_queries: int
+    trajectory_search_time_budget_seconds: float
     agentic_tool_routing: bool
     mybot_tool_path: str
     sync_tokens_path: str
@@ -1550,7 +1551,11 @@ class AppState:
         title_lines: list[str] = []
         for candidate in candidates[:6]:
             title = normalize_text(str(candidate.get("title") or ""), 120)
+            # Junk titles (injected prompts, tag noise) poison the planner: it
+            # echoes them back as "queries" and the search never converges.
             if title.lower().startswith("system and memory context"):
+                continue
+            if title.startswith(("<", "#")) or title.lower().startswith("you are "):
                 continue
             cwd = normalize_text(str(candidate.get("cwd") or ""), 80)
             title_lines.append(f"- {title}" + (f"  [{cwd}]" if cwd else ""))
@@ -1601,6 +1606,9 @@ class AppState:
             key = cleaned.lower()
             if not cleaned or len(cleaned) < 3 or key in prior_lower or key in seen:
                 continue
+            # Degenerate echoes of junk titles/tags are never useful queries.
+            if "<" in cleaned or ">" in cleaned or len(cleaned) > 90:
+                continue
             seen.add(key)
             deduped.append(cleaned)
             if len(deduped) >= max_queries:
@@ -1643,6 +1651,7 @@ class AppState:
         context: str = "",
         discovered: list[str] | None = None,
     ) -> list[dict[str, Any]]:
+        search_started = time.monotonic()
         refresh = self.ensure_trajectory_chunk_index_current()
         if trace is not None and refresh.get("rebuilt"):
             trace.append(
@@ -1735,7 +1744,18 @@ class AppState:
             rounds = 0
             max_rounds = max(0, self.config.trajectory_query_planner_max_rounds)
             engage = self._planner_should_engage(query=query, context=context, current=current)
+            # Each planner round spawns a model call; without a wall-clock cap a
+            # weak query cascades into minutes of retries and the client times out.
+            time_budget = max(1.0, self.config.trajectory_search_time_budget_seconds)
             while rounds < max_rounds and engage:
+                if time.monotonic() - search_started > time_budget:
+                    log.info(
+                        "trajectory search planner stopped: time budget %.0fs spent (query=%r rounds=%d)",
+                        time_budget, query[:60], rounds,
+                    )
+                    if trace is not None:
+                        trace.append({"stage": "planner:budget", "seconds": round(time.monotonic() - search_started, 1)})
+                    break
                 before_top = trajectory_rank_score(current[0], query=query) if current else 0.0
                 planned = self.plan_trajectory_queries(
                     query=query,
@@ -3019,6 +3039,7 @@ def load_config(args: argparse.Namespace) -> AppConfig:
         trajectory_query_planner=coerce_bool(os.environ.get("TRAJECTORY_QUERY_PLANNER"), True),
         trajectory_query_planner_max_rounds=int(os.environ.get("TRAJECTORY_QUERY_PLANNER_MAX_ROUNDS", "2")),
         trajectory_query_planner_max_queries=int(os.environ.get("TRAJECTORY_QUERY_PLANNER_MAX_QUERIES", "4")),
+        trajectory_search_time_budget_seconds=float(os.environ.get("TRAJECTORY_SEARCH_TIME_BUDGET_SECONDS", "15")),
         agentic_tool_routing=coerce_bool(os.environ.get("AGENTIC_TOOL_ROUTING"), True),
         mybot_tool_path=os.environ.get("MYBOT_TOOL_PATH", str(Path(codex_cwd) / "bin" / "mybot_tool.py")),
         sync_tokens_path=sync_tokens_path,

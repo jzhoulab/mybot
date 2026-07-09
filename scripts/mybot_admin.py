@@ -693,6 +693,61 @@ def cmd_classify(_args: argparse.Namespace) -> dict[str, Any]:
     return {"ok": True, "sessions": len(rows), "counts": counts, "automated_details": details}
 
 
+def cmd_retitle(_args: argparse.Namespace) -> dict[str, Any]:
+    """Recompute junk session titles in place (embeddings untouched).
+
+    Titles picked before the AUTO_PREFIXES additions are injected prompts /
+    tag noise ("<local-command-caveat>…", "You are the editing agent…"). They
+    poison retrieval: the query planner echoes them back as queries and never
+    converges. Recomputes from the first genuine user turn via a bounded file
+    scan; updates trajectory_chunks + the FTS title column directly.
+    """
+    from sources.common import is_real_user_text, normalize_text
+
+    cfg = _config()
+    junk_like = ("<%", "You are %", "Caveat:%", "# AGENTS.md%")
+    retitled = 0
+    skipped = 0
+    with sqlite3.connect(cfg["db_path"]) as conn:
+        conn.row_factory = sqlite3.Row
+        where = " OR ".join("title LIKE ?" for _ in junk_like)
+        rows = conn.execute(
+            "SELECT source_ref, MAX(source_name) AS sn, MAX(file_path) AS fp, MAX(title) AS t "
+            f"FROM trajectory_chunks WHERE {where} GROUP BY source_ref",
+            junk_like,
+        ).fetchall()
+        for row in rows:
+            path = str(row["fp"] or "")
+            source = str(row["sn"] or "")
+            if not path or not os.path.exists(path):
+                skipped += 1
+                continue
+            try:
+                events, _ = _parse_trajectory(path, source, cap=300)
+            except Exception:
+                skipped += 1
+                continue
+            new_title = ""
+            for event in events:
+                if event.get("kind") == "user" and is_real_user_text(event.get("text", "")):
+                    new_title = normalize_text(event["text"], limit=90)
+                    break
+            if not new_title:
+                new_title = f"{source} session"
+            conn.execute(
+                "UPDATE trajectory_chunks SET title = ? WHERE source_ref = ?",
+                (new_title, row["source_ref"]),
+            )
+            conn.execute(
+                "UPDATE trajectory_chunks_fts SET title = ? WHERE rowid IN "
+                "(SELECT id FROM trajectory_chunks WHERE source_ref = ?)",
+                (new_title, row["source_ref"]),
+            )
+            retitled += 1
+        conn.commit()
+    return {"ok": True, "junk_sessions": len(rows), "retitled": retitled, "skipped": skipped}
+
+
 AUTOMATED_CLUSTERS = ["subagent", "sdk", "exec", "no-user-turns"]
 
 
@@ -776,6 +831,7 @@ def main() -> None:
     ptj.add_argument("--limit", type=int, default=500)
 
     sub.add_parser("classify", help="backfill session origin into existing metadata")
+    sub.add_parser("retitle", help="recompute junk session titles in place")
 
     pa = sub.add_parser("automated", help="exclude/include automated (agent-driven) sessions")
     pa.add_argument("--action", required=True, choices=["exclude", "include"])
@@ -796,6 +852,7 @@ def main() -> None:
         "review": cmd_review,
         "trajectory": cmd_trajectory,
         "classify": cmd_classify,
+        "retitle": cmd_retitle,
         "automated": cmd_automated,
     }
     try:

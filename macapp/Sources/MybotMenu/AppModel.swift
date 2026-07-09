@@ -391,8 +391,9 @@ final class AppModel: ObservableObject {
                 guard let self else { return }
                 self.chatPending = false
                 switch result {
-                case .success(let text):
-                    self.chat.append(ChatMsg(role: "assistant", text: text))
+                case .success(let reply):
+                    self.chat.append(ChatMsg(role: "assistant", text: reply.text,
+                                             sources: reply.sources, toolCalls: reply.toolCalls))
                 case .failure(let error):
                     self.chat.append(ChatMsg(role: "error", text: error.localizedDescription))
                 }

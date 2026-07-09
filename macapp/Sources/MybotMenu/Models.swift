@@ -69,11 +69,14 @@ struct SearchHit: Identifiable, Hashable {
     }
 }
 
-/// One turn in the in-app chat with mybot.
+/// One turn in the in-app chat with mybot. Assistant turns carry the
+/// internals (sources used + retrieval steps) that Discord replies hide.
 struct ChatMsg: Identifiable, Hashable {
     let id = UUID()
     let role: String   // "user" | "assistant" | "error"
     let text: String
+    var sources: [ChatSource] = []
+    var toolCalls: [ChatToolCall] = []
 }
 
 /// One automated-session cluster (origin_detail) with its index count and

@@ -723,7 +723,16 @@ struct AskView: View {
                         if model.chat.isEmpty && model.searchHits.isEmpty && !model.chatPending {
                             emptyHint
                         }
-                        ForEach(model.chat) { msg in ChatBubble(msg: msg) }
+                        ForEach(model.chat) { msg in
+                            ChatBubble(msg: msg) { source in
+                                model.openTrajectory(Session(
+                                    ref: source.ref,
+                                    sessionId: String(source.ref.split(separator: ":").last ?? ""),
+                                    title: source.title,
+                                    updatedAt: "",
+                                    chunks: 0))
+                            }
+                        }
                         if model.chatPending {
                             HStack(spacing: 7) {
                                 ProgressView().controlSize(.small)
@@ -803,6 +812,14 @@ struct AskView: View {
 
 struct ChatBubble: View {
     let msg: ChatMsg
+    var onOpenSource: ((ChatSource) -> Void)? = nil
+    @State private var showInternals: Bool
+
+    init(msg: ChatMsg, startExpanded: Bool = false, onOpenSource: ((ChatSource) -> Void)? = nil) {
+        self.msg = msg
+        self.onOpenSource = onOpenSource
+        _showInternals = State(initialValue: startExpanded)
+    }
 
     var body: some View {
         switch msg.role {
@@ -825,16 +842,91 @@ struct ChatBubble: View {
             .frame(maxWidth: .infinity, alignment: .leading)
             .id(msg.id)
         default:
-            HStack(alignment: .top, spacing: 8) {
-                BotAvatar(mood: .happy).frame(width: 20, height: 20)
-                Text(.init(msg.text))   // renders basic markdown
-                    .font(.system(size: 12)).textSelection(.enabled)
-                    .frame(maxWidth: .infinity, alignment: .leading)
+            VStack(alignment: .leading, spacing: 0) {
+                HStack(alignment: .top, spacing: 8) {
+                    BotAvatar(mood: .happy).frame(width: 20, height: 20)
+                    Text(.init(msg.text))   // renders basic markdown
+                        .font(.system(size: 12)).textSelection(.enabled)
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                }
+                if !msg.sources.isEmpty || !msg.toolCalls.isEmpty {
+                    internals.padding(.top, 8)
+                }
             }
             .padding(9)
             .background(RoundedRectangle(cornerRadius: 10, style: .continuous).fill(Color.primary.opacity(0.05)))
             .id(msg.id)
         }
+    }
+
+    /// What mybot did behind the scenes: retrieval steps + grounding sources.
+    private var internals: some View {
+        VStack(alignment: .leading, spacing: 6) {
+            Button { showInternals.toggle() } label: {
+                HStack(spacing: 5) {
+                    Image(systemName: "gearshape.2.fill").font(.system(size: 9))
+                    Text(internalsSummary).font(.system(size: 10, weight: .semibold))
+                    Image(systemName: showInternals ? "chevron.down" : "chevron.right")
+                        .font(.system(size: 8, weight: .semibold))
+                }
+                .foregroundStyle(.secondary)
+                .contentShape(Rectangle())
+            }
+            .buttonStyle(.plain)
+
+            if showInternals {
+                ForEach(msg.toolCalls) { call in
+                    HStack(spacing: 5) {
+                        Image(systemName: "magnifyingglass").font(.system(size: 8.5))
+                        Text(call.query.isEmpty ? call.tool : "\(call.tool) · “\(call.query)”")
+                            .lineLimit(1)
+                        Spacer(minLength: 4)
+                        Text("\(call.results) hit\(call.results == 1 ? "" : "s") · \(String(format: "%.2fs", call.seconds))")
+                    }
+                    .font(.system(size: 10, design: .monospaced))
+                    .foregroundStyle(.secondary)
+                }
+                ForEach(msg.sources) { source in
+                    Button {
+                        onOpenSource?(source)
+                    } label: {
+                        HStack(spacing: 6) {
+                            SourceTag(source: source.sourceName)
+                            Text(source.title.isEmpty ? source.ref : source.title)
+                                .font(.system(size: 10.5, weight: .medium)).lineLimit(1)
+                            Spacer(minLength: 4)
+                            if let score = source.score {
+                                Text(String(format: "%.0f", score))
+                                    .font(.system(size: 9.5, design: .monospaced))
+                                    .foregroundStyle(.secondary)
+                            }
+                            if source.isOpenable {
+                                Image(systemName: "chevron.right")
+                                    .font(.system(size: 8, weight: .semibold)).foregroundStyle(.secondary)
+                            }
+                        }
+                        .padding(.vertical, 4).padding(.horizontal, 6)
+                        .background(RoundedRectangle(cornerRadius: 7, style: .continuous)
+                            .fill(Color.primary.opacity(0.045)))
+                        .contentShape(Rectangle())
+                    }
+                    .buttonStyle(.plain)
+                    .disabled(!source.isOpenable)
+                }
+            }
+        }
+    }
+
+    private var internalsSummary: String {
+        var parts: [String] = []
+        if !msg.toolCalls.isEmpty {
+            let secs = msg.toolCalls.reduce(0) { $0 + $1.seconds }
+            parts.append("\(msg.toolCalls.count) retrieval step\(msg.toolCalls.count == 1 ? "" : "s") · \(String(format: "%.2fs", secs))")
+        }
+        if !msg.sources.isEmpty {
+            parts.append("\(msg.sources.count) source\(msg.sources.count == 1 ? "" : "s")")
+        }
+        return parts.joined(separator: " · ")
     }
 }
 
@@ -896,7 +988,19 @@ enum UIExporter {
             askModel.chat = [
                 ChatMsg(role: "user", text: "what did I do with fable recently?"),
                 ChatMsg(role: "assistant",
-                        text: "You mostly worked on the **fable evaluation harness** — last week you fixed the scoring regression and re-ran the benchmark suite in `~/Code/demo-project`."),
+                        text: "You mostly worked on the **fable evaluation harness** — last week you fixed the scoring regression and re-ran the benchmark suite in `~/Code/demo-project`.",
+                        sources: [
+                            ChatSource(ref: "codex:0199aaa", sourceName: "codex", kind: "chunk",
+                                       title: "Fix fable scoring regression", score: 87),
+                            ChatSource(ref: "claude:bb31c02", sourceName: "claude", kind: "session",
+                                       title: "fable benchmark sweep", score: 61),
+                        ],
+                        toolCalls: [
+                            ChatToolCall(tool: "memory-search", query: "fable recent work",
+                                         seconds: 0.02, results: 5, tokens: 140),
+                            ChatToolCall(tool: "trajectory-search", query: "fable",
+                                         seconds: 0.31, results: 3, tokens: 480),
+                        ]),
             ]
             askModel.searchHits = [
                 SearchHit(ref: "codex:0199aaa", source: "codex", title: "Fix fable scoring regression",
@@ -913,7 +1017,7 @@ enum UIExporter {
 
             // ScrollView contents don't render offline — render the ask pieces directly
             write(VStack(alignment: .leading, spacing: 10) {
-                ForEach(askModel.chat) { msg in ChatBubble(msg: msg) }
+                ForEach(askModel.chat) { msg in ChatBubble(msg: msg, startExpanded: true) }
                 ChatBubble(msg: ChatMsg(role: "error", text: "chat server is not running — start it with run_discord_chatbot.sh"))
                 Text("MEMORY MATCHES").font(.system(size: 10, weight: .heavy)).tracking(0.6)
                     .foregroundStyle(.secondary)
