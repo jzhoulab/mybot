@@ -324,24 +324,43 @@ struct ContentView: View {
     }
 
     // MARK: model switcher
+    /// Presets grouped by model (e.g. "Claude Opus" → low/medium/high/xhigh/max),
+    /// so the effort tiers nest under each model instead of a flat list of 19.
+    private var groupedPresets: [(String, [ModelPreset])] {
+        var order: [String] = []
+        var groups: [String: [ModelPreset]] = [:]
+        for p in model.modelPresets {
+            let key = "\(p.family == "claude" ? "Claude" : "Codex") \(p.model.capitalized)"
+            if groups[key] == nil { order.append(key) }
+            groups[key, default: []].append(p)
+        }
+        return order.map { ($0, groups[$0] ?? []) }
+    }
+
     private var modelMenu: some View {
         Menu {
-            Picker("Agent model", selection: Binding(
-                get: { model.currentModel.id },
-                set: { id in if let p = ModelPreset.find(id) { model.setModel(p) } }
-            )) {
-                ForEach(ModelPreset.all) { preset in
-                    Text(preset.label).tag(preset.id)
+            ForEach(groupedPresets, id: \.0) { group, presets in
+                Menu(group) {
+                    ForEach(presets) { preset in
+                        Button {
+                            model.setModel(preset)
+                        } label: {
+                            if preset.id == model.currentModelId {
+                                Label(preset.thinking, systemImage: "checkmark")
+                            } else {
+                                Text(preset.thinking)
+                            }
+                        }
+                    }
                 }
             }
         } label: {
             HStack(spacing: 5) {
-                Image(systemName: "brain")
-                    .font(.system(size: 11, weight: .semibold))
-                Text(model.currentModel.family == "claude" ? "Opus 4.8" : "gpt-5.5")
+                Image(systemName: "brain").font(.system(size: 11, weight: .semibold))
+                Text(model.currentModel.shortLabel)
                     .font(.system(size: 11, weight: .semibold)).lineLimit(1)
             }
-            .foregroundStyle(Palette.source(model.currentModel.family == "claude" ? "claude" : "codex"))
+            .foregroundStyle(Palette.source(model.currentModel.family))
         }
         .menuStyle(.borderlessButton).fixedSize()
         .disabled(model.busyMessage != nil)

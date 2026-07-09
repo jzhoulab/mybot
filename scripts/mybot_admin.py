@@ -750,19 +750,76 @@ def cmd_retitle(_args: argparse.Namespace) -> dict[str, Any]:
 
 AUTOMATED_CLUSTERS = ["subagent", "sdk", "exec", "no-user-turns"]
 
-# Selectable agent presets for the menu switcher. label is what the UI shows.
-MODEL_PRESETS = [
-    {"id": "opus-ultra", "label": "Claude Opus 4.8 · ultra",
-     "backend": "claude_cli", "model": "claude-opus-4-8", "thinking": "ultra"},
-    {"id": "opus-high", "label": "Claude Opus 4.8 · high",
-     "backend": "claude_cli", "model": "claude-opus-4-8", "thinking": "high"},
-    {"id": "sonnet-high", "label": "Claude Sonnet 5 · high",
-     "backend": "claude_cli", "model": "claude-sonnet-5", "thinking": "high"},
-    {"id": "codex-xhigh", "label": "Codex gpt-5.5 · xhigh",
-     "backend": "codex_cli", "model": "gpt-5.5", "thinking": "xhigh"},
-    {"id": "codex-high", "label": "Codex gpt-5.5 · high",
-     "backend": "codex_cli", "model": "gpt-5.5", "thinking": "high"},
-]
+import re
+import shutil
+import subprocess
+
+
+def _discover_claude() -> dict[str, Any] | None:
+    """Ask the claude CLI what it supports — model aliases + effort levels parsed
+    from its --help, so we don't hardcode model names or thinking tiers."""
+    cmd = os.environ.get("CLAUDE_COMMAND") or shutil.which("claude") or "claude"
+    try:
+        out = subprocess.run([cmd, "--help"], capture_output=True, text=True, timeout=15).stdout
+    except (OSError, subprocess.SubprocessError):
+        return None
+    efforts = ["low", "medium", "high", "xhigh", "max"]
+    m = re.search(r"--effort.*?\(([^)]*)\)", out, re.DOTALL)
+    if m:
+        found = [e.strip() for e in m.group(1).split(",") if e.strip()]
+        if found:
+            efforts = found
+    # model aliases from the --model help text ("e.g. 'fable', 'opus', or 'sonnet'")
+    aliases = re.findall(r"'([a-z][a-z0-9.-]+)'", out)
+    models = [a for a in ["opus", "sonnet", "fable"] if a in aliases] or ["opus", "sonnet"]
+    return {"backend": "claude_cli", "command": cmd, "models": models, "efforts": efforts}
+
+
+def _discover_codex() -> dict[str, Any] | None:
+    cmd = os.environ.get("CODEX_COMMAND", "codex")
+    if not (shutil.which(cmd) or os.path.exists(cmd)):
+        # common desktop install path
+        alt = "/Applications/Codex.app/Contents/Resources/codex"
+        cmd = alt if os.path.exists(alt) else cmd
+    if not (shutil.which(cmd) or os.path.exists(cmd)):
+        return None
+    # codex doesn't enumerate these in --help; use its documented effort set + the
+    # configured/default model.
+    model = os.environ.get("CODEX_MODEL", "gpt-5.5")
+    return {"backend": "codex_cli", "command": cmd, "models": [model],
+            "efforts": ["low", "medium", "high", "xhigh"]}
+
+
+def _capabilities() -> dict[str, Any]:
+    backends = [b for b in (_discover_claude(), _discover_codex()) if b]
+    return {"backends": backends}
+
+
+def _preset_id(backend: str, model: str, effort: str) -> str:
+    fam = "claude" if backend == "claude_cli" else "codex"
+    return f"{fam}:{model}:{effort}"
+
+
+def _label_for(backend: str, model: str, effort: str) -> str:
+    fam = "Claude" if backend == "claude_cli" else "Codex"
+    name = model.capitalize() if backend == "claude_cli" else model
+    return f"{fam} {name} · {effort}"
+
+
+def cmd_capabilities(_args: argparse.Namespace) -> dict[str, Any]:
+    """Report available agent models + effort levels, discovered from the CLIs."""
+    caps = _capabilities()
+    # Flatten to selectable presets the menu can list, without hardcoding.
+    presets = []
+    for b in caps["backends"]:
+        for model in b["models"]:
+            for effort in b["efforts"]:
+                presets.append({
+                    "id": _preset_id(b["backend"], model, effort),
+                    "label": _label_for(b["backend"], model, effort),
+                    "backend": b["backend"], "model": model, "thinking": effort,
+                })
+    return {"ok": True, "capabilities": caps, "presets": presets}
 
 
 def _model_config_path() -> Path:
@@ -782,19 +839,29 @@ def cmd_model(args: argparse.Namespace) -> dict[str, Any]:
     except (OSError, json.JSONDecodeError):
         current = {}
 
+    caps = cmd_capabilities(argparse.Namespace())
+    presets = caps["presets"]
+
     if args.action == "set":
-        preset = next((p for p in MODEL_PRESETS if p["id"] == args.preset), None)
+        preset = next((p for p in presets if p["id"] == args.preset), None)
         if not preset:
-            return {"ok": False, "error": f"unknown preset {args.preset!r}",
-                    "presets": [p["id"] for p in MODEL_PRESETS]}
+            # accept a raw "backend:model:effort" id even if discovery is stale
+            parts = args.preset.split(":")
+            if len(parts) == 3 and parts[0] in ("claude", "codex"):
+                backend = "claude_cli" if parts[0] == "claude" else "codex_cli"
+                preset = {"id": args.preset, "backend": backend,
+                          "model": parts[1], "thinking": parts[2]}
+            else:
+                return {"ok": False, "error": f"unknown preset {args.preset!r}",
+                        "presets": [p["id"] for p in presets]}
         payload = {"backend": preset["backend"], "model": preset["model"],
                    "thinking": preset["thinking"], "preset": preset["id"]}
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text(json.dumps(payload, indent=2))
-        return {"ok": True, "action": "set", "current": payload, "presets": MODEL_PRESETS}
+        return {"ok": True, "action": "set", "current": payload, "presets": presets}
 
     # get
-    return {"ok": True, "action": "get", "current": current, "presets": MODEL_PRESETS,
+    return {"ok": True, "action": "get", "current": current, "presets": presets,
             "config_path": str(path)}
 
 
@@ -882,6 +949,7 @@ def main() -> None:
     pm = sub.add_parser("model", help="get/set the live agent model (menu switcher)")
     pm.add_argument("--action", choices=["get", "set"], default="get")
     pm.add_argument("--preset", default="")
+    sub.add_parser("capabilities", help="discover available agent models + effort levels")
 
     pa = sub.add_parser("automated", help="exclude/include automated (agent-driven) sessions")
     pa.add_argument("--action", required=True, choices=["exclude", "include"])
@@ -904,6 +972,7 @@ def main() -> None:
         "classify": cmd_classify,
         "retitle": cmd_retitle,
         "model": cmd_model,
+        "capabilities": cmd_capabilities,
         "automated": cmd_automated,
     }
     try:

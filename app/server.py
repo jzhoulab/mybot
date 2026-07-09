@@ -637,11 +637,6 @@ class ProviderClient:
         parts.append("Respond directly to the user.")
         return "\n\n".join(parts)
 
-    # Claude thinking presets → token budget (Claude Code reads MAX_THINKING_TOKENS).
-    _CLAUDE_THINKING_TOKENS = {
-        "off": 0, "low": 4000, "medium": 10000, "high": 20000, "ultra": 31999, "xhigh": 31999,
-    }
-
     def active_model(self) -> dict[str, str]:
         """Effective backend/model/thinking, honoring a live override file so the
         menu app can switch models without a server restart. Falls back to the
@@ -683,13 +678,15 @@ class ProviderClient:
         ephemeral: bool,
         tool_env: dict[str, str] | None,
     ) -> dict[str, Any]:
-        # The internal planner (ephemeral) runs tool-free + cheap thinking; the
-        # user-facing answer gets restricted Bash to run mybot_tool + full thinking.
-        think_key = (self.config.claude_planner_thinking if ephemeral else thinking).lower()
-        tokens = self._CLAUDE_THINKING_TOKENS.get(think_key, self._CLAUDE_THINKING_TOKENS["ultra"])
+        # Claude has named effort levels (low/medium/high/xhigh/max) via --effort.
+        # The internal planner (ephemeral) runs tool-free + cheap; the user-facing
+        # answer gets restricted Bash to run mybot_tool + the configured effort.
+        effort = (self.config.claude_planner_thinking if ephemeral else thinking).strip().lower()
 
         cmd = [self.config.claude_command, "-p", "--model", model,
                "--output-format", "json", "--permission-mode", "default"]
+        if effort:
+            cmd.extend(["--effort", effort])
         if system_prompt:
             cmd.extend(["--append-system-prompt", system_prompt])
         # allowedTools is a strict whitelist in headless mode: anything not listed
@@ -702,7 +699,6 @@ class ProviderClient:
         # --allowedTools/--append flags would otherwise swallow it.
 
         env = os.environ.copy()
-        env["MAX_THINKING_TOKENS"] = str(tokens)
         if tool_env:
             env.update(tool_env)
         proc = subprocess.run(cmd, input=message, capture_output=True, text=True, env=env)
@@ -3151,9 +3147,10 @@ def load_config(args: argparse.Namespace) -> AppConfig:
         codex_reasoning_effort=os.environ.get("CODEX_REASONING_EFFORT", "xhigh").strip(),
         codex_planner_reasoning_effort=os.environ.get("CODEX_PLANNER_REASONING_EFFORT", "low").strip(),
         claude_command=os.environ.get("CLAUDE_COMMAND", "claude").strip() or "claude",
-        claude_model=os.environ.get("CLAUDE_MODEL", "claude-opus-4-8").strip() or "claude-opus-4-8",
-        claude_thinking=os.environ.get("CLAUDE_THINKING", "ultra").strip() or "ultra",
-        claude_planner_thinking=os.environ.get("CLAUDE_PLANNER_THINKING", "off").strip() or "off",
+        # Alias (opus/sonnet/fable) → always the latest of that family, no pinning.
+        claude_model=os.environ.get("CLAUDE_MODEL", "opus").strip() or "opus",
+        claude_thinking=os.environ.get("CLAUDE_THINKING", "xhigh").strip() or "xhigh",
+        claude_planner_thinking=os.environ.get("CLAUDE_PLANNER_THINKING", "low").strip() or "low",
         model_config_path=os.environ.get("MODEL_CONFIG_PATH", str(Path(args.state_dir) / "model_config.json")),
         mybot_tool_python=os.environ.get("MYBOT_TOOL_PYTHON", sys.executable or "python3"),
         embedding_model_name=os.environ.get("EMBEDDING_MODEL_NAME", "sentence-transformers/all-MiniLM-L6-v2"),

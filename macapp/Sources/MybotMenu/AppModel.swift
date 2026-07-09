@@ -37,7 +37,11 @@ final class AppModel: ObservableObject {
     @Published var newProjects: [NewProject] = []
     @Published var health = Health()
     @Published var clusters: [AutomatedCluster] = []
-    @Published var currentModel: ModelPreset = ModelPreset.all[0]
+    @Published var modelPresets: [ModelPreset] = [ModelPreset.fallback]
+    @Published var currentModelId: String = ModelPreset.fallback.id
+    var currentModel: ModelPreset {
+        modelPresets.first { $0.id == currentModelId } ?? ModelPreset.fallback
+    }
     /// True while the index is being rewritten under us (read failed or looked
     /// wiped). We keep showing the last good snapshot instead of zeros.
     @Published var indexBusy = false
@@ -81,6 +85,7 @@ final class AppModel: ObservableObject {
     func start() {
         renderIcon()
         reload()
+        loadModelPresets()
         timer = Timer.scheduledTimer(withTimeInterval: 15, repeats: true) { [weak self] _ in
             Task { @MainActor in
                 guard let self, self.busyMessage == nil else { return }  // don't shift numbers mid-op
@@ -236,12 +241,12 @@ final class AppModel: ObservableObject {
             let counts = reader.automatedClusters()
             let excluded = policy.excludedClusters()
 
-            // Current agent model, read straight from model_config.json (local).
-            var modelPreset = ModelPreset.all[0]
+            // Current agent model id, read straight from model_config.json (local).
+            var modelId = ModelPreset.fallback.id
             if let data = try? Data(contentsOf: cfg.modelConfigPath),
                let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
-               let preset = obj["preset"] as? String, let found = ModelPreset.find(preset) {
-                modelPreset = found
+               let preset = obj["preset"] as? String, !preset.isEmpty {
+                modelId = preset
             }
             let clusters = AutomatedCluster.order.compactMap { detail -> AutomatedCluster? in
                 let count = counts[detail] ?? 0
@@ -255,7 +260,7 @@ final class AppModel: ObservableObject {
                 self.newProjects = pending
                 self.health = health
                 self.clusters = clusters
-                self.currentModel = modelPreset
+                self.currentModelId = modelId
                 self.indexBusy = false
                 self.suspectEmptyReads = 0
                 self.renderIcon()
@@ -378,9 +383,28 @@ final class AppModel: ObservableObject {
     func openControlRoom() { NSWorkspace.shared.open(config.guiURL) }
 
     func setModel(_ preset: ModelPreset) {
-        guard preset.id != currentModel.id else { return }
-        currentModel = preset  // optimistic; reload() confirms from disk
+        guard preset.id != currentModelId else { return }
+        currentModelId = preset.id  // optimistic; reload() confirms from disk
         runAction("Switching to \(preset.label)…") { $0.setModel(preset.id) }
+    }
+
+    /// Discover available models/effort levels from the CLIs (once, lazily).
+    func loadModelPresets() {
+        let admin = AdminClient(config: config)
+        DispatchQueue.global(qos: .utility).async {
+            let result = admin.run(["capabilities"])
+            let raw = (result.json["presets"] as? [[String: Any]]) ?? []
+            let presets: [ModelPreset] = raw.compactMap { p in
+                guard let id = p["id"] as? String, let label = p["label"] as? String,
+                      let backend = p["backend"] as? String else { return nil }
+                return ModelPreset(id: id, label: label,
+                                   family: backend == "claude_cli" ? "claude" : "codex",
+                                   model: (p["model"] as? String) ?? "",
+                                   thinking: (p["thinking"] as? String) ?? "")
+            }
+            guard !presets.isEmpty else { return }
+            DispatchQueue.main.async { self.modelPresets = presets }
+        }
     }
 
     // ---- ask: local FTS search (debounced) + server chat -------------------
