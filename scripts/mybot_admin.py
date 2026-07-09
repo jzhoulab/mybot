@@ -582,13 +582,16 @@ def cmd_trajectory(args: argparse.Namespace) -> dict[str, Any]:
     }
 
 
-def _probe_claude_session(path: str) -> tuple[bool, int, list[str]]:
-    """Bounded scan of a claude jsonl: (sidechain?, genuine human turns, entrypoints)."""
+def _probe_claude_session(path: str):
+    """Bounded scan of a claude jsonl:
+    (sidechain?, genuine human turns, entrypoints, agent_marker|None)."""
     from sources.common import is_real_user_text, iter_bounded_jsonl_lines
+    from sources.origin import parse_agent_marker
 
     sidechain = False
     human_turns = 0
     entrypoints: list[str] = []
+    agent_marker = None
     for line in iter_bounded_jsonl_lines(path):
         if line is None:
             continue
@@ -618,9 +621,11 @@ def _probe_claude_session(path: str) -> tuple[bool, int, list[str]]:
                 if isinstance(block, dict) and block.get("type") == "text":
                     text = block.get("text", "")
                     break
+        if agent_marker is None:
+            agent_marker = parse_agent_marker(text)
         if is_real_user_text(text) and not text.strip().startswith("Caveat:"):
             human_turns += 1
-    return sidechain, human_turns, entrypoints
+    return sidechain, human_turns, entrypoints, agent_marker
 
 
 def cmd_classify(_args: argparse.Namespace) -> dict[str, Any]:
@@ -655,12 +660,13 @@ def cmd_classify(_args: argparse.Namespace) -> dict[str, Any]:
             if source_name == "claude":
                 if path and os.path.exists(path):
                     try:
-                        sidechain, human_turns, entrypoints = _probe_claude_session(path)
+                        sidechain, human_turns, entrypoints, marker = _probe_claude_session(path)
                         origin, detail = classify_claude_origin_detailed(
                             entrypoints or metadata.get("entrypoints"),
                             sidechain=sidechain,
                             human_turns=human_turns,
                             cwd=cwd,
+                            agent_marker=marker,
                         )
                     except Exception:
                         origin = ""
@@ -669,16 +675,33 @@ def cmd_classify(_args: argparse.Namespace) -> dict[str, Any]:
                         metadata.get("entrypoints"), cwd=cwd)
             elif source_name == "codex" and path and os.path.exists(path):
                 try:
+                    from sources.origin import parse_agent_marker as _pam
+                    src = ""
+                    originator = ""
+                    marker = None
                     with open(path) as handle:
-                        payload = json.loads(handle.readline(512 * 1024)).get("payload", {})
-                    src = payload.get("source")
-                    cwd = str(payload.get("cwd") or cwd)
-                    origin = classify_codex_origin(
-                        src if isinstance(src, str) else "", str(payload.get("originator") or ""),
-                        cwd=cwd,
-                    )
-                    detail = "" if origin == "interactive" else (
-                        "orchestrated" if is_agent_worktree(cwd) else "exec")
+                        for n, raw in enumerate(handle):
+                            if n > 200:
+                                break
+                            try:
+                                p = json.loads(raw).get("payload", {})
+                            except json.JSONDecodeError:
+                                continue
+                            if n == 0:
+                                s = p.get("source"); src = s if isinstance(s, str) else ""
+                                originator = str(p.get("originator") or "")
+                                cwd = str(p.get("cwd") or cwd)
+                            if marker is None and p.get("type") == "user_message":
+                                marker = _pam(str(p.get("message") or ""))
+                    origin = classify_codex_origin(src, originator, cwd=cwd, agent_marker=marker)
+                    if origin == "interactive":
+                        detail = ""
+                    elif marker:
+                        detail = marker.get("origin") or "orchestrated"
+                    elif is_agent_worktree(cwd):
+                        detail = "orchestrated"
+                    else:
+                        detail = "exec"
                 except Exception:
                     origin = ""
             if not origin:

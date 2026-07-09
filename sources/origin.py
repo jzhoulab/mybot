@@ -22,10 +22,34 @@ from typing import Any
 
 AUTOMATED_CLAUDE_ENTRYPOINTS = {"sdk-cli", "sdk-py", "sdk-ts", "sdk", "headless", "print"}
 
-# Agent orchestrators (agentctl dispatcher, etc.) run agents in dedicated git worktrees
-# named like `.agent-worktrees/`, `.worktrees/`, `.agent-worktrees/`. A dot-prefixed
-# "*worktrees" path segment is a strong "launched by an orchestrator" signal — the
-# turns inside are injected task prompts, not a human typing, even at entrypoint=cli.
+# --- Agent-session convention (the robust, explicit signal) --------------------
+# A tool that launches an AI coding agent with NO human at the keyboard is
+# otherwise indistinguishable from a human session (the CLIs log the injected
+# prompt as `promptSource: typed`, `origin: {kind: human}`, `entrypoint: cli`).
+# Convention: such a launcher prepends ONE marker line to the agent's initial
+# prompt. It survives durably in the trajectory jsonl and is tool-agnostic:
+#
+#     <!-- agent-session: launcher=<tool> origin=orchestrated -->
+#
+# `origin` maps to an automated cluster (default "orchestrated"); `launcher` is
+# free-form (e.g. hop). See docs/agent-session-convention.md. mybot detects this
+# marker and both classifies the session automated AND strips it from indexed text.
+AGENT_SESSION_MARKER_RE = re.compile(r"<!--\s*agent-session:\s*(.*?)\s*-->", re.IGNORECASE)
+
+
+def parse_agent_marker(text: str | None) -> dict[str, str] | None:
+    """Return {launcher, origin} if an agent-session marker is present, else None."""
+    if not text:
+        return None
+    m = AGENT_SESSION_MARKER_RE.search(text)
+    if not m:
+        return None
+    attrs = dict(re.findall(r"(\w+)\s*=\s*([^\s]+)", m.group(1)))
+    return {"launcher": attrs.get("launcher", ""), "origin": attrs.get("origin", "orchestrated")}
+
+
+# Legacy/fallback heuristic for sessions that predate the convention: agent
+# orchestrators run agents in dedicated git worktrees (`.agent-worktrees/`, etc.).
 AGENT_WORKTREE_RE = re.compile(r"/\.[^/]*worktrees?/", re.IGNORECASE)
 
 
@@ -33,8 +57,11 @@ def is_agent_worktree(cwd: str | None) -> bool:
     return bool(cwd) and bool(AGENT_WORKTREE_RE.search(str(cwd)))
 
 
-def classify_codex_origin(source: str, originator: str, cwd: str | None = None) -> str:
-    if is_agent_worktree(cwd):
+def classify_codex_origin(
+    source: str, originator: str, cwd: str | None = None,
+    agent_marker: dict[str, str] | None = None,
+) -> str:
+    if agent_marker or is_agent_worktree(cwd):
         return "automated"
     src = (source or "").strip().lower()
     orig = (originator or "").strip().lower()
@@ -49,12 +76,16 @@ def classify_claude_origin_detailed(
     sidechain: bool = False,
     human_turns: int | None = None,
     cwd: str | None = None,
+    agent_marker: dict[str, str] | None = None,
 ) -> tuple[str, str]:
     """Return (origin, detail). detail explains WHY a session is automated."""
+    # Explicit convention marker wins — the durable, tool-agnostic signal.
+    if agent_marker:
+        return "automated", (agent_marker.get("origin") or "orchestrated")
     if sidechain:
         return "automated", "subagent"
-    # Orchestrated agent runs (worktrees) look interactive by entrypoint + have
-    # "user" turns, but those turns are machine-injected tasks — check before them.
+    # Fallback for pre-convention sessions: worktree path looks interactive by
+    # entrypoint + has "user" turns, but those turns are machine-injected tasks.
     if is_agent_worktree(cwd):
         return "automated", "orchestrated"
     for entrypoint in entrypoints or []:

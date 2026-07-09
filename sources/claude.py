@@ -15,7 +15,7 @@ from .common import (
     recent_files,
 )
 from .models import NormalizedTrajectory, TrajectorySourceAdapter
-from .origin import classify_claude_origin_detailed
+from .origin import classify_claude_origin_detailed, parse_agent_marker
 
 
 class ClaudeSourceAdapter(TrajectorySourceAdapter):
@@ -61,6 +61,7 @@ class ClaudeSourceAdapter(TrajectorySourceAdapter):
             turns = []
             sidechain = False
             human_turns = 0
+            agent_marker = None
 
             for line in iter_bounded_jsonl_lines(path):
                 if line is not None:
@@ -107,6 +108,8 @@ class ClaudeSourceAdapter(TrajectorySourceAdapter):
                                 if isinstance(block, str):
                                     text = block
                                     break
+                        if agent_marker is None:
+                            agent_marker = parse_agent_marker(text)
                         # a *genuine* typed turn: not a tool result / meta /
                         # sidechain line, and not injected boilerplate
                         has_tool_result = isinstance(content, list) and any(
@@ -140,7 +143,8 @@ class ClaudeSourceAdapter(TrajectorySourceAdapter):
             if not self.account.include_session(session_id, raw_session_id):
                 continue
             origin, origin_detail = classify_claude_origin_detailed(
-                entrypoints, sidechain=sidechain, human_turns=human_turns, cwd=cwd
+                entrypoints, sidechain=sidechain, human_turns=human_turns, cwd=cwd,
+                agent_marker=agent_marker,
             )
             if self.account.is_origin_excluded(origin, origin_detail):
                 continue

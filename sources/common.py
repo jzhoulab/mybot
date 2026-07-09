@@ -22,6 +22,7 @@ AUTO_PREFIXES = (
     "Automation:",
     "Automation ID:",
     "<subagent_notification>",
+    "<!-- agent-session:",  # orchestrator marker (see docs/agent-session-convention.md)
     "Independently run a",
     "Caveat: The messages below",
     # injected agent prompts (sdk/automated sessions) — never a human title

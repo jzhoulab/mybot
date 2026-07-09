@@ -14,7 +14,7 @@ from .common import (
     recent_files,
 )
 from .models import NormalizedTrajectory, TrajectorySourceAdapter
-from .origin import classify_codex_origin, is_agent_worktree
+from .origin import classify_codex_origin, is_agent_worktree, parse_agent_marker
 
 
 def load_codex_index(base_dir: str) -> dict[str, str]:
@@ -75,6 +75,7 @@ class CodexSourceAdapter(TrajectorySourceAdapter):
             cwd = discovered_cwd
             session_source = ""
             session_originator = ""
+            agent_marker = None
             turns = []
 
             for line in iter_bounded_jsonl_lines(path):
@@ -124,6 +125,8 @@ class CodexSourceAdapter(TrajectorySourceAdapter):
                             if isinstance(block, dict) and block.get("type") == "input_text":
                                 text = block.get("text", "")
                                 break
+                    if text and agent_marker is None:
+                        agent_marker = parse_agent_marker(text)
                     append_turn(turns, "user", text, ts_text)
 
             if not session_id:
@@ -142,10 +145,16 @@ class CodexSourceAdapter(TrajectorySourceAdapter):
             session_id = self.account.scoped_session_id(raw_session_id)
             if not self.account.include_session(session_id, raw_session_id):
                 continue
-            origin = classify_codex_origin(session_source, session_originator, cwd=cwd)
-            origin_detail = "" if origin == "interactive" else (
-                "orchestrated" if is_agent_worktree(cwd) else "exec"
-            )
+            origin = classify_codex_origin(session_source, session_originator, cwd=cwd,
+                                           agent_marker=agent_marker)
+            if origin == "interactive":
+                origin_detail = ""
+            elif agent_marker:
+                origin_detail = agent_marker.get("origin") or "orchestrated"
+            elif is_agent_worktree(cwd):
+                origin_detail = "orchestrated"
+            else:
+                origin_detail = "exec"
             if self.account.is_origin_excluded(origin, origin_detail):
                 continue
             session = NormalizedTrajectory(
