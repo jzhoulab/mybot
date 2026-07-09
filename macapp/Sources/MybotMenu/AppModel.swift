@@ -41,6 +41,14 @@ final class AppModel: ObservableObject {
     /// wiped). We keep showing the last good snapshot instead of zeros.
     @Published var indexBusy = false
     private var suspectEmptyReads = 0
+
+    // ---- ask (search + chat) ----
+    enum Mode { case projects, ask }
+    @Published var mode: Mode = .projects
+    @Published var searchHits: [SearchHit] = []
+    @Published var chat: [ChatMsg] = []
+    @Published var chatPending = false
+    private var searchWork: DispatchWorkItem?
     @Published var busyMessage: String?
     @Published var lastError: String?
 
@@ -358,6 +366,44 @@ final class AppModel: ObservableObject {
     }
 
     func openControlRoom() { NSWorkspace.shared.open(config.guiURL) }
+
+    // ---- ask: local FTS search (debounced) + server chat -------------------
+    func searchMemory(_ query: String) {
+        searchWork?.cancel()
+        let q = query.trimmingCharacters(in: .whitespaces)
+        guard q.count >= 2 else { searchHits = []; return }
+        let cfg = config
+        let work = DispatchWorkItem { [weak self] in
+            let hits = IndexReader(dbPath: cfg.dbPath.path).search(q)
+            DispatchQueue.main.async { self?.searchHits = hits }
+        }
+        searchWork = work
+        DispatchQueue.global(qos: .userInitiated).asyncAfter(deadline: .now() + 0.22, execute: work)
+    }
+
+    func ask(_ question: String) {
+        let q = question.trimmingCharacters(in: .whitespaces)
+        guard !q.isEmpty, !chatPending else { return }
+        chat.append(ChatMsg(role: "user", text: q))
+        chatPending = true
+        ChatClient(config: config).ask(q) { [weak self] result in
+            DispatchQueue.main.async {
+                guard let self else { return }
+                self.chatPending = false
+                switch result {
+                case .success(let text):
+                    self.chat.append(ChatMsg(role: "assistant", text: text))
+                case .failure(let error):
+                    self.chat.append(ChatMsg(role: "error", text: error.localizedDescription))
+                }
+            }
+        }
+    }
+
+    func newChat() {
+        chat = []
+        ChatClient(config: config).resetSession()
+    }
 
     // ---- session drill-down -----------------------------------------------
     func openDetail(_ project: Project) {

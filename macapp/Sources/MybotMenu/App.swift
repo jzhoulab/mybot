@@ -103,12 +103,17 @@ struct ContentView: View {
                 } else if let project = model.detail {
                     SessionDetail(model: model, project: project)
                 } else {
-                    controls
-                    projectScroll
-                    if model.selecting {
-                        batchBar
-                    } else if !model.newProjects.isEmpty {
-                        newProjectsBar
+                    modeTabs
+                    if model.mode == .ask {
+                        AskView(model: model)
+                    } else {
+                        controls
+                        projectScroll
+                        if model.selecting {
+                            batchBar
+                        } else if !model.newProjects.isEmpty {
+                            newProjectsBar
+                        }
                     }
                 }
             }
@@ -316,6 +321,18 @@ struct ContentView: View {
         .background(RoundedRectangle(cornerRadius: 12, style: .continuous).fill(Color.accentColor.opacity(0.12)))
         .overlay(RoundedRectangle(cornerRadius: 12, style: .continuous).strokeBorder(Color.accentColor.opacity(0.3)))
         .padding(.horizontal, 12).padding(.vertical, 6)
+    }
+
+    // MARK: mode tabs
+    private var modeTabs: some View {
+        Picker("", selection: $model.mode) {
+            Text("Projects").tag(AppModel.Mode.projects)
+            Text("Ask mybot").tag(AppModel.Mode.ask)
+        }
+        .pickerStyle(.segmented)
+        .labelsHidden()
+        .padding(.horizontal, 12)
+        .padding(.bottom, 8)
     }
 
     // MARK: footer
@@ -690,6 +707,165 @@ struct EventRow: View {
     }
 }
 
+// MARK: - Ask (search + chat)
+
+struct AskView: View {
+    @ObservedObject var model: AppModel
+    @State private var input = ""
+    @FocusState private var focused: Bool
+
+    var body: some View {
+        VStack(spacing: 0) {
+            inputBar
+            ScrollViewReader { proxy in
+                ScrollView {
+                    VStack(alignment: .leading, spacing: 10) {
+                        if model.chat.isEmpty && model.searchHits.isEmpty && !model.chatPending {
+                            emptyHint
+                        }
+                        ForEach(model.chat) { msg in ChatBubble(msg: msg) }
+                        if model.chatPending {
+                            HStack(spacing: 7) {
+                                ProgressView().controlSize(.small)
+                                Text("mybot is thinking…").font(.system(size: 11)).foregroundStyle(.secondary)
+                            }
+                            .id("pending")
+                        }
+                        if !model.searchHits.isEmpty {
+                            Text("MEMORY MATCHES")
+                                .font(.system(size: 10, weight: .heavy)).tracking(0.6)
+                                .foregroundStyle(.secondary)
+                                .padding(.top, model.chat.isEmpty ? 0 : 6)
+                            ForEach(model.searchHits) { hit in
+                                SearchHitRow(hit: hit) {
+                                    model.openTrajectory(Session(
+                                        ref: hit.ref,
+                                        sessionId: String(hit.ref.split(separator: ":").last ?? ""),
+                                        title: hit.title,
+                                        updatedAt: hit.updatedAt,
+                                        chunks: 0))
+                                }
+                            }
+                        }
+                    }
+                    .padding(.horizontal, 12).padding(.bottom, 10)
+                }
+                .onChange(of: model.chat.count) {
+                    if let last = model.chat.last { withAnimation { proxy.scrollTo(last.id, anchor: .bottom) } }
+                }
+                .onChange(of: model.chatPending) {
+                    if model.chatPending { withAnimation { proxy.scrollTo("pending", anchor: .bottom) } }
+                }
+            }
+        }
+        .onAppear { focused = true }
+    }
+
+    private var inputBar: some View {
+        HStack(spacing: 8) {
+            Image(systemName: "sparkle.magnifyingglass")
+                .font(.system(size: 12)).foregroundStyle(.secondary)
+            TextField("Search memory — press ⏎ to ask mybot", text: $input)
+                .textFieldStyle(.plain)
+                .font(.system(size: 12.5))
+                .focused($focused)
+                .onChange(of: input) { model.searchMemory(input) }
+                .onSubmit {
+                    model.ask(input)
+                    input = ""
+                }
+            if !model.chat.isEmpty {
+                Button {
+                    model.newChat()
+                } label: {
+                    Image(systemName: "square.and.pencil").font(.system(size: 11, weight: .semibold))
+                }
+                .buttonStyle(.plain).foregroundStyle(.secondary)
+                .help("New chat")
+            }
+        }
+        .padding(.horizontal, 10).padding(.vertical, 8)
+        .background(RoundedRectangle(cornerRadius: 9, style: .continuous).fill(Color.primary.opacity(0.06)))
+        .padding(.horizontal, 12).padding(.bottom, 10)
+    }
+
+    private var emptyHint: some View {
+        VStack(spacing: 6) {
+            Image(systemName: "sparkle.magnifyingglass")
+                .font(.system(size: 22)).foregroundStyle(.secondary.opacity(0.6))
+            Text("Type to search your trajectory memory.\nPress ⏎ to ask mybot a question.")
+                .font(.system(size: 11.5)).foregroundStyle(.secondary)
+                .multilineTextAlignment(.center)
+        }
+        .frame(maxWidth: .infinity).padding(.top, 60)
+    }
+}
+
+struct ChatBubble: View {
+    let msg: ChatMsg
+
+    var body: some View {
+        switch msg.role {
+        case "user":
+            Text(msg.text)
+                .font(.system(size: 12)).textSelection(.enabled)
+                .padding(9)
+                .background(RoundedRectangle(cornerRadius: 10, style: .continuous)
+                    .fill(Color.accentColor.opacity(0.14)))
+                .frame(maxWidth: .infinity, alignment: .trailing)
+                .id(msg.id)
+        case "error":
+            HStack(spacing: 6) {
+                Image(systemName: "exclamationmark.triangle.fill")
+                    .font(.system(size: 10)).foregroundStyle(.orange)
+                Text(msg.text).font(.system(size: 11.5)).foregroundStyle(.secondary)
+            }
+            .padding(9)
+            .background(RoundedRectangle(cornerRadius: 10, style: .continuous).fill(Color.orange.opacity(0.08)))
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .id(msg.id)
+        default:
+            HStack(alignment: .top, spacing: 8) {
+                BotAvatar(mood: .happy).frame(width: 20, height: 20)
+                Text(.init(msg.text))   // renders basic markdown
+                    .font(.system(size: 12)).textSelection(.enabled)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+            }
+            .padding(9)
+            .background(RoundedRectangle(cornerRadius: 10, style: .continuous).fill(Color.primary.opacity(0.05)))
+            .id(msg.id)
+        }
+    }
+}
+
+struct SearchHitRow: View {
+    let hit: SearchHit
+    let onOpen: () -> Void
+
+    var body: some View {
+        Button(action: onOpen) {
+            VStack(alignment: .leading, spacing: 4) {
+                HStack(spacing: 6) {
+                    SourceTag(source: hit.source)
+                    Text(hit.projectName).font(.system(size: 10.5, weight: .semibold))
+                        .foregroundStyle(.secondary).lineLimit(1)
+                    Spacer()
+                    Text(hit.updatedAgo).font(.system(size: 10)).foregroundStyle(.secondary)
+                    Image(systemName: "chevron.right")
+                        .font(.system(size: 9, weight: .semibold)).foregroundStyle(.secondary)
+                }
+                Text(hit.displayTitle).font(.system(size: 12, weight: .semibold)).lineLimit(1)
+                Text(hit.snippet).font(.system(size: 11)).foregroundStyle(.secondary)
+                    .lineLimit(2).multilineTextAlignment(.leading)
+            }
+            .padding(9)
+            .background(RoundedRectangle(cornerRadius: 10, style: .continuous).fill(Color.primary.opacity(0.045)))
+            .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
+    }
+}
+
 // MARK: - UI preview export
 
 enum UIExporter {
@@ -714,6 +890,38 @@ enum UIExporter {
             busyModel.busyMessage = "Excluding 394 automated sessions…"
             write(ContentView(model: busyModel).environment(\.colorScheme, scheme).background(bg),
                   name.replacingOccurrences(of: "ui-", with: "busy-"))
+
+            let askModel = AppModel.sample()
+            askModel.mode = .ask
+            askModel.chat = [
+                ChatMsg(role: "user", text: "what did I do with fable recently?"),
+                ChatMsg(role: "assistant",
+                        text: "You mostly worked on the **fable evaluation harness** — last week you fixed the scoring regression and re-ran the benchmark suite in `~/Code/demo-project`."),
+            ]
+            askModel.searchHits = [
+                SearchHit(ref: "codex:0199aaa", source: "codex", title: "Fix fable scoring regression",
+                          cwd: "/Users/you/Code/demo-project",
+                          snippet: "the fable scorer was double-counting partial matches … patched normalize step and re-ran",
+                          updatedAt: "2026-07-05T12:00:00Z"),
+                SearchHit(ref: "claude:bb31c02", source: "claude", title: "fable benchmark sweep",
+                          cwd: "/Users/you/Code/demo-project",
+                          snippet: "ran the full fable suite across 3 model configs … results in results/2026-07-01",
+                          updatedAt: "2026-07-01T09:00:00Z"),
+            ]
+            write(ContentView(model: askModel).environment(\.colorScheme, scheme).background(bg),
+                  name.replacingOccurrences(of: "ui-", with: "ask-"))
+
+            // ScrollView contents don't render offline — render the ask pieces directly
+            write(VStack(alignment: .leading, spacing: 10) {
+                ForEach(askModel.chat) { msg in ChatBubble(msg: msg) }
+                ChatBubble(msg: ChatMsg(role: "error", text: "chat server is not running — start it with run_discord_chatbot.sh"))
+                Text("MEMORY MATCHES").font(.system(size: 10, weight: .heavy)).tracking(0.6)
+                    .foregroundStyle(.secondary)
+                ForEach(askModel.searchHits) { hit in SearchHitRow(hit: hit) {} }
+            }
+            .padding(12).frame(width: 480).background(bg)
+            .environment(\.colorScheme, scheme),
+                  name.replacingOccurrences(of: "ui-", with: "askbits-"))
 
             // Rows render blank inside ScrollView in ImageRenderer, so preview
             // them in a plain VStack to judge the row styling.

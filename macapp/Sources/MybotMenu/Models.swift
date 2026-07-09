@@ -47,6 +47,35 @@ struct Session: Identifiable, Hashable {
     }
 }
 
+/// One full-text hit in the trajectory index, grouped by session.
+struct SearchHit: Identifiable, Hashable {
+    var id: String { ref }
+    let ref: String
+    let source: String
+    let title: String
+    let cwd: String
+    let snippet: String
+    let updatedAt: String
+
+    var displayTitle: String { title.isEmpty ? "session \(ref.suffix(8))" : title }
+    var projectName: String {
+        let name = (cwd as NSString).lastPathComponent
+        return name.isEmpty ? cwd : name
+    }
+    var updatedAgo: String {
+        guard let date = ISO8601DateFormatter.withFractional.date(from: updatedAt)
+            ?? ISO8601DateFormatter().date(from: updatedAt) else { return "" }
+        return Health.relative(from: date)
+    }
+}
+
+/// One turn in the in-app chat with mybot.
+struct ChatMsg: Identifiable, Hashable {
+    let id = UUID()
+    let role: String   // "user" | "assistant" | "error"
+    let text: String
+}
+
 /// One automated-session cluster (origin_detail) with its index count and
 /// whether the access policy currently excludes it.
 struct AutomatedCluster: Identifiable, Hashable {

@@ -109,6 +109,52 @@ final class IndexReader {
         return value
     }
 
+    /// Full-text search over the index (FTS5), grouped by session, best match
+    /// first. Local and instant — no server involved.
+    func search(_ query: String, limit: Int = 12) -> [SearchHit] {
+        let tokens = query.split(whereSeparator: { $0.isWhitespace })
+            .map { $0.replacingOccurrences(of: "\"", with: "\"\"") }
+            .filter { !$0.isEmpty }
+        guard !tokens.isEmpty, let db = openReadOnly() else { return [] }
+        defer { sqlite3_close(db) }
+        let match = tokens.map { "\"\($0)\"*" }.joined(separator: " ")
+
+        // snippet() can't be combined with GROUP BY, so rank the top chunks
+        // and keep the best chunk per session here.
+        var out: [SearchHit] = []
+        var seen = Set<String>()
+        var stmt: OpaquePointer?
+        let sql = """
+            SELECT c.source_ref, c.source_name, c.title, c.cwd, c.updated_at,
+                   snippet(trajectory_chunks_fts, 2, '', '', ' … ', 14)
+            FROM trajectory_chunks_fts f
+            JOIN trajectory_chunks c ON c.id = f.rowid
+            WHERE trajectory_chunks_fts MATCH ?
+            ORDER BY f.rank
+            LIMIT 60
+            """
+        if sqlite3_prepare_v2(db, sql, -1, &stmt, nil) == SQLITE_OK {
+            match.withCString { mPtr in
+                sqlite3_bind_text(stmt, 1, mPtr, -1, nil)
+                while sqlite3_step(stmt) == SQLITE_ROW, out.count < limit {
+                    let ref = text(stmt, 0)
+                    guard seen.insert(ref).inserted else { continue }
+                    out.append(SearchHit(
+                        ref: ref,
+                        source: text(stmt, 1),
+                        title: text(stmt, 2),
+                        cwd: text(stmt, 3),
+                        snippet: text(stmt, 5)
+                            .replacingOccurrences(of: "\n", with: " "),
+                        updatedAt: text(stmt, 4)
+                    ))
+                }
+            }
+        }
+        sqlite3_finalize(stmt)
+        return out
+    }
+
     /// Automated sessions per cluster (origin_detail), e.g. sdk/exec/subagent.
     func automatedClusters() -> [String: Int] {
         guard let db = openReadOnly() else { return [:] }
