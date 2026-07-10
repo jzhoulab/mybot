@@ -53,7 +53,9 @@ final class AppModel: ObservableObject {
     @Published var searchHits: [SearchHit] = []
     @Published var chat: [ChatMsg] = []
     @Published var chatPending = false
+    @Published var chatActivity = ""   // live tool line while streaming
     private var searchWork: DispatchWorkItem?
+    private var streamTask: Task<Void, Never>?
     @Published var busyMessage: String?
     @Published var lastError: String?
 
@@ -425,24 +427,53 @@ final class AppModel: ObservableObject {
         let q = question.trimmingCharacters(in: .whitespaces)
         guard !q.isEmpty, !chatPending else { return }
         chat.append(ChatMsg(role: "user", text: q))
+        chat.append(ChatMsg(role: "assistant", text: "", streaming: true))
         chatPending = true
-        ChatClient(config: config).ask(q) { [weak self] result in
-            DispatchQueue.main.async {
-                guard let self else { return }
+        chatActivity = "Thinking…"
+        let assistantId = chat.last!.id
+
+        func update(_ mutate: (inout ChatMsg) -> Void) {
+            guard let i = chat.firstIndex(where: { $0.id == assistantId }) else { return }
+            var msg = chat[i]; mutate(&msg); chat[i] = msg
+        }
+
+        streamTask = ChatClient(config: config).stream(q) { [weak self] event in
+            guard let self else { return }
+            switch event {
+            case .tool(let label):
+                self.chatActivity = label
+            case .delta(let text):
+                self.chatActivity = ""
+                update { $0.text += text }
+            case .done(let reply):
                 self.chatPending = false
-                switch result {
-                case .success(let reply):
-                    self.chat.append(ChatMsg(role: "assistant", text: reply.text,
-                                             sources: reply.sources, toolCalls: reply.toolCalls))
-                case .failure(let error):
-                    self.chat.append(ChatMsg(role: "error", text: error.localizedDescription))
+                self.chatActivity = ""
+                update {
+                    if !reply.text.isEmpty { $0.text = reply.text }
+                    $0.sources = reply.sources
+                    $0.toolCalls = reply.toolCalls
+                    $0.streaming = false
+                }
+            case .failure(let error):
+                self.chatPending = false
+                self.chatActivity = ""
+                // Replace the empty streaming bubble with an error bubble.
+                if let i = self.chat.firstIndex(where: { $0.id == assistantId }) {
+                    if self.chat[i].text.isEmpty {
+                        self.chat[i] = ChatMsg(role: "error", text: error)
+                    } else {
+                        update { $0.streaming = false }
+                    }
                 }
             }
         }
     }
 
     func newChat() {
+        streamTask?.cancel()
         chat = []
+        chatPending = false
+        chatActivity = ""
         ChatClient(config: config).resetSession()
     }
 

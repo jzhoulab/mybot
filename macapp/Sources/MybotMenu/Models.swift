@@ -92,9 +92,10 @@ struct SearchHit: Identifiable, Hashable {
 struct ChatMsg: Identifiable, Hashable {
     let id = UUID()
     let role: String   // "user" | "assistant" | "error"
-    let text: String
+    var text: String
     var sources: [ChatSource] = []
     var toolCalls: [ChatToolCall] = []
+    var streaming: Bool = false   // assistant bubble still receiving deltas
 }
 
 /// One automated-session cluster (origin_detail) with its index count and

@@ -311,6 +311,28 @@ def render_history_transcript(messages: list[dict[str, Any]]) -> str:
     return "\n".join(lines)
 
 
+class _ClientGone(Exception):
+    """Raised when an SSE client disconnects mid-stream so we can stop cleanly."""
+
+
+def _describe_tool(block: dict[str, Any]) -> str:
+    """Friendly one-liner for a tool_use block, shown as live activity while the
+    agent works. The mybot tool is invoked via Bash, so parse its subcommand."""
+    name = str(block.get("name") or "tool")
+    inp = block.get("input") or {}
+    command = str(inp.get("command") or "") if isinstance(inp, dict) else ""
+    if "mybot_tool" in command:
+        m = re.search(r"mybot_tool\.py\s+([a-z-]+)", command)
+        sub = (m.group(1) if m else "").replace("-", " ")
+        q = re.search(r'-q\s+["\']([^"\']+)', command) or re.search(r'--query\s+["\']([^"\']+)', command)
+        if "read" in sub:
+            return "Reading trajectory evidence…"
+        if "search" in sub:
+            return f"Searching memory: {q.group(1)[:50]}" if q else "Searching memory…"
+        return f"Running {sub or 'tool'}…"
+    return f"Running {name}…"
+
+
 @dataclass
 class AppConfig:
     host: str
@@ -678,14 +700,20 @@ class ProviderClient:
         thinking: str,
         ephemeral: bool,
         tool_env: dict[str, str] | None,
+        on_event: Any = None,
     ) -> dict[str, Any]:
         # Claude has named effort levels (low/medium/high/xhigh/max) via --effort.
         # The internal planner (ephemeral) runs tool-free + cheap; the user-facing
         # answer gets restricted Bash to run mybot_tool + the configured effort.
         effort = (self.config.claude_planner_thinking if ephemeral else thinking).strip().lower()
+        streaming = on_event is not None
 
         cmd = [self.config.claude_command, "-p", "--model", model,
-               "--output-format", "json", "--permission-mode", "default"]
+               "--permission-mode", "default"]
+        if streaming:
+            cmd.extend(["--output-format", "stream-json", "--include-partial-messages", "--verbose"])
+        else:
+            cmd.extend(["--output-format", "json"])
         if effort:
             cmd.extend(["--effort", effort])
         if system_prompt:
@@ -702,6 +730,10 @@ class ProviderClient:
         env = os.environ.copy()
         if tool_env:
             env.update(tool_env)
+
+        if streaming:
+            return self._run_claude_stream(cmd, message, env, on_event)
+
         proc = subprocess.run(cmd, input=message, capture_output=True, text=True, env=env)
         if proc.returncode != 0:
             stderr = normalize_text(proc.stderr, 1500)
@@ -725,6 +757,77 @@ class ProviderClient:
             "backend_session_id": None,
             "usage": (raw or {}).get("usage") if isinstance(raw, dict) else None,
         }
+
+    def _run_claude_stream(self, cmd, message, env, on_event) -> dict[str, Any]:
+        """Popen the claude CLI in stream-json mode and forward events via
+        on_event({kind, ...}) as they arrive. Accumulates the final answer text.
+        on_event kinds: "tool" (label), "delta" (text), "usage" (dict)."""
+        proc = subprocess.Popen(
+            cmd, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            text=True, env=env, bufsize=1,
+        )
+        assert proc.stdin and proc.stdout
+        try:
+            proc.stdin.write(message)
+            proc.stdin.close()
+        except BrokenPipeError:
+            pass
+
+        text_parts: list[str] = []
+        result_text = ""
+        usage: Any = None
+        tool_blocks: dict[int, dict[str, Any]] = {}  # index -> {name, input_json}
+        for line in proc.stdout:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                evt = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            etype = evt.get("type")
+            if etype == "stream_event":
+                inner = evt.get("event", {})
+                itype = inner.get("type")
+                idx = inner.get("index", 0)
+                if itype == "content_block_delta":
+                    delta = inner.get("delta") or {}
+                    if delta.get("type") == "input_json_delta":
+                        # tool_use input streams here — accumulate for the label
+                        if idx in tool_blocks:
+                            tool_blocks[idx]["input_json"] += str(delta.get("partial_json") or "")
+                    else:
+                        text = delta.get("text") or ""
+                        if text:
+                            text_parts.append(text)
+                            on_event({"kind": "delta", "text": text})
+                elif itype == "content_block_start":
+                    block = inner.get("content_block") or {}
+                    if block.get("type") == "tool_use":
+                        tool_blocks[idx] = {"name": block.get("name") or "tool", "input_json": ""}
+                elif itype == "content_block_stop" and idx in tool_blocks:
+                    tb = tool_blocks.pop(idx)
+                    try:
+                        parsed_input = json.loads(tb["input_json"] or "{}")
+                    except json.JSONDecodeError:
+                        parsed_input = {}
+                    on_event({"kind": "tool",
+                              "label": _describe_tool({"name": tb["name"], "input": parsed_input})})
+            elif etype == "result":
+                result_text = str(evt.get("result") or "")
+                usage = evt.get("usage")
+                if evt.get("is_error"):
+                    raise RuntimeError(f"Claude CLI reported error: {result_text[:500]}")
+        proc.wait()
+        if proc.returncode not in (0, None):
+            err = normalize_text(proc.stderr.read() if proc.stderr else "", 1000)
+            raise RuntimeError(f"Claude CLI failed (exit {proc.returncode}). stderr={err}")
+        # Prefer the accumulated deltas; fall back to the result field.
+        text = ("".join(text_parts)).strip() or result_text.strip()
+        if usage:
+            on_event({"kind": "usage", "usage": usage})
+        return {"text": text, "raw": None, "provider_style": "claude_cli",
+                "backend_session_id": None, "usage": usage}
 
     def _run_codex(
         self,
@@ -829,6 +932,7 @@ class ProviderClient:
         temperature: float | None = None,
         ephemeral: bool = False,
         tool_env: dict[str, str] | None = None,
+        on_event: Any = None,
     ) -> dict[str, Any]:
         active = self.active_model()
         if active["backend"] == "claude_cli":
@@ -842,6 +946,7 @@ class ProviderClient:
                 thinking=active["thinking"],
                 ephemeral=ephemeral,
                 tool_env=tool_env,
+                on_event=on_event,
             )
 
         if active["backend"] == "codex_cli":
@@ -893,6 +998,7 @@ class ProviderClient:
         max_output_tokens: int | None = None,
         temperature: float | None = None,
         tool_env: dict[str, str] | None = None,
+        on_event: Any = None,
     ) -> dict[str, Any]:
         return self.complete(
             system_prompt=system_prompt,
@@ -903,6 +1009,7 @@ class ProviderClient:
             temperature=temperature,
             ephemeral=False,
             tool_env=tool_env,
+            on_event=on_event,
         )
 
     def summarize_conversation(self, *, existing_summary: str, new_messages: list[dict[str, Any]]) -> str:
@@ -2415,6 +2522,9 @@ class ChatHandler(BaseHTTPRequestHandler):
         if self.path == "/chat":
             self.handle_chat(body)
             return
+        if self.path == "/chat/stream":
+            self.handle_chat_stream(body)
+            return
         if self.path == "/owner/profile":
             self.handle_owner_profile(body)
             return
@@ -2496,25 +2606,21 @@ class ChatHandler(BaseHTTPRequestHandler):
             return
         self.respond_json(400, {"ok": False, "error": f"unknown action {action!r}"})
 
-    def handle_chat(self, body: dict[str, Any]) -> None:
-        started = time.time()
+    def _chat_context(self, body: dict[str, Any]):
+        """Shared prep for /chat and /chat/stream. Returns (ctx, None) or
+        (None, (status, error)). ctx holds everything both paths need."""
         message = normalize_text(str(body.get("message") or body.get("input") or ""))
         if not message:
-            self.respond_json(400, {"ok": False, "error": "message is required"})
-            return
-
+            return None, (400, "message is required")
         user = str(body.get("user") or body.get("actor_id") or DEFAULT_SESSION_MAIN_KEY)
         actor_id = normalize_text(str(body.get("actor_id") or user), 128)
         try:
             memory_scope = parse_memory_scope(body.get("memory_scope"))
         except ValueError as exc:
-            self.respond_json(400, {"ok": False, "error": str(exc)})
-            return
-
+            return None, (400, str(exc))
         target_user_id = normalize_text(str(body.get("target_user_id") or ""), 128) or None
         if memory_scope == "target_user" and not target_user_id:
-            self.respond_json(400, {"ok": False, "error": "target_user_id is required when memory_scope=target_user"})
-            return
+            return None, (400, "target_user_id is required when memory_scope=target_user")
 
         session_key = safe_session_key(
             user=user,
@@ -2522,10 +2628,6 @@ class ChatHandler(BaseHTTPRequestHandler):
             new_session=coerce_bool(body.get("new_session")),
         )
         use_memory = coerce_bool(body.get("use_trajectory_memory"), True)
-        log.info(
-            "chat start user=%s scope=%s session=%s msg_chars=%d use_memory=%s",
-            user, memory_scope, session_key, len(message), use_memory,
-        )
         all_messages = self.server.state.sessions.load_messages(session_key, limit=None)
         summary_state = self.server.state.sessions.get_session_summary(session_key) or {}
         summary_text = str(summary_state.get("summary") or "")
@@ -2555,12 +2657,10 @@ class ChatHandler(BaseHTTPRequestHandler):
                 match_limit=int(body.get("memory_match_limit", self.server.state.config.memory_match_limit)),
             )
         except ValueError as exc:
-            self.respond_json(400, {"ok": False, "error": str(exc)})
-            return
+            return None, (400, str(exc))
         except RuntimeError as exc:
             log.warning("chat build_system_prompt failed user=%s: %s", user, exc)
-            self.respond_json(500, {"ok": False, "error": str(exc)})
-            return
+            return None, (500, str(exc))
 
         retrieval_budget_log_path = (
             self.server.state.new_retrieval_budget_log_path()
@@ -2573,29 +2673,26 @@ class ChatHandler(BaseHTTPRequestHandler):
             target_user_id=target_user_id,
             retrieval_budget_log_path=str(retrieval_budget_log_path) if retrieval_budget_log_path else None,
         )
+        return {
+            "message": message, "user": user, "actor_id": actor_id,
+            "memory_scope": memory_scope, "target_user_id": target_user_id,
+            "session_key": session_key, "use_memory": use_memory,
+            "history_for_model": history_for_model, "system_prompt": system_prompt,
+            "memory_sources": memory_sources, "session_summary_used": session_summary_used,
+            "summary_text": summary_text, "summary_state": summary_state,
+            "compacted_message_count": compacted_message_count,
+            "retrieval_budget_log_path": retrieval_budget_log_path, "tool_env": tool_env,
+        }, None
 
-        try:
-            provider_result = self.server.state.provider.chat(
-                system_prompt=system_prompt,
-                history=history_for_model,
-                message=message,
-                backend_session_id=(self.server.state.sessions.get_backend_state(session_key) or {}).get("backend_session_id"),
-                max_output_tokens=int(body["max_output_tokens"]) if body.get("max_output_tokens") is not None else None,
-                temperature=float(body["temperature"]) if body.get("temperature") is not None else None,
-                tool_env=tool_env,
-            )
-        except RuntimeError as exc:
-            log.warning("chat provider failed user=%s: %s", user, exc)
-            self.respond_json(502, {"ok": False, "error": str(exc)})
-            return
-
-        retrieval_budgets = self.server.state.read_retrieval_budget_log(retrieval_budget_log_path)
-        answer = append_retrieval_budget_summary(provider_result["text"], retrieval_budgets)
+    def _chat_persist(self, body, ctx, provider_result, answer, retrieval_budgets) -> dict[str, Any]:
+        """Shared finalize: build source records, persist the turn, compact,
+        return the response payload."""
+        user = ctx["user"]; actor_id = ctx["actor_id"]; session_key = ctx["session_key"]
+        memory_scope = ctx["memory_scope"]; target_user_id = ctx["target_user_id"]
+        session_summary_used = ctx["session_summary_used"]; memory_sources = ctx["memory_sources"]
+        summary_text = ctx["summary_text"]; summary_state = ctx["summary_state"]
+        compacted_message_count = ctx["compacted_message_count"]
         response_hash = hashlib.sha256(answer.encode("utf-8")).hexdigest()[:16]
-        log.info(
-            "chat done user=%s session=%s reply_chars=%d sources=%d elapsed=%.1fs",
-            user, session_key, len(answer), len(memory_sources), time.time() - started,
-        )
 
         source_records: list[dict[str, Any]] = []
         if session_summary_used:
@@ -2629,10 +2726,7 @@ class ChatHandler(BaseHTTPRequestHandler):
         source_records.extend(memory_sources)
 
         self.server.state.sessions.append_message(
-            session_key,
-            user,
-            "user",
-            message,
+            session_key, user, "user", ctx["message"],
             meta={
                 "source": "external_api",
                 "actor_id": actor_id,
@@ -2641,10 +2735,7 @@ class ChatHandler(BaseHTTPRequestHandler):
             },
         )
         self.server.state.sessions.append_message(
-            session_key,
-            user,
-            "assistant",
-            answer,
+            session_key, user, "assistant", answer,
             meta={
                 "source": "model_provider",
                 "provider_style": provider_result["provider_style"],
@@ -2663,10 +2754,7 @@ class ChatHandler(BaseHTTPRequestHandler):
             existing = self.server.state.sessions.get_backend_state(session_key) or {}
             if existing.get("backend_session_id") != backend_session_id:
                 self.server.state.sessions.set_backend_state(
-                    session_key,
-                    user,
-                    provider_result["provider_style"],
-                    backend_session_id,
+                    session_key, user, provider_result["provider_style"], backend_session_id,
                 )
 
         try:
@@ -2689,7 +2777,85 @@ class ChatHandler(BaseHTTPRequestHandler):
         }
         if body.get("include_raw"):
             payload["raw"] = provider_result["raw"]
+        return payload
+
+    def handle_chat(self, body: dict[str, Any]) -> None:
+        started = time.time()
+        ctx, err = self._chat_context(body)
+        if err:
+            self.respond_json(err[0], {"ok": False, "error": err[1]})
+            return
+        log.info("chat start user=%s session=%s msg_chars=%d",
+                 ctx["user"], ctx["session_key"], len(ctx["message"]))
+        try:
+            provider_result = self.server.state.provider.chat(
+                system_prompt=ctx["system_prompt"], history=ctx["history_for_model"],
+                message=ctx["message"],
+                backend_session_id=(self.server.state.sessions.get_backend_state(ctx["session_key"]) or {}).get("backend_session_id"),
+                tool_env=ctx["tool_env"],
+            )
+        except RuntimeError as exc:
+            log.warning("chat provider failed user=%s: %s", ctx["user"], exc)
+            self.respond_json(502, {"ok": False, "error": str(exc)})
+            return
+        retrieval_budgets = self.server.state.read_retrieval_budget_log(ctx["retrieval_budget_log_path"])
+        answer = append_retrieval_budget_summary(provider_result["text"], retrieval_budgets)
+        log.info("chat done user=%s session=%s reply_chars=%d elapsed=%.1fs",
+                 ctx["user"], ctx["session_key"], len(answer), time.time() - started)
+        payload = self._chat_persist(body, ctx, provider_result, answer, retrieval_budgets)
         self.respond_json(200, payload)
+
+    def handle_chat_stream(self, body: dict[str, Any]) -> None:
+        """Server-Sent Events variant: streams tool activity + answer text as the
+        agent produces it, then a final `done` event with sources + budget."""
+        started = time.time()
+        ctx, err = self._chat_context(body)
+        if err:
+            self.respond_json(err[0], {"ok": False, "error": err[1]})
+            return
+        log.info("chat stream start user=%s session=%s", ctx["user"], ctx["session_key"])
+
+        self.send_response(200)
+        self.send_header("Content-Type", "text/event-stream")
+        self.send_header("Cache-Control", "no-cache")
+        self.send_header("Connection", "close")
+        self.end_headers()
+
+        def emit(event: dict[str, Any]) -> None:
+            try:
+                self.wfile.write(f"data: {json.dumps(event)}\n\n".encode("utf-8"))
+                self.wfile.flush()
+            except (BrokenPipeError, OSError):
+                raise _ClientGone()
+
+        try:
+            provider_result = self.server.state.provider.chat(
+                system_prompt=ctx["system_prompt"], history=ctx["history_for_model"],
+                message=ctx["message"],
+                backend_session_id=(self.server.state.sessions.get_backend_state(ctx["session_key"]) or {}).get("backend_session_id"),
+                tool_env=ctx["tool_env"],
+                on_event=emit,
+            )
+        except _ClientGone:
+            log.info("chat stream: client disconnected user=%s", ctx["user"])
+            return
+        except RuntimeError as exc:
+            log.warning("chat stream provider failed user=%s: %s", ctx["user"], exc)
+            try:
+                emit({"kind": "error", "error": str(exc)})
+            except _ClientGone:
+                pass
+            return
+
+        retrieval_budgets = self.server.state.read_retrieval_budget_log(ctx["retrieval_budget_log_path"])
+        answer = append_retrieval_budget_summary(provider_result["text"], retrieval_budgets)
+        payload = self._chat_persist(body, ctx, provider_result, answer, retrieval_budgets)
+        log.info("chat stream done user=%s session=%s reply_chars=%d elapsed=%.1fs",
+                 ctx["user"], ctx["session_key"], len(answer), time.time() - started)
+        try:
+            emit({"kind": "done", **payload})
+        except _ClientGone:
+            pass
 
     def handle_memory_rebuild(self, body: dict[str, Any]) -> None:
         result = self.server.state.rebuild_memory(

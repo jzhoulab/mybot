@@ -827,10 +827,11 @@ struct AskView: View {
                                     chunks: 0))
                             }
                         }
-                        if model.chatPending {
+                        if model.chatPending && !model.chatActivity.isEmpty {
                             HStack(spacing: 7) {
                                 ProgressView().controlSize(.small)
-                                Text("mybot is thinking…").font(.system(size: 11)).foregroundStyle(.secondary)
+                                Text(model.chatActivity).font(.system(size: 11)).foregroundStyle(.secondary)
+                                    .lineLimit(1)
                             }
                             .id("pending")
                         }
@@ -939,7 +940,8 @@ struct ChatBubble: View {
             VStack(alignment: .leading, spacing: 0) {
                 HStack(alignment: .top, spacing: 8) {
                     BotAvatar(mood: .happy).frame(width: 20, height: 20)
-                    Text(.init(msg.text))   // renders basic markdown
+                    Text(.init(msg.text.isEmpty && msg.streaming ? "…" : msg.text)
+                         + (msg.streaming && !msg.text.isEmpty ? .init(" ▍") : ""))
                         .font(.system(size: 12)).textSelection(.enabled)
                         .frame(maxWidth: .infinity, alignment: .leading)
                 }
@@ -1112,6 +1114,10 @@ enum UIExporter {
             // ScrollView contents don't render offline — render the ask pieces directly
             write(VStack(alignment: .leading, spacing: 10) {
                 ForEach(askModel.chat) { msg in ChatBubble(msg: msg, startExpanded: true) }
+                ChatBubble(msg: ChatMsg(role: "assistant",
+                    text: "You mostly worked on the fable evaluation harness", streaming: true))
+                HStack(spacing: 7) { ProgressView().controlSize(.small)
+                    Text("Searching memory: fable recent work").font(.system(size: 11)).foregroundStyle(.secondary) }
                 ChatBubble(msg: ChatMsg(role: "error", text: "chat server is not running — start it with run_discord_chatbot.sh"))
                 Text("MEMORY MATCHES").font(.system(size: 10, weight: .heavy)).tracking(0.6)
                     .foregroundStyle(.secondary)

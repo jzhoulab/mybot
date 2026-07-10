@@ -111,6 +111,83 @@ struct ChatClient {
         }.resume()
     }
 
+    /// Streamed events from POST /chat/stream.
+    enum StreamEvent {
+        case tool(String)          // live activity, e.g. "Searching memory: fable"
+        case delta(String)         // answer text chunk
+        case done(ChatReply)       // final: full text + sources + tool calls
+        case failure(String)
+    }
+
+    /// POST /chat/stream (SSE). Calls onEvent on the main queue as events arrive.
+    /// Returns a Task so the caller can cancel it.
+    @discardableResult
+    func stream(_ message: String, onEvent: @escaping (StreamEvent) -> Void) -> Task<Void, Never> {
+        var request = URLRequest(url: baseURL.appendingPathComponent("chat/stream"))
+        request.httpMethod = "POST"
+        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        request.setValue("text/event-stream", forHTTPHeaderField: "Accept")
+        request.timeoutInterval = 200
+        request.httpBody = try? JSONSerialization.data(withJSONObject: [
+            "user": config.ownerActorID, "actor_id": config.ownerActorID,
+            "session_key": Self.sessionKey, "message": message,
+            "use_trajectory_memory": true, "return_sources": true,
+        ] as [String: Any])
+
+        return Task {
+            func send(_ e: StreamEvent) { DispatchQueue.main.async { onEvent(e) } }
+            do {
+                let (bytes, response) = try await URLSession.shared.bytes(for: request)
+                if let http = response as? HTTPURLResponse, http.statusCode >= 400 {
+                    send(.failure("server error \(http.statusCode)")); return
+                }
+                for try await line in bytes.lines {
+                    if Task.isCancelled { return }
+                    guard line.hasPrefix("data:") else { continue }
+                    let json = line.dropFirst(5).trimmingCharacters(in: .whitespaces)
+                    guard let data = json.data(using: .utf8),
+                          let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+                          let kind = obj["kind"] as? String else { continue }
+                    switch kind {
+                    case "tool":   send(.tool((obj["label"] as? String) ?? "Working…"))
+                    case "delta":  send(.delta((obj["text"] as? String) ?? ""))
+                    case "error":  send(.failure((obj["error"] as? String) ?? "error"))
+                    case "done":   send(.done(Self.reply(from: obj)))
+                    default: break
+                    }
+                }
+            } catch {
+                if !Task.isCancelled {
+                    let hint = (error as? URLError)?.code == .cannotConnectToHost
+                        ? "chat server is not running — start it with run_discord_chatbot.sh"
+                        : error.localizedDescription
+                    send(.failure(hint))
+                }
+            }
+        }
+    }
+
+    /// Build a ChatReply from a /chat or /chat/stream done payload.
+    static func reply(from obj: [String: Any]) -> ChatReply {
+        let sources = ((obj["sources"] as? [[String: Any]]) ?? []).map { s in
+            ChatSource(ref: (s["source_ref"] as? String) ?? "",
+                       sourceName: (s["source_name"] as? String) ?? "",
+                       kind: (s["record_kind"] as? String) ?? "",
+                       title: (s["title"] as? String) ?? "",
+                       score: s["match_score"] as? Double)
+        }
+        let toolCalls = ((obj["retrieval_budget"] as? [[String: Any]]) ?? []).map { b in
+            ChatToolCall(tool: (b["tool"] as? String) ?? "tool",
+                         query: (b["query"] as? String) ?? "",
+                         seconds: (b["seconds"] as? Double) ?? 0,
+                         results: (b["result_count"] as? Int) ?? 0,
+                         tokens: (b["tokens_estimate"] as? Int) ?? 0)
+        }
+        var text = (obj["text"] as? String) ?? ""
+        if !toolCalls.isEmpty, let r = text.range(of: "\n\nRetrieval budget:") { text = String(text[..<r.lowerBound]) }
+        return ChatReply(text: text, sources: sources, toolCalls: toolCalls)
+    }
+
     /// POST /sessions/reset — start a fresh conversation. Fire and forget.
     func resetSession() {
         var request = URLRequest(url: baseURL.appendingPathComponent("sessions/reset"))
