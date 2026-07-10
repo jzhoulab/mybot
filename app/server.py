@@ -323,13 +323,20 @@ def _describe_tool(block: dict[str, Any]) -> str:
     command = str(inp.get("command") or "") if isinstance(inp, dict) else ""
     if "mybot_tool" in command:
         m = re.search(r"mybot_tool\.py\s+([a-z-]+)", command)
-        sub = (m.group(1) if m else "").replace("-", " ")
+        sub = (m.group(1) if m else "").replace("-", " ").strip()
         q = re.search(r'-q\s+["\']([^"\']+)', command) or re.search(r'--query\s+["\']([^"\']+)', command)
         if "read" in sub:
             return "Reading trajectory evidence…"
         if "search" in sub:
             return f"Searching memory: {q.group(1)[:50]}" if q else "Searching memory…"
-        return f"Running {sub or 'tool'}…"
+        return "Running memory tool…" if not sub else f"Running {sub}…"
+    if "sqlite3" in command:
+        like = re.search(r"LIKE\s+'%([^%']+)%'", command, re.IGNORECASE)
+        if like:
+            return f"Grepping index: {like.group(1)[:50]}"
+        if re.search(r"\bCOUNT\b|GROUP BY", command, re.IGNORECASE):
+            return "Enumerating sessions…"
+        return "Querying index (SQL)…"
     return f"Running {name}…"
 
 
@@ -719,11 +726,18 @@ class ProviderClient:
         if system_prompt:
             cmd.extend(["--append-system-prompt", system_prompt])
         # allowedTools is a strict whitelist in headless mode: anything not listed
-        # is auto-denied. The planner (ephemeral) gets no tools; the answer gets
-        # ONLY the mybot tool via a Bash command prefix — no file/edit/web access.
+        # is auto-denied. The planner (ephemeral) gets no tools. The answer gets
+        # exactly two Bash prefixes, both read-only and policy-scoped:
+        #  1. the mybot tool (agentic memory/trajectory search + read)
+        #  2. sqlite3 -readonly over the INDEX db — free-form exact/enumeration SQL
+        #     over the cleaned, included-only chunk text (writes are blocked by the
+        #     -readonly flag; the db path is pinned so it can't point elsewhere).
+        # No file/edit/web access, and NOT the raw ~/.claude jsonl (which still
+        # holds excluded sessions + secrets).
         if not ephemeral:
             tool_prefix = f"{self.config.mybot_tool_python} {self.config.mybot_tool_path}"
-            cmd.extend(["--allowedTools", f"Bash({tool_prefix}:*)"])
+            sqlite_prefix = f"/usr/bin/sqlite3 -readonly {self.config.trajectory_index_db_path}"
+            cmd.extend(["--allowedTools", f"Bash({tool_prefix}:*)", f"Bash({sqlite_prefix}:*)"])
         # NOTE: prompt goes via stdin, NOT as a positional arg — the variadic
         # --allowedTools/--append flags would otherwise swallow it.
 
@@ -2350,14 +2364,29 @@ class AppState:
 
         if use_memory and self.config.agentic_tool_routing:
             tool_command = f"{shlex.quote(self.config.mybot_tool_python)} {shlex.quote(self.config.mybot_tool_path)}"
+            sqlite_command = f"/usr/bin/sqlite3 -readonly {shlex.quote(self.config.trajectory_index_db_path)}"
             sections.append(
                 "## Local Tool Routing\n"
                 "Decide from the user's message whether local memory or trajectory lookup is needed. "
-                "If it is needed, use the mybot tool and iterate until you have enough grounded evidence; "
-                "Do not bypass the configured trajectory access layer. "
-                "Treat search results as candidates and read focused trajectory evidence before making claims about what a trajectory contains. "
-                "otherwise answer directly without lookup. "
-                f"The tool command is: `{tool_command}`. "
+                "If it is not, answer directly. If it is, you have TWO complementary read-only tools:\n"
+                f"1. Agentic search/read: `{tool_command}` — subcommands memory-search, trajectory-search, "
+                "trajectory-read (focused evidence), trajectory-stats. Best for fuzzy/semantic questions. "
+                "Treat search results as candidates and trajectory-read focused evidence before claiming what a trajectory contains.\n"
+                f"2. Exact SQL over the cleaned index: `{sqlite_command} \"<SQL>\"` — read-only. The table "
+                "`trajectory_chunks(source_ref, source_name, cwd, title, updated_at, text, metadata_json)` "
+                "holds the CLEANED, human-readable text of ONLY the included sessions (raw noise stripped; "
+                "excluded/automated sessions are absent). Use it for EXACT things the fuzzy search misses: "
+                "verify a literal string across sessions (e.g. `WHERE text LIKE '%claude-fable-5%'`), count/enumerate "
+                "(`SELECT DISTINCT source_ref, MAX(cwd), MAX(title), MAX(updated_at) ... GROUP BY source_ref "
+                "ORDER BY updated_at DESC`), or filter by cwd/date/`json_extract(metadata_json,'$.origin')`. "
+                "There is also a `trajectory_chunks_fts(title, cwd, text)` FTS5 table for `MATCH` queries.\n"
+                "Be RELENTLESSLY PROACTIVE before you reply: whenever a question touches prior work, do not "
+                "answer from the first few hits or a single search. Enumerate the relevant sessions with SQL, "
+                "grep exact identifiers to verify every specific claim, and read the key sessions in full. Keep "
+                "digging — issue follow-up queries, widen and narrow, cross-check — until you have either "
+                "corroborated your answer with concrete evidence or confirmed the evidence genuinely isn't there. "
+                "Prefer a thorough, verified answer over a fast one; state clearly what is grounded vs uncertain. "
+                "Do not bypass these tools to touch raw session files. "
                 "The request actor and memory scope are already provided through environment variables."
             )
         elif use_memory:
