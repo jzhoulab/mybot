@@ -810,7 +810,6 @@ struct AskView: View {
 
     var body: some View {
         VStack(spacing: 0) {
-            inputBar
             ScrollViewReader { proxy in
                 ScrollView {
                     VStack(alignment: .leading, spacing: 10) {
@@ -861,6 +860,8 @@ struct AskView: View {
                     if model.chatPending { withAnimation { proxy.scrollTo("pending", anchor: .bottom) } }
                 }
             }
+            Divider().opacity(0.3)
+            inputBar   // at the bottom, per chatbot convention
         }
         .onAppear { focused = true }
     }
@@ -890,7 +891,7 @@ struct AskView: View {
         }
         .padding(.horizontal, 10).padding(.vertical, 8)
         .background(RoundedRectangle(cornerRadius: 9, style: .continuous).fill(Color.primary.opacity(0.06)))
-        .padding(.horizontal, 12).padding(.bottom, 10)
+        .padding(.horizontal, 12).padding(.vertical, 10)
     }
 
     private var emptyHint: some View {
