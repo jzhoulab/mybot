@@ -735,7 +735,7 @@ def cmd_retitle(_args: argparse.Namespace) -> dict[str, Any]:
     from sources.common import is_real_user_text, normalize_text
 
     cfg = _config()
-    junk_like = ("<%", "You are %", "Caveat:%", "# AGENTS.md%")
+    junk_like = ("<%", "You are %", "Caveat:%", "# AGENTS.md%", "This session is being continued%")
     retitled = 0
     skipped = 0
     with sqlite3.connect(cfg["db_path"]) as conn:

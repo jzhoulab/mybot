@@ -54,6 +54,53 @@ RECENCY_INTENT_RE = re.compile(
     re.IGNORECASE,
 )
 VECTOR_BATCH_SIZE = 32
+# Chunks that quote this assistant's own machinery — test queries typed while
+# building mybot, mybot source read into tool output, retrieval traces — echo
+# whatever entities the code uses as examples ("cluster", "showusage", a balance
+# line) and would otherwise outrank the session holding the real data. The
+# penalty keys off the chunk BODY, not the session title: a genuine data chunk
+# inside a mybot-titled session must escape it, and an echo chunk inside an
+# innocently-titled session must not.
+SELF_ECHO_MARKERS = (
+    "mybot",
+    "trajectory-search",
+    "trajectory-read",
+    "trajectory_chunk",  # trajectory_chunks table, trajectory_chunk_index
+    "trajectory_memory",
+    "semantic_memory",
+    # Quoted retrieval output: genuine work never reprints another session's
+    # header or the tool's JSON fields, so these mark result dumps captured
+    # while testing this assistant.
+    "source ref: claude:",
+    "source ref: codex:",
+    '"match_kind"',
+    '"source_ref"',
+)
+
+
+def _chunk_body(text: str) -> str:
+    """Chunk text after the header (Title/Source/Source ref/CWD/Updated) that
+    _chunk_document prepends. normalize_text flattens the stored text to one
+    line, so locate the header's final `Updated: <timestamp>` field and cut
+    through its value. Content-keyed penalties must not trip on header echoes
+    of the session title or ref."""
+    if not text.startswith("Title: "):
+        return text
+    marker = " Updated: "
+    index = text.find(marker)
+    if index < 0:
+        return text
+    rest = text[index + len(marker):]
+    space = rest.find(" ")
+    return rest[space + 1:] if space >= 0 else ""
+
+
+
+SELF_ECHO_QUERY_EXEMPT_RE = re.compile(
+    r"\b(mybot|bot|chatbot|memory|memories|retrieval|retrieve\w*|trajector\w*|"
+    r"index\w*|chunk\w*|embedding\w*|discord|menu bar|menu app|gui)\b",
+    re.IGNORECASE,
+)
 CORRECTION_MARKERS = (
     "better word",
     "correction",
@@ -757,6 +804,38 @@ class TrajectoryChunkIndex:
             "db_path": self.db_path,
         }
 
+    def _eligible_chunk_ids(self, *, after: str, before: str, source: str) -> set[int] | None:
+        """Rowids passing the hard updated_at/source filters, or None when no
+        filter is active. ISO-prefix comparisons; a date-only `before` bound is
+        made inclusive of that whole day."""
+        after = (after or "").strip()
+        before = (before or "").strip()
+        source = (source or "").strip().lower()
+        if not (after or before or source):
+            return None
+        clauses: list[str] = []
+        params: list[str] = []
+        if source:
+            clauses.append("lower(source_name) = ?")
+            params.append(source)
+        if after:
+            clauses.append("updated_at >= ?")
+            params.append(after)
+        if before:
+            clauses.append("updated_at <= ?")
+            params.append(before if len(before) > 10 else before + "~")
+        with self._connect() as conn:
+            rows = conn.execute(
+                f"SELECT id FROM trajectory_chunks WHERE {' AND '.join(clauses)}",
+                tuple(params),
+            ).fetchall()
+        return {int(row["id"]) for row in rows}
+
+    # Above this, restricting the vector search to the filtered rowids would
+    # decode embeddings row-by-row (no cache); a window this wide behaves like
+    # an unfiltered search anyway, so use the full matrix and post-filter.
+    _VECTOR_CANDIDATE_FILTER_MAX = 4000
+
     def search(
         self,
         *,
@@ -765,21 +844,36 @@ class TrajectoryChunkIndex:
         mode: str = "hybrid",
         exact_limit: int = 300,
         vector_limit: int = 50,
+        after: str = "",
+        before: str = "",
+        source: str = "",
     ) -> list[dict[str, Any]]:
         mode = (mode or "hybrid").lower()
+        eligible_ids = self._eligible_chunk_ids(after=after, before=before, source=source)
+        if eligible_ids is not None and not eligible_ids:
+            return []
         scores: dict[int, dict[str, float]] = {}
         exact_rowids: set[int] = set()
         if mode in {"hybrid", "exact", "fts", "lexical"}:
             for rowid, score in self._exact_scores(query, limit=exact_limit):
+                if eligible_ids is not None and rowid not in eligible_ids:
+                    continue
                 scores.setdefault(rowid, {})["exact"] = max(scores.get(rowid, {}).get("exact", 0.0), score)
                 exact_rowids.add(rowid)
         if mode in {"hybrid", "vector", "semantic"}:
-            vector_candidates = exact_rowids if mode == "hybrid" and exact_rowids else None
+            if mode == "hybrid" and exact_rowids:
+                vector_candidates = exact_rowids
+            elif eligible_ids is not None and len(eligible_ids) <= self._VECTOR_CANDIDATE_FILTER_MAX:
+                vector_candidates = eligible_ids
+            else:
+                vector_candidates = None
             for rowid, score in self._vector_scores(
                 query,
                 limit=vector_limit,
                 candidate_rowids=vector_candidates,
             ):
+                if eligible_ids is not None and rowid not in eligible_ids:
+                    continue
                 scores.setdefault(rowid, {})["vector"] = max(scores.get(rowid, {}).get("vector", 0.0), score)
         if not scores:
             return []
@@ -795,6 +889,7 @@ class TrajectoryChunkIndex:
         now = datetime.now(timezone.utc)
         recency_intent = bool(RECENCY_INTENT_RE.search(query or ""))
         payloads: list[dict[str, Any]] = []
+        chunk_texts: dict[int, str] = {}
         for row in rows:
             parts = scores.get(row["id"], {})
             exact = parts.get("exact", 0.0)
@@ -814,6 +909,7 @@ class TrajectoryChunkIndex:
             payload = self._row_to_payload(row, score=score, match_kind=match_kind)
             payload["metadata"]["exact_score"] = round(exact, 4)
             payload["metadata"]["vector_score"] = round(vector, 4)
+            chunk_texts[int(row["id"])] = str(row["text"] or "")
             payloads.append(payload)
 
         payloads.sort(
@@ -837,6 +933,14 @@ class TrajectoryChunkIndex:
             deduped.append(payload)
             if len(deduped) >= limit:
                 break
+        # text_preview is the chunk HEAD (mostly header); the line that actually
+        # matched can sit anywhere in the chunk. Surface it, or a zoomed read
+        # becomes a blind guess and "no grounded record" a false conclusion.
+        for payload in deduped:
+            text = chunk_texts.get(int(payload["metadata"].get("chunk_id") or 0), "")
+            snippets = snippets_for_query(_chunk_body(text), query, limit=2, width=500) if text else []
+            if snippets:
+                payload["snippets"] = snippets
         return deduped
 
     def _recency_bonus(
@@ -873,10 +977,10 @@ class TrajectoryChunkIndex:
         # genuinely fresh evidence deep in their chunk stream.
         if int(row["chunk_index"]) > 120 and title_hits == 0:
             score *= 0.8
-        title_lower = str(row["title"] or "").lower()
-        query_lower = query.lower()
-        if "mybot" in title_lower and "mybot" not in query_lower:
-            score *= 0.35
+        if not SELF_ECHO_QUERY_EXEMPT_RE.search(query or ""):
+            body_lower = _chunk_body(str(row["text"] or "")).lower()
+            if any(marker in body_lower for marker in SELF_ECHO_MARKERS):
+                score *= 0.35
         score *= generated_session_penalty(title=str(row["title"] or ""), cwd=str(row["cwd"] or ""))
         if now is not None:
             score += self._recency_bonus(
@@ -910,6 +1014,8 @@ class TrajectoryChunkIndex:
             start = int(chunk_row["event_start"])
             end = int(chunk_row["event_end"]) + 1
         else:
+            if doc.events:
+                event_index = max(0, min(event_index, len(doc.events) - 1))
             start = max(0, event_index - before)
             end = min(len(doc.events), event_index + after + 1)
         windows: list[tuple[str, int, int]] = []
@@ -1018,6 +1124,7 @@ class TrajectoryChunkIndex:
             "metadata": doc.metadata,
             "event_start": start,
             "event_end": end - 1,
+            "total_events": len(doc.events),
             "snippets": snippets,
             "transcript": transcript,
             "transcript_chars": len(doc.transcript),

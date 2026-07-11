@@ -445,6 +445,7 @@ def read_payload_from_file(
         "updated_at": updated_at,
         "cwd": cwd,
         "metadata": metadata,
+        "total_events": len(events),
         "snippets": snippets,
         "transcript": evidence,
         "transcript_chars": len(transcript),
@@ -502,26 +503,50 @@ def snippet_quality(snippet: str) -> int:
         score -= 40
     if "tool_result" in lowered or "[truncated]" in lowered:
         score -= 6
+    # Quoted retrieval output (another session's header, the tool's JSON
+    # fields) is a mirror of a search, not evidence.
+    if (
+        "source ref: claude:" in lowered
+        or "source ref: codex:" in lowered
+        or '"source_ref"' in lowered
+        or '"match_kind"' in lowered
+    ):
+        score -= 60
+    if "this session is being continued" in lowered:
+        score -= 25
     return score
 
 
 def snippets_for_query(text: str, query: str, *, limit: int = 3, width: int = 900) -> list[str]:
     candidates: list[str] = []
     phrase = normalize_text(focus_query(query), 160)
+    tokens = query_tokens(query)
     seen: set[str] = set()
     if phrase and len(phrase) >= 6:
         for snippet in snippet_candidates(text, phrase, width=width):
             if snippet not in seen:
                 candidates.append(snippet)
                 seen.add(snippet)
-    for token in query_tokens(query):
+    for token in tokens:
         if len(candidates) >= limit * 8:
             break
         for snippet in snippet_candidates(text, token, width=width, max_candidates=3):
             if snippet not in seen:
                 candidates.append(snippet)
                 seen.add(snippet)
-    candidates.sort(key=snippet_quality, reverse=True)
+
+    # A window covering more distinct query terms is better evidence than a
+    # "cleaner-looking" window around one common term — the balance/status line
+    # a data query wants usually lives in tool output that snippet_quality
+    # would otherwise discount. Blend rather than tier: a heavily-discounted
+    # window (e.g. quoted retrieval output) must not win on coverage alone.
+    token_set = set(tokens)
+
+    def coverage(snippet: str) -> int:
+        lowered = snippet.lower()
+        return sum(1 for token in token_set if token in lowered)
+
+    candidates.sort(key=lambda snippet: coverage(snippet) * 40 + snippet_quality(snippet), reverse=True)
     return candidates[:limit]
 
 

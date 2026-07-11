@@ -29,6 +29,9 @@ AUTO_PREFIXES = (
     "You are a ",
     "You are an ",
     "You are the ",
+    # compaction boilerplate that opens every continued session — the real
+    # request is in a later turn
+    "This session is being continued",
 )
 UUID_RE = re.compile(r"^[0-9a-f]{8}-[0-9a-f]{4}-")
 ROLLOUT_RE = re.compile(r"^rollout-\d{4}-\d{2}-\d{2}T")
