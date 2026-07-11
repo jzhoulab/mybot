@@ -59,6 +59,13 @@ final class AppModel: ObservableObject {
     @Published var busyMessage: String?
     @Published var lastError: String?
 
+    // Owner identity onboarding: discovered by a background "Sherlock session"
+    // on first boot, confirmed by the owner here or via !iam on Discord.
+    @Published var ownerName = ""
+    @Published var ownerAliases: [String] = []
+    @Published var ownerConfirmed = false
+    @Published var identityInvestigating = false
+
     @Published var search = ""
     @Published var sourceFilter = "all"
     @Published var statusFilter: StatusFilter = .included
@@ -88,11 +95,51 @@ final class AppModel: ObservableObject {
         renderIcon()
         reload()
         loadModelPresets()
+        refreshIdentity()
         timer = Timer.scheduledTimer(withTimeInterval: 15, repeats: true) { [weak self] _ in
             Task { @MainActor in
                 guard let self, self.busyMessage == nil else { return }  // don't shift numbers mid-op
                 self.reload()
+                // Keep polling while onboarding hasn't settled (discovery in
+                // flight, or a deduced name waiting for the owner's nod).
+                if self.identityInvestigating || (self.ownerName.isEmpty || !self.ownerConfirmed) {
+                    self.refreshIdentity()
+                }
             }
+        }
+    }
+
+    // MARK: owner identity
+
+    private func applyIdentity(_ identity: ChatClient.IdentityState?) {
+        guard let identity else { return }  // server down — keep last known
+        DispatchQueue.main.async {
+            self.ownerName = identity.name
+            self.ownerAliases = identity.aliases
+            self.ownerConfirmed = identity.confirmed
+            self.identityInvestigating = identity.investigating
+        }
+    }
+
+    func refreshIdentity() {
+        ChatClient(config: config).fetchIdentity { [weak self] identity in
+            self?.applyIdentity(identity)
+        }
+    }
+
+    func confirmIdentity(name: String) {
+        let trimmed = name.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return }
+        ChatClient(config: config).confirmIdentity(name: trimmed) { [weak self] identity in
+            self?.applyIdentity(identity)
+            DispatchQueue.main.async { self?.refreshIdentity() }
+        }
+    }
+
+    func rediscoverIdentity() {
+        identityInvestigating = true
+        ChatClient(config: config).rediscoverIdentity { [weak self] identity in
+            self?.applyIdentity(identity)
         }
     }
 
@@ -119,6 +166,9 @@ final class AppModel: ObservableObject {
         health.latestIndexedAt = ISO8601DateFormatter().string(from: Date().addingTimeInterval(-140))
         model.health = health
         model.newProjects = [NewProject(source: "codex", cwd: "/Users/you/Code/newapp", sessions: 4)]
+        model.ownerName = "Ada Lovelace"
+        model.ownerAliases = ["alice", "alice"]
+        model.ownerConfirmed = false
         return model
     }
 
@@ -131,9 +181,9 @@ final class AppModel: ObservableObject {
 
     var accentColor: Color {
         switch mood {
-        case .happy: return Color(red: 0.30, green: 0.80, blue: 0.46)
-        case .alert: return Color(red: 0.98, green: 0.74, blue: 0.20)
-        case .error: return Color(red: 0.95, green: 0.36, blue: 0.36)
+        case .happy: return Color(red: 0.18, green: 0.62, blue: 0.50)
+        case .alert: return Color(red: 0.86, green: 0.62, blue: 0.20)
+        case .error: return Color(red: 0.87, green: 0.36, blue: 0.33)
         case .sleepy: return Color(white: 0.62)
         }
     }

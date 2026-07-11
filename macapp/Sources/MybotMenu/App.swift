@@ -38,24 +38,43 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 // MARK: - Design helpers
 
 private enum Palette {
+    // Drawn from the bunny icon: crisp neutrals carry the UI, ONE confident
+    // teal-blue (the icon's gradient) marks everything interactive, and status
+    // hues stay small — dots, icons, and single words, never colored slabs.
+    static let iconTeal = Color(red: 0.36, green: 0.80, blue: 0.72)   // icon gradient start
+    static let iconBlue = Color(red: 0.22, green: 0.58, blue: 0.86)   // icon gradient end
+    static let accent   = Color(red: 0.14, green: 0.55, blue: 0.71)   // the gradient, deepened for text/controls
+    static var brandGradient: LinearGradient {
+        LinearGradient(colors: [iconTeal, iconBlue], startPoint: .topLeading, endPoint: .bottomTrailing)
+    }
+
+    static let good = Color(red: 0.15, green: 0.60, blue: 0.44)       // teal-leaning green
+    static let warn = Color(red: 0.86, green: 0.62, blue: 0.20)       // clear amber
+    static let bad  = Color(red: 0.87, green: 0.36, blue: 0.33)       // coral (badge-red family)
+
     static func source(_ name: String) -> Color {
         switch name {
-        case "codex": return Color(red: 0.47, green: 0.49, blue: 0.96)
-        case "claude": return Color(red: 0.93, green: 0.56, blue: 0.26)
+        case "codex": return Color(red: 0.44, green: 0.49, blue: 0.90)
+        case "claude": return Color(red: 0.80, green: 0.51, blue: 0.30)
         default: return .gray
         }
     }
 }
 
 private struct SourceTag: View {
+    // These sit on nearly every row: the hue lives in a small dot so the tag
+    // identifies the source without shouting over the row's actual content.
     let source: String
     var body: some View {
-        Text(source.uppercased())
-            .font(.system(size: 9, weight: .heavy))
-            .tracking(0.4)
-            .padding(.horizontal, 6).padding(.vertical, 2.5)
-            .background(Capsule().fill(Palette.source(source).opacity(0.16)))
-            .foregroundStyle(Palette.source(source))
+        HStack(spacing: 4) {
+            Circle().fill(Palette.source(source)).frame(width: 5, height: 5)
+            Text(source.uppercased())
+                .font(.system(size: 8.5, weight: .semibold))
+                .tracking(0.7)
+                .foregroundStyle(.secondary)
+        }
+        .padding(.leading, 6).padding(.trailing, 7).padding(.vertical, 2.5)
+        .background(Capsule().fill(Color.primary.opacity(0.055)))
     }
 }
 
@@ -88,6 +107,69 @@ private func chipLabel(_ text: String, _ icon: String) -> some View {
     .foregroundStyle(.primary)
 }
 
+/// "You're Ada Lovelace, right?" — one-click confirm of the deduced identity,
+/// with an inline correction field for when Sherlock got it wrong.
+private struct IdentityConfirmCard: View {
+    @ObservedObject var model: AppModel
+    @State private var correcting = false
+    @State private var correctedName = ""
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            HStack(spacing: 8) {
+                Image(systemName: "person.crop.circle.badge.questionmark")
+                    .font(.system(size: 14, weight: .semibold)).foregroundStyle(Palette.accent)
+                VStack(alignment: .leading, spacing: 1) {
+                    Text("I did some digging — you're \(model.ownerName), right?")
+                        .font(.system(size: 12, weight: .bold))
+                    if !model.ownerAliases.isEmpty {
+                        Text("also goes by " + model.ownerAliases.prefix(4).joined(separator: ", "))
+                            .font(.system(size: 10.5)).foregroundStyle(.secondary)
+                    }
+                }
+                Spacer()
+            }
+            if correcting {
+                HStack(spacing: 8) {
+                    TextField("Your name", text: $correctedName)
+                        .textFieldStyle(.roundedBorder).font(.system(size: 12))
+                        .onSubmit { model.confirmIdentity(name: correctedName) }
+                    Button("Save") { model.confirmIdentity(name: correctedName) }
+                        .buttonStyle(.plain).font(.system(size: 11, weight: .semibold))
+                        .padding(.horizontal, 12).padding(.vertical, 6)
+                        .background(Capsule().fill(Palette.accent)).foregroundStyle(.white)
+                        .disabled(correctedName.trimmingCharacters(in: .whitespaces).isEmpty)
+                }
+            } else {
+                HStack(spacing: 8) {
+                    Button {
+                        model.confirmIdentity(name: model.ownerName)
+                    } label: {
+                        Text("That's me").font(.system(size: 11, weight: .semibold))
+                            .padding(.horizontal, 12).padding(.vertical, 6)
+                            .background(Capsule().fill(Palette.accent)).foregroundStyle(.white)
+                    }
+                    .buttonStyle(.plain)
+                    Button {
+                        correctedName = model.ownerName
+                        correcting = true
+                    } label: {
+                        Text("Not quite…").font(.system(size: 11, weight: .semibold))
+                            .padding(.horizontal, 12).padding(.vertical, 6)
+                            .background(Capsule().fill(Color.primary.opacity(0.06)))
+                            .foregroundStyle(.secondary)
+                    }
+                    .buttonStyle(.plain)
+                    Spacer()
+                }
+            }
+        }
+        .padding(12)
+        .background(RoundedRectangle(cornerRadius: 12, style: .continuous).fill(Color.primary.opacity(0.05)))
+        .overlay(RoundedRectangle(cornerRadius: 12, style: .continuous).strokeBorder(Palette.accent.opacity(0.35)))
+    }
+}
+
 // MARK: - Root
 
 struct ContentView: View {
@@ -97,6 +179,7 @@ struct ContentView: View {
         VStack(spacing: 0) {
             headerBlock
             if let busy = model.busyMessage { busyBanner(busy) }
+            if model.trajectory == nil && model.detail == nil { identityOnboarding }
             Group {
                 if let session = model.trajectory {
                     TrajectoryView(model: model, session: session)
@@ -133,15 +216,42 @@ struct ContentView: View {
             Text("working…").font(.system(size: 10)).foregroundStyle(.secondary)
         }
         .padding(.horizontal, 14).padding(.vertical, 9)
-        .background(Color.accentColor.opacity(0.16))
-        .overlay(Rectangle().frame(height: 1).foregroundStyle(Color.accentColor.opacity(0.3)), alignment: .bottom)
+        .background(Palette.accent.opacity(0.14))
+        .overlay(Rectangle().frame(height: 1).foregroundStyle(Palette.accent.opacity(0.3)), alignment: .bottom)
+    }
+
+    // MARK: identity onboarding
+    /// First-run experience: mybot deduces who its owner is from the
+    /// trajectories (Sherlock session), then asks for a one-click nod here.
+    @ViewBuilder private var identityOnboarding: some View {
+        if model.identityInvestigating && model.ownerName.isEmpty {
+            HStack(spacing: 9) {
+                ProgressView().controlSize(.small)
+                VStack(alignment: .leading, spacing: 1) {
+                    Text("Getting to know you").font(.system(size: 12, weight: .bold))
+                    Text("mybot is deducing who its owner is from your session history…")
+                        .font(.system(size: 11)).foregroundStyle(.secondary)
+                }
+                Spacer()
+            }
+            .padding(12)
+            .background(RoundedRectangle(cornerRadius: 12, style: .continuous).fill(Color.primary.opacity(0.05)))
+            .overlay(RoundedRectangle(cornerRadius: 12, style: .continuous).strokeBorder(Palette.accent.opacity(0.35)))
+            .padding(.horizontal, 12).padding(.bottom, 8)
+        } else if !model.ownerName.isEmpty && !model.ownerConfirmed {
+            IdentityConfirmCard(model: model)
+                .padding(.horizontal, 12).padding(.bottom, 8)
+        }
     }
 
     private var background: some View {
+        // A quiet, constant brand wash. Status/mood belongs to the menu-bar
+        // icon and status dot — tinting the whole canvas by mood turned the
+        // popover brown whenever anything needed attention.
         ZStack {
             Color.primary.opacity(0.015)
             LinearGradient(
-                colors: [model.accentColor.opacity(0.16), .clear],
+                colors: [Palette.accent.opacity(0.09), .clear],
                 startPoint: .top, endPoint: .init(x: 0.5, y: 0.28)
             )
         }
@@ -155,6 +265,10 @@ struct ContentView: View {
             HStack(spacing: 11) {
                 BotAvatar(mood: model.mood)
                     .frame(width: 36, height: 36)
+                    .contextMenu {
+                        Button("Re-discover owner (Sherlock session)") { model.rediscoverIdentity() }
+                            .disabled(model.identityInvestigating)
+                    }
                 VStack(alignment: .leading, spacing: 1) {
                     Text("mybot memory").font(.system(size: 15, weight: .bold))
                     Text(statusLine).font(.system(size: 11)).foregroundStyle(.secondary).lineLimit(1)
@@ -171,9 +285,9 @@ struct ContentView: View {
             }
             HStack(spacing: 8) {
                 StatChip(icon: "folder.fill", value: "\(h.projectCount)", label: "projects",
-                         tint: Color(red: 0.47, green: 0.49, blue: 0.96))
+                         tint: Palette.accent)
                 StatChip(icon: "sparkles", value: "\(pct(h.coverage))%", label: "embedded",
-                         tint: h.coverage > 0.5 ? .green : .orange)
+                         tint: h.coverage > 0.5 ? Palette.good : Palette.warn)
                 StatChip(icon: "internaldrive.fill", value: formatBytes(h.indexBytes), label: "on disk",
                          tint: .secondary)
             }
@@ -182,10 +296,11 @@ struct ContentView: View {
     }
 
     private var statusLine: String {
-        if model.indexBusy { return "Index updating… showing last snapshot" }
+        let serving = model.ownerConfirmed && !model.ownerName.isEmpty ? "Serving \(model.ownerName) · " : ""
+        if model.indexBusy { return serving + "Index updating… showing last snapshot" }
         let h = model.health
-        if h.totalChunks > 0 && h.embeddedChunks == 0 { return "Semantic search off · lexical only" }
-        return "Index \(h.stale ? "stale" : "fresh") · updated \(h.indexedAgo)"
+        if h.totalChunks > 0 && h.embeddedChunks == 0 { return serving + "Semantic search off · lexical only" }
+        return serving + "Index \(h.stale ? "stale" : "fresh") · updated \(h.indexedAgo)"
     }
 
     private func pct(_ value: Double) -> Int { Int((value * 100).rounded()) }
@@ -242,7 +357,7 @@ struct ContentView: View {
                 }
                 .buttonStyle(.plain)
                 .font(.system(size: 11, weight: .semibold))
-                .foregroundStyle(Color.accentColor)
+                .foregroundStyle(Palette.accent)
             }
             .padding(.horizontal, 18).padding(.top, 8).padding(.bottom, 4)
 
@@ -270,7 +385,7 @@ struct ContentView: View {
     private var newProjectsBar: some View {
         VStack(alignment: .leading, spacing: 7) {
             HStack(spacing: 6) {
-                Image(systemName: "sparkles").font(.system(size: 12)).foregroundStyle(.orange)
+                Image(systemName: "sparkles").font(.system(size: 12)).foregroundStyle(Palette.accent)
                 Text("\(model.newProjects.count) new project\(model.newProjects.count == 1 ? "" : "s") to review")
                     .font(.system(size: 12, weight: .bold))
                 Spacer()
@@ -282,15 +397,15 @@ struct ContentView: View {
                     Text("· \(np.sessions) sess").font(.system(size: 10)).foregroundStyle(.secondary)
                     Spacer()
                     Button("Keep") { model.reviewProject(np, decision: "keep") }
-                        .buttonStyle(.plain).font(.system(size: 11, weight: .semibold)).foregroundStyle(.blue)
+                        .buttonStyle(.plain).font(.system(size: 11, weight: .semibold)).foregroundStyle(Palette.accent)
                     Button("Exclude") { model.reviewProject(np, decision: "exclude") }
-                        .buttonStyle(.plain).font(.system(size: 11, weight: .semibold)).foregroundStyle(.red)
+                        .buttonStyle(.plain).font(.system(size: 11, weight: .semibold)).foregroundStyle(.secondary)
                 }
             }
         }
         .padding(12)
-        .background(RoundedRectangle(cornerRadius: 12, style: .continuous).fill(Color.orange.opacity(0.12)))
-        .overlay(RoundedRectangle(cornerRadius: 12, style: .continuous).strokeBorder(Color.orange.opacity(0.28)))
+        .background(RoundedRectangle(cornerRadius: 12, style: .continuous).fill(Color.primary.opacity(0.05)))
+        .overlay(RoundedRectangle(cornerRadius: 12, style: .continuous).strokeBorder(Palette.accent.opacity(0.35)))
         .padding(.horizontal, 12).padding(.vertical, 6)
     }
 
@@ -305,7 +420,7 @@ struct ContentView: View {
             } label: {
                 Text("Include").font(.system(size: 11, weight: .semibold))
                     .padding(.horizontal, 12).padding(.vertical, 6)
-                    .background(Capsule().fill(Color.green.opacity(0.18))).foregroundStyle(.green)
+                    .background(Capsule().fill(Palette.accent)).foregroundStyle(.white)
             }
             .buttonStyle(.plain).disabled(model.selection.isEmpty).opacity(model.selection.isEmpty ? 0.5 : 1)
             Button {
@@ -313,13 +428,13 @@ struct ContentView: View {
             } label: {
                 Text("Exclude").font(.system(size: 11, weight: .semibold))
                     .padding(.horizontal, 12).padding(.vertical, 6)
-                    .background(Capsule().fill(Color.red.opacity(0.16))).foregroundStyle(.red)
+                    .background(Capsule().fill(Color.primary.opacity(0.07))).foregroundStyle(Palette.bad)
             }
             .buttonStyle(.plain).disabled(model.selection.isEmpty).opacity(model.selection.isEmpty ? 0.5 : 1)
         }
         .padding(12)
-        .background(RoundedRectangle(cornerRadius: 12, style: .continuous).fill(Color.accentColor.opacity(0.12)))
-        .overlay(RoundedRectangle(cornerRadius: 12, style: .continuous).strokeBorder(Color.accentColor.opacity(0.3)))
+        .background(RoundedRectangle(cornerRadius: 12, style: .continuous).fill(Palette.accent.opacity(0.10)))
+        .overlay(RoundedRectangle(cornerRadius: 12, style: .continuous).strokeBorder(Palette.accent.opacity(0.3)))
         .padding(.horizontal, 12).padding(.vertical, 6)
     }
 
@@ -433,7 +548,7 @@ struct ContentView: View {
 
             if let err = model.lastError {
                 Image(systemName: "exclamationmark.triangle.fill")
-                    .font(.system(size: 12)).foregroundStyle(.red).help(err)
+                    .font(.system(size: 12)).foregroundStyle(Palette.bad).help(err)
             }
             Button { NSApplication.shared.terminate(nil) } label: { chipLabel("Quit", "power") }
                 .buttonStyle(.plain)
@@ -457,7 +572,7 @@ struct ProjectRow: View {
         HStack(spacing: 8) {
             if selecting {
                 Image(systemName: isSelected ? "checkmark.circle.fill" : "circle")
-                    .font(.system(size: 16)).foregroundStyle(isSelected ? Color.accentColor : .secondary)
+                    .font(.system(size: 16)).foregroundStyle(isSelected ? Palette.accent : .secondary)
             }
             Button { selecting ? onToggleSelect?() : onOpen?() } label: {
                 HStack(spacing: 10) {
@@ -492,7 +607,7 @@ struct ProjectRow: View {
         )
         .overlay(alignment: .leading) {
             RoundedRectangle(cornerRadius: 2)
-                .fill(project.included ? Color.green.opacity(0.8) : Color.clear)
+                .fill(project.included ? Palette.accent.opacity(0.75) : Color.clear)
                 .frame(width: 3).padding(.vertical, 9)
         }
         .opacity(project.included ? 1 : 0.6)
@@ -506,12 +621,14 @@ struct ProjectRow: View {
     }
 
     private var toggleButton: some View {
+        // The action, not an alarm: removing is a quiet neutral pill; adding
+        // back is the accent — a whole list of red "Exclude" slabs shouted.
         Button { toggle(!project.included) } label: {
             Text(project.included ? "Exclude" : "Include")
                 .font(.system(size: 11, weight: .semibold))
                 .padding(.horizontal, 11).padding(.vertical, 6)
-                .background(Capsule().fill(project.included ? Color.red.opacity(0.14) : Color.green.opacity(0.18)))
-                .foregroundStyle(project.included ? Color.red : Color.green)
+                .background(Capsule().fill(project.included ? Color.primary.opacity(0.06) : Palette.accent.opacity(0.16)))
+                .foregroundStyle(project.included ? Color.secondary : Palette.accent)
         }
         .buttonStyle(.plain)
     }
@@ -551,7 +668,7 @@ struct SessionDetail: View {
                     Spacer()
                     if project.included {
                         Label("included", systemImage: "checkmark.circle.fill")
-                            .font(.system(size: 10, weight: .medium)).foregroundStyle(.green)
+                            .font(.system(size: 10, weight: .medium)).foregroundStyle(Palette.good)
                     } else {
                         Label("excluded", systemImage: "minus.circle.fill")
                             .font(.system(size: 10, weight: .medium)).foregroundStyle(.secondary)
@@ -614,14 +731,14 @@ struct SessionDetail: View {
                 Text(showAutomated ? "HIDE" : "SHOW")
                     .font(.system(size: 10, weight: .heavy)).tracking(0.5)
                     .padding(.horizontal, 9).padding(.vertical, 3.5)
-                    .background(Capsule().fill(Color.purple.opacity(0.18)))
+                    .background(Capsule().fill(Color.primary.opacity(0.08)))
             }
-            .foregroundStyle(showAutomated ? Color.purple : Color.purple.opacity(0.85))
+            .foregroundStyle(.secondary)
             .padding(.horizontal, 11).padding(.vertical, 7)
             .background(RoundedRectangle(cornerRadius: 9, style: .continuous)
-                .fill(Color.purple.opacity(showAutomated ? 0.10 : 0.07)))
+                .fill(Color.primary.opacity(showAutomated ? 0.055 : 0.035)))
             .overlay(RoundedRectangle(cornerRadius: 9, style: .continuous)
-                .strokeBorder(Color.purple.opacity(0.25)))
+                .strokeBorder(Color.primary.opacity(0.09)))
             .contentShape(Rectangle())
         }
         .buttonStyle(.plain)
@@ -646,8 +763,8 @@ struct SessionRow: View {
                             if session.isAutomated {
                                 Text("AUTO").font(.system(size: 8, weight: .heavy)).tracking(0.3)
                                     .padding(.horizontal, 4).padding(.vertical, 1.5)
-                                    .background(Capsule().fill(Color.orange.opacity(0.22)))
-                                    .foregroundStyle(.orange)
+                                    .background(Capsule().fill(Color.primary.opacity(0.08)))
+                                    .foregroundStyle(.secondary)
                             }
                         }
                         HStack(spacing: 8) {
@@ -669,8 +786,8 @@ struct SessionRow: View {
                 Text("Exclude")
                     .font(.system(size: 11, weight: .semibold))
                     .padding(.horizontal, 10).padding(.vertical, 5)
-                    .background(Capsule().fill(Color.red.opacity(0.14)))
-                    .foregroundStyle(.red)
+                    .background(Capsule().fill(Color.primary.opacity(0.06)))
+                    .foregroundStyle(.secondary)
             }
             .buttonStyle(.plain)
             Image(systemName: "chevron.right")
@@ -747,11 +864,11 @@ struct EventRow: View {
 
     var body: some View {
         switch event.kind {
-        case "user": bubble(role: "You", tint: Color.accentColor, align: .trailing)
+        case "user": bubble(role: "You", tint: Palette.accent, align: .trailing)
         case "assistant": bubble(role: "Assistant", tint: .secondary, align: .leading)
-        case "thinking": foldable(icon: "brain", title: "Thinking", tint: .purple, mono: false, italic: true)
+        case "thinking": foldable(icon: "brain", title: "Thinking", tint: .secondary, mono: false, italic: true)
         case "tool_use": foldable(icon: "wrench.and.screwdriver.fill",
-                                  title: event.tool.isEmpty ? "Tool call" : event.tool, tint: .orange, mono: true)
+                                  title: event.tool.isEmpty ? "Tool call" : event.tool, tint: Palette.accent, mono: true)
         case "tool_result": foldable(icon: "arrow.turn.down.right",
                                      title: "Result · \(event.text.count) chars", tint: .secondary, mono: true)
         default: EmptyView()
@@ -768,7 +885,7 @@ struct EventRow: View {
                 .frame(maxWidth: .infinity, alignment: .leading)
                 .padding(9)
                 .background(RoundedRectangle(cornerRadius: 10, style: .continuous)
-                    .fill(align == .trailing ? Color.accentColor.opacity(0.12) : Color.primary.opacity(0.05)))
+                    .fill(align == .trailing ? Palette.accent.opacity(0.12) : Color.primary.opacity(0.05)))
         }
         .frame(maxWidth: .infinity, alignment: align == .trailing ? .trailing : .leading)
     }
@@ -920,21 +1037,24 @@ struct ChatBubble: View {
     var body: some View {
         switch msg.role {
         case "user":
+            // The one saturated element in the chat: the bunny icon's own
+            // gradient, so "you talking to mybot" carries the brand.
             Text(msg.text)
                 .font(.system(size: 12)).textSelection(.enabled)
-                .padding(9)
-                .background(RoundedRectangle(cornerRadius: 10, style: .continuous)
-                    .fill(Color.accentColor.opacity(0.14)))
+                .foregroundStyle(.white)
+                .padding(.horizontal, 11).padding(.vertical, 8)
+                .background(RoundedRectangle(cornerRadius: 12, style: .continuous)
+                    .fill(Palette.brandGradient))
                 .frame(maxWidth: .infinity, alignment: .trailing)
                 .id(msg.id)
         case "error":
             HStack(spacing: 6) {
                 Image(systemName: "exclamationmark.triangle.fill")
-                    .font(.system(size: 10)).foregroundStyle(.orange)
+                    .font(.system(size: 10)).foregroundStyle(Palette.warn)
                 Text(msg.text).font(.system(size: 11.5)).foregroundStyle(.secondary)
             }
             .padding(9)
-            .background(RoundedRectangle(cornerRadius: 10, style: .continuous).fill(Color.orange.opacity(0.08)))
+            .background(RoundedRectangle(cornerRadius: 10, style: .continuous).fill(Color.primary.opacity(0.045)))
             .frame(maxWidth: .infinity, alignment: .leading)
             .id(msg.id)
         default:

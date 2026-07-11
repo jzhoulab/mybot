@@ -200,4 +200,56 @@ struct ChatClient {
         ])
         URLSession.shared.dataTask(with: request).resume()
     }
+
+    // MARK: owner identity (onboarding)
+
+    struct IdentityState {
+        var name: String
+        var aliases: [String]
+        var confirmed: Bool
+        var investigating: Bool
+    }
+
+    private func identityRequest(_ payload: [String: Any],
+                                 completion: @escaping (IdentityState?) -> Void) {
+        var request = URLRequest(url: baseURL.appendingPathComponent("owner/identity"))
+        request.httpMethod = "POST"
+        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        request.timeoutInterval = 15
+        request.httpBody = try? JSONSerialization.data(withJSONObject: payload)
+        URLSession.shared.dataTask(with: request) { data, _, _ in
+            guard let data,
+                  let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+                  (obj["ok"] as? Bool) == true else {
+                completion(nil)
+                return
+            }
+            let identity = (obj["identity"] as? [String: Any]) ?? [:]
+            completion(IdentityState(
+                name: (identity["display_name"] as? String) ?? "",
+                aliases: (identity["aliases"] as? [String]) ?? [],
+                confirmed: (identity["confirmed"] as? Bool) ?? false,
+                investigating: (obj["investigating"] as? Bool) ?? false
+            ))
+        }.resume()
+    }
+
+    /// Current owner identity + whether a Sherlock investigation is running.
+    func fetchIdentity(completion: @escaping (IdentityState?) -> Void) {
+        identityRequest(["action": "get"], completion: completion)
+    }
+
+    /// Owner confirms (or corrects) their name.
+    func confirmIdentity(name: String, completion: @escaping (IdentityState?) -> Void) {
+        identityRequest([
+            "action": "set",
+            "actor_id": config.ownerActorID,
+            "display_name": name,
+        ], completion: completion)
+    }
+
+    /// Kick off a background Sherlock session (deduce the owner from trajectories).
+    func rediscoverIdentity(completion: @escaping (IdentityState?) -> Void) {
+        identityRequest(["action": "investigate", "background": true, "save": true], completion: completion)
+    }
 }
