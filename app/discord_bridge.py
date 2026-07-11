@@ -103,6 +103,12 @@ class BridgeConfig:
     max_output_tokens: int | None
     command_guild_id: int | None
     message_coalesce_seconds: float
+    # One shared session per guild channel (multi-person context) instead of
+    # one per (channel, user). DMs are always per-user.
+    group_sessions: bool
+    # Record non-addressed messages from explicitly listed channels into the
+    # channel session so the bot has context when it IS addressed.
+    observe_channels: bool
 
 
 @dataclass
@@ -115,6 +121,9 @@ class PendingChatRequest:
     target_user_id: str | None = None
     discord_message: discord.Message | None = None
     interaction: discord.Interaction | None = None
+    display_name: str = ""
+    channel_kind: str = "dm"
+    channel_label: str = ""
 
 
 @dataclass
@@ -166,6 +175,9 @@ class ChatbotApi:
         memory_scope: str = "private",
         target_user_id: str | None = None,
         return_sources: bool = True,
+        display_name: str = "",
+        channel_kind: str = "",
+        channel_label: str = "",
     ) -> dict[str, Any]:
         payload: dict[str, Any] = {
             "actor_id": actor_id,
@@ -176,11 +188,37 @@ class ChatbotApi:
             "use_trajectory_memory": self.config.use_trajectory_memory,
             "return_sources": return_sources,
         }
+        if display_name:
+            payload["actor_display_name"] = display_name
+        if channel_kind:
+            payload["channel_kind"] = channel_kind
+        if channel_label:
+            payload["channel_label"] = channel_label
         if target_user_id:
             payload["target_user_id"] = target_user_id
         if self.config.max_output_tokens is not None:
             payload["max_output_tokens"] = self.config.max_output_tokens
         return await asyncio.to_thread(self._post_json, "/chat", payload)
+
+    async def observe(
+        self,
+        *,
+        actor_id: str,
+        user_key: str,
+        session_key: str,
+        message: str,
+        display_name: str = "",
+    ) -> dict[str, Any]:
+        payload: dict[str, Any] = {
+            "actor_id": actor_id,
+            "user": user_key,
+            "session_key": session_key,
+            "message": message,
+        }
+        if display_name:
+            payload["actor_display_name"] = display_name
+            payload["author_label"] = display_name
+        return await asyncio.to_thread(self._post_json, "/sessions/observe", payload)
 
     async def reset_session(self, *, user_key: str, session_key: str) -> dict[str, Any]:
         payload = {"user": user_key, "session_key": session_key}
@@ -202,6 +240,13 @@ class ChatbotApi:
         if tags:
             payload["tags"] = tags
         return await asyncio.to_thread(self._post_json, "/memory/promote", payload)
+
+    async def set_owner_identity(self, *, actor_id: str, display_name: str) -> dict[str, Any]:
+        return await asyncio.to_thread(
+            self._post_json,
+            "/owner/identity",
+            {"action": "set", "actor_id": actor_id, "display_name": display_name},
+        )
 
     async def session_history(
         self,
@@ -268,6 +313,7 @@ class DiscordBridgeClient(discord.Client):
                 return
 
             await interaction.response.defer(thinking=True)
+            channel_kind, channel_label = self._channel_kind_label(interaction.channel)
             await self._enqueue_chat_request(
                 PendingChatRequest(
                     actor_id=self._actor_id(interaction.user.id),
@@ -279,6 +325,9 @@ class DiscordBridgeClient(discord.Client):
                     message_text=text,
                     memory_scope="private",
                     interaction=interaction,
+                    display_name=interaction.user.display_name,
+                    channel_kind=channel_kind,
+                    channel_label=channel_label,
                 )
             )
 
@@ -367,8 +416,10 @@ class DiscordBridgeClient(discord.Client):
         raw_text = message.content or ""
         if message.guild is not None:
             if not self._should_reply_in_guild_message(message):
+                await self._maybe_observe_message(message, raw_text)
                 return
             raw_text = self._strip_bot_mentions(raw_text)
+        raw_text = self._resolve_mentions(message, raw_text)
 
         text = normalize_text(raw_text)
         if not text:
@@ -388,6 +439,36 @@ class DiscordBridgeClient(discord.Client):
             memory_scope="private",
         )
 
+    def _observation_eligible(self, channel: discord.abc.MessageableChannel) -> bool:
+        """Observe only channels someone explicitly listed — never hoover a
+        whole server just because the allowlist is empty (= all allowed)."""
+        if not self.config.observe_channels or not self.config.group_sessions:
+            return False
+        channel_id = getattr(channel, "id", None)
+        parent_id = getattr(channel, "parent_id", None)
+        explicit = self.config.allowed_channel_ids | self.config.auto_reply_channel_ids
+        return channel_id in explicit or parent_id in explicit
+
+    async def _maybe_observe_message(self, message: discord.Message, raw_text: str) -> None:
+        if not self._observation_eligible(message.channel):
+            return
+        text = normalize_text(self._resolve_mentions(message, raw_text))
+        if not text:
+            return
+        try:
+            await self.api.observe(
+                actor_id=self._actor_id(message.author.id),
+                user_key=self._user_key(message.author.id),
+                session_key=self._session_key_for_channel(
+                    user_id=message.author.id,
+                    channel=message.channel,
+                ),
+                message=text,
+                display_name=message.author.display_name,
+            )
+        except Exception:
+            log.exception("failed to observe channel message author=%s", message.author.id)
+
     async def _handle_command_message(self, message: discord.Message, text: str) -> bool:
         if text.lower() in {"!new", "!reset"}:
             await self._handle_message_reset(message)
@@ -395,6 +476,28 @@ class DiscordBridgeClient(discord.Client):
 
         if text.lower() == "!sources":
             await self._handle_sources(message)
+            return True
+
+        iam_name = command_argument(text, "!iam")
+        if iam_name is not None:
+            if not iam_name:
+                await self._send_channel_text(
+                    message.channel, "Usage: `!iam <your name>`", reference=message,
+                )
+                return True
+            try:
+                result = await self.api.set_owner_identity(
+                    actor_id=self._actor_id(message.author.id),
+                    display_name=iam_name,
+                )
+                name = (result.get("identity") or {}).get("display_name") or iam_name
+                await self._send_channel_text(
+                    message.channel, f"Got it — I'll call you **{name}**.", reference=message,
+                )
+            except RuntimeError as exc:
+                await self._send_channel_text(
+                    message.channel, f"Couldn't set that: {exc}", reference=message,
+                )
             return True
 
         remember_shared = command_argument(text, "!remember-shared")
@@ -455,6 +558,7 @@ class DiscordBridgeClient(discord.Client):
             user_id=message.author.id,
             channel=message.channel,
         )
+        channel_kind, channel_label = self._channel_kind_label(message.channel)
         await self._enqueue_chat_request(
             PendingChatRequest(
                 actor_id=self._actor_id(message.author.id),
@@ -464,6 +568,9 @@ class DiscordBridgeClient(discord.Client):
                 memory_scope=memory_scope,
                 target_user_id=target_user_id,
                 discord_message=message,
+                display_name=message.author.display_name,
+                channel_kind=channel_kind,
+                channel_label=channel_label,
             )
         )
 
@@ -497,9 +604,12 @@ class DiscordBridgeClient(discord.Client):
         )
 
     def _chat_buffer_key(self, request: PendingChatRequest) -> str:
+        # actor_id keeps coalescing per-author: in a shared channel session two
+        # people's near-simultaneous messages must not fold into one request.
         return "|".join(
             [
                 request.session_key,
+                request.actor_id,
                 request.memory_scope,
                 request.target_user_id or "",
             ]
@@ -589,6 +699,9 @@ class DiscordBridgeClient(discord.Client):
             memory_scope=target.memory_scope,
             target_user_id=target.target_user_id,
             return_sources=False,
+            display_name=target.display_name,
+            channel_kind=target.channel_kind,
+            channel_label=target.channel_label,
         )
         if len(requests) > 1:
             await self._acknowledge_folded_interactions(
@@ -783,9 +896,26 @@ class DiscordBridgeClient(discord.Client):
         if guild is None:
             return f"discord-dm-user-{user_id}"
         channel_id = getattr(channel, "id", 0)
-        if isinstance(channel, discord.Thread):
-            return f"discord-guild-{guild.id}-thread-{channel_id}-user-{user_id}"
-        return f"discord-guild-{guild.id}-channel-{channel_id}-user-{user_id}"
+        kind = "thread" if isinstance(channel, discord.Thread) else "channel"
+        if self.config.group_sessions:
+            # One shared conversation per channel: everyone's messages and the
+            # bot's replies form a single attributed transcript.
+            return f"discord-guild-{guild.id}-{kind}-{channel_id}"
+        return f"discord-guild-{guild.id}-{kind}-{channel_id}-user-{user_id}"
+
+    def _channel_kind_label(self, channel: discord.abc.MessageableChannel | None) -> tuple[str, str]:
+        guild = getattr(channel, "guild", None)
+        if channel is None or guild is None:
+            return "dm", ""
+        name = getattr(channel, "name", "") or str(getattr(channel, "id", ""))
+        return "group", f"#{name} ({guild.name})"
+
+    def _resolve_mentions(self, message: discord.Message, text: str) -> str:
+        """Replace raw <@id> mention tokens with @DisplayName so the model and
+        the stored transcript read like human conversation."""
+        for member in message.mentions:
+            text = re.sub(rf"<@!?{member.id}>", f"@{member.display_name}", text)
+        return text
 
     async def _handle_message_reset(self, message: discord.Message) -> None:
         try:
@@ -896,6 +1026,8 @@ def load_config(args: argparse.Namespace) -> BridgeConfig:
         max_output_tokens=max_output_tokens,
         command_guild_id=command_guild_id,
         message_coalesce_seconds=max(0.0, message_coalesce_seconds),
+        group_sessions=env_bool("DISCORD_GROUP_SESSIONS", True),
+        observe_channels=env_bool("DISCORD_OBSERVE_CHANNELS", True),
     )
 
 

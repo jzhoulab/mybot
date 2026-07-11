@@ -13,6 +13,34 @@ from datetime import datetime, timezone
 from typing import Any
 
 
+def post_via_proxy(proxy_url: str, request: urllib.request.Request) -> str:
+    """POST through an HTTP proxy unconditionally (absolute-URI request line +
+    Proxy-Authorization), sidestepping urllib's NO_PROXY bypass logic."""
+    import base64
+    import http.client
+    import urllib.parse
+
+    parsed = urllib.parse.urlparse(proxy_url)
+    if not parsed.hostname or not parsed.port:
+        raise SystemExit(f"Unusable proxy URL in HTTP_PROXY: {proxy_url!r}")
+    headers = {"Content-Type": "application/json"}
+    if parsed.username:
+        credentials = f"{parsed.username}:{parsed.password or ''}"
+        headers["Proxy-Authorization"] = "Basic " + base64.b64encode(credentials.encode()).decode()
+    conn = http.client.HTTPConnection(parsed.hostname, parsed.port, timeout=180)
+    try:
+        conn.request("POST", request.full_url, body=request.data, headers=headers)
+        response = conn.getresponse()
+        raw = response.read().decode("utf-8")
+        if response.status >= 400:
+            raise SystemExit(f"HTTP {response.status}: {raw}")
+        return raw
+    except OSError as exc:
+        raise SystemExit(f"Connection failed (direct and via sandbox proxy): {exc}") from exc
+    finally:
+        conn.close()
+
+
 def post_json(base_url: str, path: str, payload: dict[str, Any]) -> dict[str, Any]:
     request = urllib.request.Request(
         url=f"{base_url.rstrip('/')}{path}",
@@ -27,7 +55,17 @@ def post_json(base_url: str, path: str, payload: dict[str, Any]) -> dict[str, An
         body = exc.read().decode("utf-8", errors="replace")
         raise SystemExit(f"HTTP {exc.code}: {body}") from exc
     except urllib.error.URLError as exc:
-        raise SystemExit(f"Connection failed: {exc}") from exc
+        # Sandboxed shells (Claude Code's seatbelt) block direct sockets —
+        # even loopback — and set NO_PROXY for localhost, so every stdlib
+        # opener (ProxyHandler included: it honors proxy_bypass) skips the one
+        # route that works: the sandbox proxy. On a permission-denied connect,
+        # retry by speaking to the proxy directly via http.client.
+        proxy = os.environ.get("HTTP_PROXY") or os.environ.get("http_proxy") or ""
+        reason = getattr(exc, "reason", None)
+        denied = (isinstance(reason, OSError) and reason.errno == 1) or "not permitted" in str(exc).lower()
+        if not (proxy and denied):
+            raise SystemExit(f"Connection failed: {exc}") from exc
+        raw = post_via_proxy(proxy, request)
     try:
         parsed = json.loads(raw)
     except json.JSONDecodeError as exc:
@@ -70,6 +108,8 @@ def result_count(result: dict[str, Any]) -> int:
     matches = result.get("matches")
     if isinstance(matches, list):
         return len(matches)
+    if isinstance(result.get("rows"), list):
+        return len(result["rows"])
     if isinstance(result.get("trajectory"), dict):
         return 1
     return 0
@@ -148,16 +188,20 @@ def spent_seconds() -> float:
     return total
 
 
+def total_budget_seconds() -> float:
+    try:
+        return float(os.environ.get("MYBOT_TOOL_TOTAL_BUDGET_SECONDS", "90"))
+    except ValueError:
+        return 90.0
+
+
 def enforce_total_budget(command: str) -> None:
     """Stop runaway search loops: after the per-request budget is spent, tell
     the model to answer with the evidence it already has instead of searching
     again. Reads stay allowed — using found evidence is the goal."""
-    if command not in ("memory-search", "trajectory-search"):
+    if command not in ("memory-search", "trajectory-search", "sql"):
         return
-    try:
-        budget = float(os.environ.get("MYBOT_TOOL_TOTAL_BUDGET_SECONDS", "90"))
-    except ValueError:
-        budget = 90.0
+    budget = total_budget_seconds()
     spent = spent_seconds()
     if spent <= budget:
         return
@@ -186,6 +230,12 @@ def call_and_print(args: argparse.Namespace, path: str, payload: dict[str, Any])
         started_at=started_at,
     )
     write_budget_log(result["_budget"], payload)
+    # The log now includes this call, so spent_seconds() is the true running
+    # total — surface what's left so the model can pace its remaining searches.
+    if os.environ.get("MYBOT_TOOL_BUDGET_LOG", "").strip():
+        result["_budget"]["budget_seconds_remaining"] = round(
+            max(0.0, total_budget_seconds() - spent_seconds()), 1
+        )
     print_json(result)
 
 
@@ -209,11 +259,28 @@ def main() -> int:
     trajectory_search.add_argument("-q", "--query", required=True)
     trajectory_search.add_argument("--limit", type=int, default=5)
     trajectory_search.add_argument("--trace", action="store_true")
+    trajectory_search.add_argument("--after", default="", help="Only sessions updated on/after this ISO date (YYYY-MM-DD)")
+    trajectory_search.add_argument("--before", default="", help="Only sessions updated on/before this ISO date (YYYY-MM-DD)")
+    trajectory_search.add_argument("--source", default="", help="Restrict to one source: codex or claude")
 
     trajectory_read = subparsers.add_parser("trajectory-read", help="Read focused evidence from a trajectory")
     trajectory_read.add_argument("--source-ref", required=True)
     trajectory_read.add_argument("-q", "--query", default="")
     trajectory_read.add_argument("--max-chars", type=int, default=12000)
+    trajectory_read.add_argument(
+        "--around-event", type=int, default=None,
+        help="Zoom to this exact event index (search hits report event_start/event_end; reads report total_events)",
+    )
+    trajectory_read.add_argument("--events-before", type=int, default=3, help="Events of context before --around-event")
+    trajectory_read.add_argument("--events-after", type=int, default=6, help="Events of context after --around-event")
+    trajectory_read.add_argument(
+        "--chunk-id", type=int, default=None,
+        help="Read one indexed chunk by id (metadata.chunk_id in search hits), with related-chunk context",
+    )
+
+    sql_parser = subparsers.add_parser("sql", help="Read-only SQL over the trajectory index (SELECT only)")
+    sql_parser.add_argument("-q", "--query", required=True)
+    sql_parser.add_argument("--limit", type=int, default=50, help="Max rows returned (cap 200)")
 
     subparsers.add_parser("trajectory-stats", help="Inspect trajectory index stats")
 
@@ -226,13 +293,30 @@ def main() -> int:
         return 0
 
     if args.command == "trajectory-search":
-        payload.update({"query": args.query, "limit": args.limit, "return_trace": bool(args.trace)})
+        payload.update({"query": args.query, "limit": args.limit, "return_trace": bool(args.trace), "compact": True})
+        if args.after:
+            payload["after"] = args.after
+        if args.before:
+            payload["before"] = args.before
+        if args.source:
+            payload["source"] = args.source
         call_and_print(args, "/trajectory/search", payload)
         return 0
 
     if args.command == "trajectory-read":
         payload.update({"source_ref": args.source_ref, "query": args.query, "max_chars": args.max_chars})
+        if args.around_event is not None:
+            payload["event_index"] = args.around_event
+            payload["events_before"] = args.events_before
+            payload["events_after"] = args.events_after
+        if args.chunk_id is not None:
+            payload["chunk_id"] = args.chunk_id
         call_and_print(args, "/trajectory/read", payload)
+        return 0
+
+    if args.command == "sql":
+        payload.update({"query": args.query, "limit": args.limit})
+        call_and_print(args, "/trajectory/sql", payload)
         return 0
 
     if args.command == "trajectory-stats":

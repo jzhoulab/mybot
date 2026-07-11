@@ -10,6 +10,7 @@ import os
 import re
 import shlex
 import shutil
+import sqlite3
 import subprocess
 import sys
 import threading
@@ -216,6 +217,77 @@ def merge_trajectory_source(
         by_ref[source_ref] = item
 
 
+def date_filter_keys(after: str, before: str) -> tuple[str, str]:
+    """ISO-prefix comparison keys for hard time filters. A date-only `before`
+    is made inclusive of that whole day ('~' sorts after every ISO char)."""
+    after_key = (after or "").strip()
+    before_key = (before or "").strip()
+    if before_key and len(before_key) <= 10:
+        before_key += "~"
+    return after_key, before_key
+
+
+def trajectory_source_in_window(
+    source: dict[str, Any],
+    *,
+    after_key: str = "",
+    before_key: str = "",
+    source_filter: str = "",
+) -> bool:
+    if source_filter and str(source.get("source_name") or "").lower() != source_filter:
+        return False
+    if not (after_key or before_key):
+        return True
+    updated = str(source.get("updated_at") or "")
+    if not updated:
+        return False
+    if after_key and updated < after_key:
+        return False
+    if before_key and updated > before_key:
+        return False
+    return True
+
+
+# What an agent needs from a search hit: identity, freshness, where the match
+# lives (chunk/event coordinates for a follow-up windowed read), and preview
+# text. Internal bookkeeping (file paths, char offsets, channel flags, duplicate
+# summaries) only burns the agent's context.
+COMPACT_MATCH_METADATA_KEYS = (
+    "session_id",
+    "raw_session_id",
+    "chunk_id",
+    "chunk_index",
+    "event_start",
+    "event_end",
+    "origin",
+    "origin_detail",
+)
+
+
+def compact_trajectory_match(match: dict[str, Any]) -> dict[str, Any]:
+    metadata = match.get("metadata") if isinstance(match.get("metadata"), dict) else {}
+    compact: dict[str, Any] = {
+        "source_ref": match.get("source_ref"),
+        "source_name": match.get("source_name"),
+        "title": match.get("title"),
+        "updated_at": match.get("updated_at"),
+        "cwd": match.get("cwd"),
+        "score": match.get("match_score") or match.get("score"),
+        "match_kind": match.get("match_kind"),
+        "channels": match.get("_retrieval_channels") or [],
+        "text_preview": match.get("text_preview") or match.get("summary_short") or "",
+        "metadata": {
+            key: metadata[key]
+            for key in COMPACT_MATCH_METADATA_KEYS
+            if metadata.get(key) not in (None, "")
+        },
+    }
+    snippets = [normalize_text(str(snippet), 700) for snippet in (match.get("snippets") or [])[:3]]
+    if snippets:
+        compact["snippets"] = snippets
+    return {key: value for key, value in compact.items() if value not in (None, "", [], {})}
+
+
 def sort_trajectory_sources(sources: list[dict[str, Any]], *, query: str, limit: int | None = None) -> list[dict[str, Any]]:
     ranked = sorted(
         sources,
@@ -376,6 +448,10 @@ class AppConfig:
     mybot_tool_python: str
     embedding_model_name: str
     imported_owner_actor_id: str
+    owner_display_name: str
+    team_name: str
+    guest_owner_access: bool
+    claude_bash_sandbox: bool
     session_tail_pairs: int
     compaction_trigger_message_count: int
     compaction_trigger_char_count: int
@@ -572,17 +648,19 @@ class ProviderClient:
         if not re.fullmatch(r"[A-Za-z0-9_]+", profile):
             raise RuntimeError("CODEX_PERMISSION_PROFILE must contain only letters, numbers, and underscores")
 
-        tool_path = Path(self.config.mybot_tool_path).expanduser().resolve()
-        project_root = Path(__file__).resolve().parent.parent
+        # Allow-list posture (matches the claude sandbox): deny ALL of home,
+        # then re-allow only the runtime workspace (where mybot_tool lives).
+        # The earlier deny-list named a few sensitive paths but left the rest
+        # of home readable — the agent could read ~/.ssh, ~/.aws, and other
+        # repos' secrets. Most-specific-path wins, so the narrow runtime read
+        # beats the broad ~/ deny; the workspace_roots grant still supplies
+        # write (verified: budget log under runtime/.mybot works). Everything
+        # sensitive — the repo, .env, config/, state/, ~/.codex, ~/.claude —
+        # sits under ~/ and is covered by the single deny.
+        runtime_dir = Path(self.config.codex_cwd).expanduser().resolve()
         filesystem = {
-            str(project_root): "deny",
-            str(tool_path): "read",
-            str(project_root / ".env"): "deny",
-            str(project_root / ".discord.env"): "deny",
-            str(project_root / "config"): "deny",
-            str(project_root / "state"): "deny",
-            "~/.codex": "deny",
-            "~/.claude": "deny",
+            "~/": "deny",
+            str(runtime_dir): "read",
         }
         workspace_roots = self._codex_permission_workspace_roots()
         args = [
@@ -698,6 +776,36 @@ class ProviderClient:
             thinking = str(override.get("thinking") or "")
         return {"backend": backend, "model": model, "thinking": thinking}
 
+    def _claude_sandbox_settings_json(self) -> str:
+        """Per-invocation sandbox policy for the answer agent's Bash. Allow-list
+        posture: all of home is deny-read except the runtime workspace (the
+        mybot tool lives there and writes its budget log there); network is
+        localhost-only so the tool can reach this server and nothing else."""
+        runtime_dir = str(Path(self.config.codex_cwd).expanduser().resolve())
+        return json.dumps(
+            {
+                "sandbox": {
+                    "enabled": True,
+                    "failIfUnavailable": True,
+                    "autoAllowBashIfSandboxed": True,
+                    "allowUnsandboxedCommands": False,
+                    # Writes: the sandbox default (working directory + session
+                    # tmp only) is exactly right because the subprocess cwd IS
+                    # the runtime workspace. An explicit denyWrite("~/") is NOT
+                    # used — it overrides allowWrite and silently broke the
+                    # tool's budget log (and with it the anti-spiral guard).
+                    "filesystem": {
+                        "denyRead": ["~/"],
+                        "allowRead": [runtime_dir],
+                        "allowWrite": [runtime_dir],
+                    },
+                    "network": {
+                        "allowedDomains": ["localhost", "127.0.0.1"],
+                    },
+                },
+            }
+        )
+
     def _run_claude(
         self,
         *,
@@ -725,19 +833,23 @@ class ProviderClient:
             cmd.extend(["--effort", effort])
         if system_prompt:
             cmd.extend(["--append-system-prompt", system_prompt])
-        # allowedTools is a strict whitelist in headless mode: anything not listed
-        # is auto-denied. The planner (ephemeral) gets no tools. The answer gets
-        # exactly two Bash prefixes, both read-only and policy-scoped:
-        #  1. the mybot tool (agentic memory/trajectory search + read)
-        #  2. sqlite3 -readonly over the INDEX db — free-form exact/enumeration SQL
-        #     over the cleaned, included-only chunk text (writes are blocked by the
-        #     -readonly flag; the db path is pinned so it can't point elsewhere).
-        # No file/edit/web access, and NOT the raw ~/.claude jsonl (which still
-        # holds excluded sessions + secrets).
+        # The answer agent's shell: with CLAUDE_BASH_SANDBOX (default, needs
+        # claude >= 2.1.154) Bash runs inside the OS sandbox (macOS Seatbelt) —
+        # broad text tools and pipes are allowed because the FILESYSTEM is the
+        # boundary: home is deny-read except the runtime workspace, so grep/sed
+        # /awk magic works on tool output but ~/.env, ~/.claude/projects (raw
+        # jsonl with excluded sessions), and the repo's config/state stay
+        # unreadable; network is localhost-only. Sandboxed commands auto-run
+        # (autoAllowBashIfSandboxed), and failIfUnavailable means we fail loud
+        # rather than silently running Bash unsandboxed. The legacy fallback is
+        # the strict single-prefix whitelist. Planner (ephemeral) gets no tools.
         if not ephemeral:
-            tool_prefix = f"{self.config.mybot_tool_python} {self.config.mybot_tool_path}"
-            sqlite_prefix = f"/usr/bin/sqlite3 -readonly {self.config.trajectory_index_db_path}"
-            cmd.extend(["--allowedTools", f"Bash({tool_prefix}:*)", f"Bash({sqlite_prefix}:*)"])
+            if self.config.claude_bash_sandbox:
+                cmd.extend(["--settings", self._claude_sandbox_settings_json()])
+                cmd.extend(["--allowedTools", "Bash"])
+            else:
+                tool_prefix = f"{self.config.mybot_tool_python} {self.config.mybot_tool_path}"
+                cmd.extend(["--allowedTools", f"Bash({tool_prefix}:*)"])
         # NOTE: prompt goes via stdin, NOT as a positional arg — the variadic
         # --allowedTools/--append flags would otherwise swallow it.
 
@@ -745,10 +857,15 @@ class ProviderClient:
         if tool_env:
             env.update(tool_env)
 
-        if streaming:
-            return self._run_claude_stream(cmd, message, env, on_event)
+        # Run from the runtime workspace, not the repo: the sandbox implicitly
+        # trusts the working directory, and the repo (code, .env, state) must
+        # stay outside the boundary.
+        claude_cwd = str(Path(self.config.codex_cwd).expanduser())
 
-        proc = subprocess.run(cmd, input=message, capture_output=True, text=True, env=env)
+        if streaming:
+            return self._run_claude_stream(cmd, message, env, on_event, cwd=claude_cwd)
+
+        proc = subprocess.run(cmd, input=message, capture_output=True, text=True, env=env, cwd=claude_cwd)
         if proc.returncode != 0:
             stderr = normalize_text(proc.stderr, 1500)
             stdout = normalize_text(proc.stdout, 1500)
@@ -772,13 +889,13 @@ class ProviderClient:
             "usage": (raw or {}).get("usage") if isinstance(raw, dict) else None,
         }
 
-    def _run_claude_stream(self, cmd, message, env, on_event) -> dict[str, Any]:
+    def _run_claude_stream(self, cmd, message, env, on_event, cwd: str | None = None) -> dict[str, Any]:
         """Popen the claude CLI in stream-json mode and forward events via
         on_event({kind, ...}) as they arrive. Accumulates the final answer text.
         on_event kinds: "tool" (label), "delta" (text), "usage" (dict)."""
         proc = subprocess.Popen(
             cmd, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-            text=True, env=env, bufsize=1,
+            text=True, env=env, bufsize=1, cwd=cwd,
         )
         assert proc.stdin and proc.stdout
         try:
@@ -1051,6 +1168,77 @@ class ProviderClient:
         return normalize_text(result["text"], 2500)
 
 
+class PersonRegistry:
+    """Durable per-person record of who has talked to this bot: display name,
+    contact cadence, and recent topics. This is what lets the bot greet a lab
+    member as a known person months later, on Discord today and Slack later —
+    keyed by transport-agnostic actor_id."""
+
+    MAX_RECENT_TOPICS = 10
+
+    def __init__(self, state_dir: str) -> None:
+        self.path = Path(state_dir) / "people.json"
+        self._lock = threading.Lock()
+
+    def _load(self) -> dict[str, dict[str, Any]]:
+        try:
+            data = json.loads(self.path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            return {}
+        return data if isinstance(data, dict) else {}
+
+    def get(self, actor_id: str) -> dict[str, Any] | None:
+        record = self._load().get(normalize_text(actor_id, 128))
+        return dict(record) if isinstance(record, dict) else None
+
+    def note_interaction(
+        self,
+        *,
+        actor_id: str,
+        display_name: str = "",
+        channel_label: str = "",
+        topic: str = "",
+        observed: bool = False,
+    ) -> None:
+        """Best-effort update; never let bookkeeping break a chat."""
+        actor_id = normalize_text(actor_id, 128)
+        if not actor_id:
+            return
+        now = utc_now()
+        try:
+            with self._lock:
+                data = self._load()
+                record = data.get(actor_id)
+                if not isinstance(record, dict):
+                    record = {"first_seen": now, "chat_count": 0, "observed_count": 0}
+                if display_name:
+                    record["display_name"] = normalize_text(display_name, 80)
+                record["last_seen"] = now
+                if observed:
+                    record["observed_count"] = int(record.get("observed_count") or 0) + 1
+                else:
+                    record["chat_count"] = int(record.get("chat_count") or 0) + 1
+                    if topic:
+                        topics = record.get("recent_topics")
+                        topics = topics if isinstance(topics, list) else []
+                        topics.append(
+                            {
+                                "at": now,
+                                "channel": normalize_text(channel_label, 80),
+                                "topic": normalize_text(topic, 140),
+                            }
+                        )
+                        record["recent_topics"] = topics[-self.MAX_RECENT_TOPICS:]
+                data[actor_id] = record
+                self.path.parent.mkdir(parents=True, exist_ok=True)
+                self.path.write_text(
+                    json.dumps(data, indent=1, ensure_ascii=False, sort_keys=True),
+                    encoding="utf-8",
+                )
+        except OSError:
+            log.warning("person registry write failed for actor %s", actor_id, exc_info=True)
+
+
 class AppState:
     def __init__(self, config: AppConfig) -> None:
         self.config = config
@@ -1058,6 +1246,10 @@ class AppState:
         self.lock = threading.Lock()
         self.workspace = PromptWorkspace(config.workspace_dir)
         self.sessions = SessionStore(config.state_dir)
+        self.people = PersonRegistry(config.state_dir)
+        self._identity_lock = threading.Lock()
+        self._identity_investigating = False
+        self._identity_error = ""
         self.provider = ProviderClient(config)
         self.sync_auth = SyncAuthStore(config.sync_tokens_path)
         self.memory_store = SemanticMemoryStore(
@@ -1603,7 +1795,11 @@ class AppState:
         if not owner_id:
             return False
         if memory_scope == "private":
-            return normalize_text(actor_id, 128) == owner_id
+            # The bot is the owner's representative: with guest access on
+            # (default), teammates query the owner's history through it —
+            # that's the collaboration point. Set GUEST_OWNER_ACCESS=false to
+            # restrict trajectory lookup to the owner themself.
+            return self.config.guest_owner_access or normalize_text(actor_id, 128) == owner_id
         if memory_scope == "target_user":
             return normalize_text(target_user_id or "", 128) == owner_id
         return False
@@ -1624,12 +1820,30 @@ class AppState:
         index_modes: tuple[str, ...] = ("hybrid",),
         trace: list[dict[str, Any]] | None = None,
         stage: str = "search",
+        after: str = "",
+        before: str = "",
+        source_filter: str = "",
     ) -> list[dict[str, Any]]:
         channel_limit = max(limit * 2, self.config.trajectory_search_limit, 8)
+        after_key, before_key = date_filter_keys(after, before)
+        source_filter = (source_filter or "").strip().lower()
+        filters_active = bool(after_key or before_key or source_filter)
+        if filters_active:
+            # Channels without SQL-level filters get post-filtered below, so
+            # over-fetch to keep the surviving candidate pool comparable.
+            channel_limit *= 3
+
+        def in_window(match: dict[str, Any]) -> bool:
+            return not filters_active or trajectory_source_in_window(
+                match, after_key=after_key, before_key=before_key, source_filter=source_filter
+            )
+
         by_ref: dict[str, dict[str, Any]] = {}
         counts: dict[str, int] = {}
 
         for source in seed_sources or []:
+            if not in_window(source):
+                continue
             merge_trajectory_source(by_ref, source, query=query, channel="seed")
         if seed_sources:
             counts["seed"] = len(seed_sources)
@@ -1640,6 +1854,9 @@ class AppState:
                     query=query,
                     limit=channel_limit,
                     mode=mode,
+                    after=after,
+                    before=before,
+                    source=source_filter,
                 )
                 counts[f"index:{mode}"] = len(index_matches)
                 for match in index_matches:
@@ -1659,7 +1876,7 @@ class AppState:
             )
             counts["semantic"] = len(semantic_matches)
             for match in semantic_matches:
-                if not self.source_allowed_by_visibility(match):
+                if not self.source_allowed_by_visibility(match) or not in_window(match):
                     continue
                 merge_trajectory_source(by_ref, match, query=query, channel="semantic")
 
@@ -1673,7 +1890,7 @@ class AppState:
             )
             counts["lexical"] = len(lexical_matches)
             for match in lexical_matches:
-                if not self.source_allowed_by_visibility(match):
+                if not self.source_allowed_by_visibility(match) or not in_window(match):
                     continue
                 merge_trajectory_source(by_ref, match, query=query, channel="lexical")
 
@@ -1688,7 +1905,7 @@ class AppState:
             ]
             counts["local"] = len(local_matches)
             for match in local_matches:
-                if not self.source_allowed_by_visibility(match):
+                if not self.source_allowed_by_visibility(match) or not in_window(match):
                     continue
                 match["match_score"] = match.get("score")
                 match["_local_lookup"] = float(match.get("score") or 0.0) >= LOCAL_LOOKUP_PRIORITY_THRESHOLD
@@ -1895,6 +2112,9 @@ class AppState:
         trace: list[dict[str, Any]] | None = None,
         context: str = "",
         discovered: list[str] | None = None,
+        after: str = "",
+        before: str = "",
+        source_filter: str = "",
     ) -> list[dict[str, Any]]:
         search_started = time.monotonic()
         refresh = self.ensure_trajectory_chunk_index_current()
@@ -1923,6 +2143,9 @@ class AppState:
             index_modes=("hybrid",),
             trace=trace,
             stage="initial",
+            after=after,
+            before=before,
+            source_filter=source_filter,
         )
         for match in initial:
             merge_trajectory_source(combined_by_ref, match, query=query, channel="initial")
@@ -1943,6 +2166,9 @@ class AppState:
                 include_index=False,
                 trace=trace,
                 stage="fallback:local",
+                after=after,
+                before=before,
+                source_filter=source_filter,
             )
             for match in local_matches:
                 merge_trajectory_source(combined_by_ref, match, query=query, channel="fallback:local")
@@ -1974,6 +2200,9 @@ class AppState:
                     index_modes=("exact", "hybrid"),
                     trace=trace,
                     stage=f"refine:{step_index}",
+                    after=after,
+                    before=before,
+                    source_filter=source_filter,
                 )
                 for match in step_matches:
                     merge_trajectory_source(combined_by_ref, match, query=query, channel=f"refine:{step_index}")
@@ -2037,6 +2266,9 @@ class AppState:
                         index_modes=("exact", "hybrid"),
                         trace=trace,
                         stage=f"planner:{rounds + 1}:{step_index}",
+                        after=after,
+                        before=before,
+                        source_filter=source_filter,
                     )
                     for match in step_matches:
                         merge_trajectory_source(
@@ -2308,6 +2540,228 @@ class AppState:
                 return "\n".join(lines[i:]).strip()
         return text
 
+    OWNER_IDENTITY_FILE = "owner_identity.json"
+    OWNER_IDENTITY_PROMPT = (
+        "Sherlock session: deduce who the OWNER of this assistant is from their trajectory "
+        "memory alone. Hunt for the owner's real name and the handles they go by — git author "
+        "lines, home-directory and cluster usernames, self-introductions, how collaborators "
+        "address them. Cross-check at least two independent pieces of evidence; do not guess "
+        "from a single path segment. Output ONLY strict JSON, nothing else:\n"
+        '{"display_name": "<most natural full name>", "aliases": ["<handle or short name>", ...], '
+        '"evidence": ["<one short line each, max 4>"], "confidence": "high|medium|low"}'
+    )
+
+    def owner_identity_path(self) -> Path:
+        return Path(self.config.state_dir) / self.OWNER_IDENTITY_FILE
+
+    def get_owner_identity(self) -> dict[str, Any]:
+        try:
+            data = json.loads(self.owner_identity_path().read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            return {}
+        return data if isinstance(data, dict) else {}
+
+    def save_owner_identity(
+        self,
+        *,
+        display_name: str,
+        aliases: list[str] | None = None,
+        evidence: list[str] | None = None,
+        confidence: str = "",
+        confirmed: bool = False,
+    ) -> dict[str, Any]:
+        identity = {
+            "display_name": normalize_text(display_name, 80),
+            "aliases": [normalize_text(str(alias), 60) for alias in (aliases or []) if str(alias).strip()][:8],
+            "evidence": [normalize_text(str(item), 160) for item in (evidence or [])][:4],
+            "confidence": normalize_text(confidence, 16),
+            "confirmed": confirmed,
+            "updated_at": utc_now(),
+        }
+        path = self.owner_identity_path()
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps(identity, indent=1, ensure_ascii=False), encoding="utf-8")
+        return identity
+
+    def owner_name(self) -> str:
+        """Discovered/confirmed identity first; the env var is only a fallback
+        for installs that predate identity discovery."""
+        name = normalize_text(str(self.get_owner_identity().get("display_name") or ""), 80)
+        return name or self.config.owner_display_name
+
+    def investigate_owner_identity(self) -> dict[str, Any]:
+        """Sherlock run: the agent deduces the owner's name/handles from the
+        trajectories. Returns the parsed identity draft (not saved)."""
+        actor_id = normalize_text(self.config.imported_owner_actor_id, 128)
+        system_prompt, _sources, _summary = self.build_system_prompt(
+            query=self.OWNER_IDENTITY_PROMPT,
+            actor_id=actor_id,
+            memory_scope="private",
+            target_user_id=None,
+            session_summary="",
+            use_memory=True,
+            match_limit=self.config.memory_match_limit,
+        )
+        budget_log = (
+            self.new_retrieval_budget_log_path()
+            if self.config.agentic_tool_routing else None
+        )
+        tool_env = self.tool_env_for_request(
+            actor_id=actor_id, memory_scope="private", target_user_id=None,
+            retrieval_budget_log_path=str(budget_log) if budget_log else None,
+        )
+        result = self.provider.chat(
+            system_prompt=system_prompt, history=[],
+            message=self.OWNER_IDENTITY_PROMPT, tool_env=tool_env,
+        )
+        text = str(result.get("text") or "")
+        start, end = text.find("{"), text.rfind("}")
+        if start < 0 or end <= start:
+            return {}
+        try:
+            parsed = json.loads(text[start : end + 1])
+        except json.JSONDecodeError:
+            return {}
+        if not isinstance(parsed, dict) or not str(parsed.get("display_name") or "").strip():
+            return {}
+        return parsed
+
+    def identity_status(self) -> dict[str, Any]:
+        with self._identity_lock:
+            return {"investigating": self._identity_investigating, "error": self._identity_error}
+
+    def start_owner_identity_investigation(self, *, save: bool = True) -> bool:
+        """Run the Sherlock session in the background. Returns False if one is
+        already in flight."""
+        with self._identity_lock:
+            if self._identity_investigating:
+                return False
+            self._identity_investigating = True
+            self._identity_error = ""
+
+        def worker() -> None:
+            error = ""
+            try:
+                draft = self.investigate_owner_identity()
+                if draft and save:
+                    self.save_owner_identity(
+                        display_name=str(draft.get("display_name") or ""),
+                        aliases=draft.get("aliases") if isinstance(draft.get("aliases"), list) else [],
+                        evidence=draft.get("evidence") if isinstance(draft.get("evidence"), list) else [],
+                        confidence=str(draft.get("confidence") or ""),
+                        confirmed=False,
+                    )
+                    log.info("owner identity discovered: %s", draft.get("display_name"))
+                elif not draft:
+                    error = "investigation returned no usable identity"
+            except Exception as exc:  # pragma: no cover - background best-effort
+                log.warning("owner identity investigation failed: %s", exc)
+                error = normalize_text(str(exc), 300)
+            finally:
+                with self._identity_lock:
+                    self._identity_investigating = False
+                    self._identity_error = error
+
+        threading.Thread(target=worker, daemon=True, name="owner-identity-sherlock").start()
+        return True
+
+    def maybe_start_identity_onboarding(self) -> None:
+        """First-boot onboarding: a fresh install doesn't ask who you are — it
+        deduces the owner from the trajectories, then confirms in conversation
+        or in the menu app."""
+        if self.get_owner_identity().get("display_name"):
+            return
+
+        def delayed() -> None:
+            # Let the HTTP server come up first: the investigating agent's tool
+            # calls loop back into this same server.
+            time.sleep(20)
+            try:
+                total_chunks = int(self.trajectory_chunk_index.stats().get("total_chunks") or 0)
+            except Exception:
+                return
+            if total_chunks <= 0:
+                log.info("identity onboarding skipped: no indexed trajectories yet")
+                return
+            log.info("identity onboarding: no owner identity on file — starting sherlock session")
+            self.start_owner_identity_investigation(save=True)
+
+        threading.Thread(target=delayed, daemon=True, name="owner-identity-onboarding").start()
+
+    def is_owner_actor(self, actor_id: str) -> bool:
+        owner_id = normalize_text(self.config.imported_owner_actor_id, 128)
+        return bool(owner_id) and normalize_text(actor_id, 128) == owner_id
+
+    def asker_section(
+        self,
+        *,
+        actor_id: str,
+        actor_display_name: str,
+        channel_kind: str,
+        channel_label: str,
+    ) -> str:
+        """Tell the model who it serves vs who is talking right now — the core
+        of multi-person operation over Discord/Slack."""
+        identity = self.get_owner_identity()
+        owner_name = self.owner_name() or "your owner"
+        aliases = [str(a) for a in (identity.get("aliases") or []) if str(a).strip()]
+        alias_note = f" (also goes by: {', '.join(aliases[:5])})" if aliases else ""
+        team = f" on {self.config.team_name}" if self.config.team_name else ""
+        record = self.people.get(actor_id) or {}
+        name = actor_display_name or str(record.get("display_name") or "") or f"actor {actor_id}"
+        lines = [
+            "## Who Is Asking",
+            f"You are {owner_name}'s assistant and representative{team}: a plain, factual "
+            "information source over their work history that helps the team collaborate. "
+            f"No persona needed.{alias_note}",
+        ]
+        if self.is_owner_actor(actor_id):
+            lines.append(
+                f"Asker: {name} — this IS {owner_name}, the owner. First-person references "
+                "('what did I do', 'my runs') mean the owner's own work."
+            )
+            if not identity.get("display_name"):
+                lines.append(
+                    "You have not yet learned the owner's name. If it fits naturally, briefly "
+                    "ask what to call them (one line; they can also set it with `!iam <name>`)."
+                )
+            elif not identity.get("confirmed"):
+                lines.append(
+                    f"'{owner_name}' is your own deduction from their history, not yet confirmed. "
+                    "If it fits naturally, confirm it once (they can correct with `!iam <name>`)."
+                )
+        else:
+            lines.append(
+                f"Asker: {name} (id {actor_id}) — a teammate of {owner_name}, not the owner. "
+                f"Answer their questions about {owner_name}'s work from the owner's history — "
+                "that is your job as representative. Reference resolution: the owner's name or "
+                f"'your owner' means {owner_name}; but THIS asker's first-person references "
+                "('my notes', 'what did I ask you') mean the asker themself, whose own private "
+                "notes are separate from the owner's history."
+            )
+        if channel_kind == "group":
+            where = f" in {channel_label}" if channel_label else ""
+            lines.append(
+                f"Setting: group channel{where}. Multiple people talk here; user turns are "
+                "prefixed with the speaker's name in [brackets]. Address the current asker, and "
+                "use the channel conversation as shared context everyone present can see."
+            )
+        elif channel_kind:
+            lines.append("Setting: direct message — a private one-on-one conversation.")
+        first_seen = str(record.get("first_seen") or "")[:10]
+        chat_count = int(record.get("chat_count") or 0)
+        if chat_count > 1:
+            history_line = f"Prior contact: {chat_count} chats since {first_seen or 'recently'}."
+            topics = [
+                normalize_text(str(item.get("topic") or ""), 90)
+                for item in (record.get("recent_topics") or [])[-4:-1]
+                if isinstance(item, dict) and item.get("topic")
+            ]
+            if topics:
+                history_line += " Recent topics: " + "; ".join(topics)
+            lines.append(history_line)
+        return "\n".join(lines)
+
     def build_system_prompt(
         self,
         *,
@@ -2318,6 +2772,9 @@ class AppState:
         session_summary: str,
         use_memory: bool,
         match_limit: int,
+        actor_display_name: str = "",
+        channel_kind: str = "",
+        channel_label: str = "",
     ) -> tuple[str, list[dict[str, Any]], bool]:
         sections: list[str] = []
         workspace_prompt = self.workspace.render()
@@ -2332,6 +2789,15 @@ class AppState:
                 "requests, shorthand, and 'my/our' references in this profile:\n"
                 f"{owner_profile}"
             )
+
+        sections.append(
+            self.asker_section(
+                actor_id=actor_id,
+                actor_display_name=actor_display_name,
+                channel_kind=channel_kind,
+                channel_label=channel_label,
+            )
+        )
 
         sections.append(
             "## Grounding Policy\n"
@@ -2362,22 +2828,48 @@ class AppState:
         if session_summary:
             sections.append(f"## Session Summary\n{session_summary}")
 
-        if use_memory and self.config.agentic_tool_routing:
+        trajectory_allowed = self.can_use_local_trajectory_lookup(
+            actor_id=actor_id,
+            memory_scope=memory_scope,
+            target_user_id=target_user_id,
+        )
+        if use_memory and self.config.agentic_tool_routing and not trajectory_allowed:
             tool_command = f"{shlex.quote(self.config.mybot_tool_python)} {shlex.quote(self.config.mybot_tool_path)}"
-            sqlite_command = f"/usr/bin/sqlite3 -readonly {shlex.quote(self.config.trajectory_index_db_path)}"
             sections.append(
                 "## Local Tools\n"
-                "Two read-only tools over the user's own past coding sessions (actor + scope are "
-                "preset via env vars):\n"
-                f"- `{tool_command}` — memory-search, trajectory-search, trajectory-read, trajectory-stats "
-                "(semantic/fuzzy search + focused evidence reads).\n"
-                f"- `{sqlite_command} \"<SQL>\"` — exact/enumeration SQL over the cleaned, included-only index: "
-                "`trajectory_chunks(source_ref, source_name, cwd, title, updated_at, text, metadata_json)` "
-                "and FTS5 `trajectory_chunks_fts(title, cwd, text)`.\n"
-                "Be relentlessly proactive: dig with these until the answer is grounded in real evidence, "
-                "then say what's certain vs not. Don't touch raw session files directly."
+                f"- `{tool_command} memory-search -q <query>` — search long-term memory available "
+                "to this asker (their own private notes + shared team memory; actor and scope are "
+                "preset via env vars). Trajectory search/read are owner-only and will refuse for "
+                "this request — don't attempt them."
             )
-        elif use_memory:
+        elif use_memory and self.config.agentic_tool_routing:
+            tool_command = f"{shlex.quote(self.config.mybot_tool_python)} {shlex.quote(self.config.mybot_tool_path)}"
+            sections.append(
+                "## Local Tools\n"
+                "Your shell runs in a read-restricted sandbox (no secrets, no raw session files, "
+                "localhost-only network). The mybot tool below is your data source (actor + scope "
+                "preset via env vars); you may compose its output with standard text tools — "
+                "grep, sed, awk, jq, sort, uniq, pipes — when that's sharper than SQL:\n"
+                f"- `{tool_command}` — memory-search, trajectory-search, trajectory-read, trajectory-stats "
+                "(semantic/fuzzy search + focused evidence reads). trajectory-search takes --after/--before "
+                "(ISO date) and --source codex|claude; hits report event_start/event_end + chunk_id. "
+                "trajectory-read --around-event N (± --events-before/--events-after) or --chunk-id C zooms "
+                "to that exact spot; reads report total_events so you can page (the tail is the freshest).\n"
+                f"- `{tool_command} sql -q \"<SELECT …>\" [--limit N]` — exact/enumeration SQL over the "
+                "cleaned, included-only index: `trajectory_chunks(id, source_ref, source_name, cwd, title, "
+                "updated_at, event_start, event_end, text, metadata_json)` and FTS5 "
+                "`trajectory_chunks_fts(title, cwd, text)`. Your grep/sed/awk/jq equivalents live INSIDE "
+                "this sandbox: `text REGEXP '...'` (case-insensitive), `regexp_extract(text, pattern[, group])`, "
+                "`regexp_count(text, pattern)`, SQLite JSON1 (`json_extract(metadata_json,'$.key')`), plus "
+                "GROUP BY/COUNT for aggregation. A row's `id` works as `--chunk-id` in trajectory-read to "
+                "pull full context around a SQL hit.\n"
+                "Be relentlessly proactive: dig with these until the answer is grounded in real evidence, "
+                "then say what's certain vs not (with dates for time-sensitive values). Live numbers "
+                "(balances, quotas, job states) usually ARE recorded in past command output — hunt for the "
+                "literal output line (e.g. text LIKE '%Current Balance%') before concluding there's no "
+                "record. Don't touch raw session files directly."
+            )
+        elif use_memory and trajectory_allowed:
             sections.append(f"## Trajectory Memory Overview\n{self.trajectory_overview()}")
             sections.append(f"## Recent Trajectory Catalog\n{self.recent_trajectory_catalog()}")
 
@@ -2422,8 +2914,9 @@ class AppState:
 
         sections.append(
             "## Response Rule\n"
-            "Answer naturally and concisely. Mention uncertainty when the answer is not grounded "
-            "in the retrieved memory or current session context."
+            "Answer concisely and factually — you are an information source, not a persona. "
+            "Mention uncertainty when the answer is not grounded in the retrieved memory or "
+            "current session context."
         )
         return (
             "\n\n".join(section for section in sections if section),
@@ -2545,6 +3038,9 @@ class ChatHandler(BaseHTTPRequestHandler):
         if self.path == "/owner/profile":
             self.handle_owner_profile(body)
             return
+        if self.path == "/owner/identity":
+            self.handle_owner_identity(body)
+            return
         if self.path == "/gui/query":
             self.handle_gui_query(body)
             return
@@ -2566,6 +3062,9 @@ class ChatHandler(BaseHTTPRequestHandler):
         if self.path == "/trajectory/read":
             self.handle_trajectory_read(body)
             return
+        if self.path == "/trajectory/sql":
+            self.handle_trajectory_sql(body)
+            return
         if self.path == "/trajectory/index/rebuild":
             self.handle_trajectory_index_rebuild(body)
             return
@@ -2574,6 +3073,9 @@ class ChatHandler(BaseHTTPRequestHandler):
             return
         if self.path == "/trajectory/index/stats":
             self.handle_trajectory_index_stats(body)
+            return
+        if self.path == "/sessions/observe":
+            self.handle_session_observe(body)
             return
         if self.path == "/memory/promote":
             self.handle_memory_promote(body)
@@ -2623,6 +3125,68 @@ class ChatHandler(BaseHTTPRequestHandler):
             return
         self.respond_json(400, {"ok": False, "error": f"unknown action {action!r}"})
 
+    def handle_owner_identity(self, body: dict[str, Any]) -> None:
+        """Who the bot serves. `investigate` runs the Sherlock session (agent
+        deduces the owner's name from trajectories); `set` is the owner
+        confirming or correcting it themselves."""
+        action = str(body.get("action") or "get").strip().lower()
+        state = self.server.state
+        if action == "get":
+            self.respond_json(200, {"ok": True, "identity": state.get_owner_identity(), **state.identity_status()})
+            return
+        if action == "set":
+            actor_id = normalize_text(str(body.get("actor_id") or ""), 128)
+            if not state.is_owner_actor(actor_id):
+                self.respond_json(403, {"ok": False, "error": "only the owner can set their identity"})
+                return
+            display_name = normalize_text(str(body.get("display_name") or ""), 80)
+            if not display_name:
+                self.respond_json(400, {"ok": False, "error": "display_name is required"})
+                return
+            existing = state.get_owner_identity()
+            aliases = body.get("aliases") if isinstance(body.get("aliases"), list) else existing.get("aliases") or []
+            identity = state.save_owner_identity(
+                display_name=display_name,
+                aliases=aliases,
+                evidence=existing.get("evidence") or [],
+                confidence="confirmed",
+                confirmed=True,
+            )
+            self.respond_json(200, {"ok": True, "identity": identity})
+            return
+        if action == "investigate":
+            if coerce_bool(body.get("background"), False):
+                started_bg = state.start_owner_identity_investigation(
+                    save=coerce_bool(body.get("save"), True)
+                )
+                self.respond_json(200, {"ok": True, "started": started_bg, **state.identity_status()})
+                return
+            started = time.time()
+            log.info("owner identity investigation (sherlock) started")
+            try:
+                draft = state.investigate_owner_identity()
+            except RuntimeError as exc:
+                log.warning("owner identity investigation failed: %s", exc)
+                self.respond_json(502, {"ok": False, "error": str(exc)})
+                return
+            if not draft:
+                self.respond_json(502, {"ok": False, "error": "investigation returned no usable identity"})
+                return
+            saved = False
+            if coerce_bool(body.get("save"), False):
+                state.save_owner_identity(
+                    display_name=str(draft.get("display_name") or ""),
+                    aliases=draft.get("aliases") if isinstance(draft.get("aliases"), list) else [],
+                    evidence=draft.get("evidence") if isinstance(draft.get("evidence"), list) else [],
+                    confidence=str(draft.get("confidence") or ""),
+                    confirmed=False,
+                )
+                saved = True
+            log.info("owner identity investigated in %.1fs (saved=%s)", time.time() - started, saved)
+            self.respond_json(200, {"ok": True, "draft": draft, "saved": saved})
+            return
+        self.respond_json(400, {"ok": False, "error": f"unknown action {action!r}"})
+
     def _chat_context(self, body: dict[str, Any]):
         """Shared prep for /chat and /chat/stream. Returns (ctx, None) or
         (None, (status, error)). ctx holds everything both paths need."""
@@ -2638,6 +3202,17 @@ class ChatHandler(BaseHTTPRequestHandler):
         target_user_id = normalize_text(str(body.get("target_user_id") or ""), 128) or None
         if memory_scope == "target_user" and not target_user_id:
             return None, (400, "target_user_id is required when memory_scope=target_user")
+        actor_display_name = normalize_text(str(body.get("actor_display_name") or ""), 80)
+        channel_kind = normalize_text(str(body.get("channel_kind") or ""), 16).lower()
+        if channel_kind not in ("", "dm", "group"):
+            return None, (400, "channel_kind must be 'dm' or 'group'")
+        channel_label = normalize_text(str(body.get("channel_label") or ""), 120)
+        author_label = normalize_text(str(body.get("author_label") or actor_display_name), 80)
+        raw_message = message
+        if channel_kind == "group" and author_label:
+            # Attributed turns keep a shared channel session readable when
+            # several people talk to the bot in the same conversation.
+            message = f"[{author_label}] {message}"
 
         session_key = safe_session_key(
             user=user,
@@ -2672,6 +3247,9 @@ class ChatHandler(BaseHTTPRequestHandler):
                 session_summary=summary_text,
                 use_memory=use_memory,
                 match_limit=int(body.get("memory_match_limit", self.server.state.config.memory_match_limit)),
+                actor_display_name=actor_display_name,
+                channel_kind=channel_kind,
+                channel_label=channel_label,
             )
         except ValueError as exc:
             return None, (400, str(exc))
@@ -2691,7 +3269,9 @@ class ChatHandler(BaseHTTPRequestHandler):
             retrieval_budget_log_path=str(retrieval_budget_log_path) if retrieval_budget_log_path else None,
         )
         return {
-            "message": message, "user": user, "actor_id": actor_id,
+            "message": message, "raw_message": raw_message, "user": user, "actor_id": actor_id,
+            "actor_display_name": actor_display_name, "channel_kind": channel_kind,
+            "channel_label": channel_label,
             "memory_scope": memory_scope, "target_user_id": target_user_id,
             "session_key": session_key, "use_memory": use_memory,
             "history_for_model": history_for_model, "system_prompt": system_prompt,
@@ -2773,6 +3353,13 @@ class ChatHandler(BaseHTTPRequestHandler):
                 self.server.state.sessions.set_backend_state(
                     session_key, user, provider_result["provider_style"], backend_session_id,
                 )
+
+        self.server.state.people.note_interaction(
+            actor_id=actor_id,
+            display_name=ctx.get("actor_display_name", ""),
+            channel_label=ctx.get("channel_label", "") or session_key,
+            topic=ctx.get("raw_message", ctx["message"]),
+        )
 
         try:
             self.server.state.maybe_compact_session(session_key=session_key, user=user)
@@ -3011,6 +3598,17 @@ class ChatHandler(BaseHTTPRequestHandler):
             self.respond_json(403, {"ok": False, "error": "local trajectory lookup is not allowed for this actor/scope"})
             return
         limit = int(body.get("limit", self.server.state.config.trajectory_search_limit))
+        after = normalize_text(str(body.get("after") or ""), 32)
+        before = normalize_text(str(body.get("before") or ""), 32)
+        for label, value in (("after", after), ("before", before)):
+            if value and not re.fullmatch(r"\d{4}-\d{2}-\d{2}([T ].*)?", value):
+                self.respond_json(
+                    400,
+                    {"ok": False, "error": f"{label} must be an ISO date (YYYY-MM-DD or full timestamp), got {value!r}"},
+                )
+                return
+        source_filter = normalize_text(str(body.get("source") or ""), 32).lower()
+        compact = coerce_bool(body.get("compact"), False)
         if coerce_bool(body.get("full_scan"), False):
             results = self.server.state.trajectory_lookup.search(
                 query=query,
@@ -3042,11 +3640,138 @@ class ChatHandler(BaseHTTPRequestHandler):
             seed_sources=None,
             trace=trace if coerce_bool(body.get("return_trace"), False) else None,
             context=normalize_text(str(body.get("context") or ""), 1200),
+            after=after,
+            before=before,
+            source_filter=source_filter,
         )
+        if compact:
+            matches = [compact_trajectory_match(match) for match in matches]
         response = {"ok": True, "mode": "agentic_candidate", "matches": matches}
+        if after or before or source_filter:
+            response["filters"] = {
+                key: value
+                for key, value in (("after", after), ("before", before), ("source", source_filter))
+                if value
+            }
         if coerce_bool(body.get("return_trace"), False):
             response["trace"] = trace
         self.respond_json(200, response)
+
+    TRAJECTORY_SQL_MAX_ROWS = 200
+    TRAJECTORY_SQL_MAX_CELL_CHARS = 500
+    TRAJECTORY_SQL_TIMEOUT_SECONDS = 10.0
+
+    @staticmethod
+    def _register_sql_regex_functions(conn: sqlite3.Connection) -> None:
+        """grep/sed/awk-class text surgery INSIDE the read-only sandbox, so the
+        agent never needs raw shell text tools (which could read arbitrary
+        files). Case-insensitive by default; use (?-i:...) to force case."""
+
+        def _compile(pattern: Any) -> "re.Pattern[str]":
+            return re.compile(str(pattern or "")[:500], re.IGNORECASE | re.DOTALL)
+
+        def regexp(pattern: Any, value: Any) -> int:  # WHERE text REGEXP '...'
+            if value is None:
+                return 0
+            return 1 if _compile(pattern).search(str(value)) else 0
+
+        def regexp_extract(value: Any, pattern: Any, group: Any = 0) -> str | None:
+            if value is None:
+                return None
+            match = _compile(pattern).search(str(value))
+            if match is None:
+                return None
+            try:
+                return match.group(int(group))
+            except (IndexError, ValueError):
+                return None
+
+        def regexp_count(value: Any, pattern: Any) -> int:
+            if value is None:
+                return 0
+            return len(_compile(pattern).findall(str(value)))
+
+        conn.create_function("regexp", 2, regexp, deterministic=True)
+        conn.create_function("regexp_extract", 2, regexp_extract, deterministic=True)
+        conn.create_function("regexp_extract", 3, regexp_extract, deterministic=True)
+        conn.create_function("regexp_count", 2, regexp_count, deterministic=True)
+
+    def handle_trajectory_sql(self, body: dict[str, Any]) -> None:
+        """Read-only SQL over the trajectory index, exposed through mybot_tool
+        so the agent needs exactly ONE preapproved command prefix. Replaces the
+        raw `sqlite3 -readonly` allowlist entry, which (a) auto-denied any
+        command-shape deviation (bare `sqlite3`, extra flags, pipes) and
+        (b) still allowed `.system`-style dot-command shell escapes."""
+        query = normalize_text(str(body.get("query") or ""), 4000).strip().rstrip(";").strip()
+        if not query:
+            self.respond_json(400, {"ok": False, "error": "query is required"})
+            return
+        actor_id = normalize_text(str(body.get("actor_id") or body.get("user") or self.server.state.config.imported_owner_actor_id), 128)
+        try:
+            memory_scope = parse_memory_scope(body.get("memory_scope"))
+        except ValueError as exc:
+            self.respond_json(400, {"ok": False, "error": str(exc)})
+            return
+        target_user_id = normalize_text(str(body.get("target_user_id") or ""), 128) or None
+        if not self.server.state.can_use_local_trajectory_lookup(
+            actor_id=actor_id,
+            memory_scope=memory_scope,
+            target_user_id=target_user_id,
+        ):
+            self.respond_json(403, {"ok": False, "error": "trajectory SQL is not allowed for this actor/scope"})
+            return
+        # mode=ro + query_only stop writes; ATTACH could still read OTHER
+        # database files (memories, anything on disk), so it is refused.
+        if re.search(r"\b(attach|detach)\b", query, re.IGNORECASE):
+            self.respond_json(400, {"ok": False, "error": "ATTACH/DETACH are not allowed"})
+            return
+        limit = max(1, min(int(body.get("limit", 50)), self.TRAJECTORY_SQL_MAX_ROWS))
+        db_path = self.server.state.config.trajectory_index_db_path
+        started = time.monotonic()
+        conn: sqlite3.Connection | None = None
+        try:
+            conn = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
+            conn.row_factory = sqlite3.Row
+            conn.execute("PRAGMA query_only=ON")
+            self._register_sql_regex_functions(conn)
+            conn.set_progress_handler(
+                lambda: 1 if time.monotonic() - started > self.TRAJECTORY_SQL_TIMEOUT_SECONDS else 0,
+                100_000,
+            )
+            cursor = conn.execute(query)
+            rows = cursor.fetchmany(limit + 1)
+            columns = [desc[0] for desc in cursor.description] if cursor.description else []
+        except (sqlite3.Error, sqlite3.Warning) as exc:
+            self.respond_json(400, {"ok": False, "error": f"SQL error: {exc}"})
+            return
+        finally:
+            if conn is not None:
+                conn.close()
+
+        cell_truncated = False
+
+        def render_cell(value: Any) -> Any:
+            nonlocal cell_truncated
+            if value is None or isinstance(value, (int, float)):
+                return value
+            text = value.decode("utf-8", "replace") if isinstance(value, bytes) else str(value)
+            if len(text) > self.TRAJECTORY_SQL_MAX_CELL_CHARS:
+                cell_truncated = True
+                return text[: self.TRAJECTORY_SQL_MAX_CELL_CHARS - 1] + "…"
+            return text
+
+        rendered = [[render_cell(value) for value in row] for row in rows[:limit]]
+        self.respond_json(
+            200,
+            {
+                "ok": True,
+                "columns": columns,
+                "rows": rendered,
+                "row_count": len(rendered),
+                "truncated": len(rows) > limit or cell_truncated,
+                "seconds": round(time.monotonic() - started, 3),
+            },
+        )
 
     def handle_trajectory_index_rebuild(self, body: dict[str, Any]) -> None:
         actor_id = normalize_text(str(body.get("actor_id") or body.get("user") or self.server.state.config.imported_owner_actor_id), 128)
@@ -3132,6 +3857,33 @@ class ChatHandler(BaseHTTPRequestHandler):
         self.server.state.ensure_trajectory_chunk_index_current()
         query = normalize_text(str(body.get("query") or ""), 300)
         max_chars = int(body.get("max_chars", self.server.state.config.trajectory_evidence_chars))
+        event_index = body.get("event_index")
+        chunk_id = body.get("chunk_id")
+        if event_index is not None or chunk_id is not None:
+            try:
+                window = self.server.state.trajectory_chunk_index.read_window(
+                    source_ref=source_ref,
+                    event_index=int(event_index) if event_index is not None else 0,
+                    chunk_id=int(chunk_id) if chunk_id is not None else None,
+                    query=query,
+                    before=max(0, int(body.get("events_before", 3))),
+                    after=max(0, int(body.get("events_after", 6))),
+                    max_chars=max_chars,
+                )
+            except (TypeError, ValueError):
+                self.respond_json(
+                    400,
+                    {"ok": False, "error": "event_index, chunk_id, events_before and events_after must be integers"},
+                )
+                return
+            if window is None:
+                self.respond_json(404, {"ok": False, "error": "trajectory not found in allowed sources"})
+                return
+            if not self.server.state.source_allowed_by_visibility(window):
+                self.respond_json(403, {"ok": False, "error": "trajectory is hidden by visibility policy"})
+                return
+            self.respond_json(200, {"ok": True, "trajectory": window})
+            return
         source = self.server.state.memory_store.get_trajectory_source(
             source_ref=source_ref,
             actor_id=actor_id,
@@ -3268,6 +4020,36 @@ class ChatHandler(BaseHTTPRequestHandler):
             self.respond_json(400, {"ok": False, "error": str(exc)})
             return
         self.respond_json(200, {"ok": True, **status})
+
+    def handle_session_observe(self, body: dict[str, Any]) -> None:
+        """Record a channel message into a session WITHOUT invoking the model.
+        This is how the bot has context over everything said in a group channel
+        while only replying when addressed."""
+        message = normalize_text(str(body.get("message") or ""), 4000)
+        if not message:
+            self.respond_json(400, {"ok": False, "error": "message is required"})
+            return
+        user = str(body.get("user") or body.get("actor_id") or DEFAULT_SESSION_MAIN_KEY)
+        requested_key = str(body.get("session_key") or "")
+        if not requested_key:
+            self.respond_json(400, {"ok": False, "error": "session_key is required"})
+            return
+        session_key = safe_session_key(user=user, requested=requested_key)
+        actor_id = normalize_text(str(body.get("actor_id") or user), 128)
+        author_label = normalize_text(
+            str(body.get("author_label") or body.get("actor_display_name") or ""), 80
+        )
+        content = f"[{author_label}] {message}" if author_label else message
+        self.server.state.sessions.append_message(
+            session_key, user, "user", content,
+            meta={"source": "observed", "actor_id": actor_id},
+        )
+        self.server.state.people.note_interaction(
+            actor_id=actor_id,
+            display_name=normalize_text(str(body.get("actor_display_name") or ""), 80),
+            observed=True,
+        )
+        self.respond_json(200, {"ok": True, "session_key": session_key})
 
     def handle_session_history(self, body: dict[str, Any]) -> None:
         session_key = safe_session_key(
@@ -3439,6 +4221,10 @@ def load_config(args: argparse.Namespace) -> AppConfig:
         mybot_tool_python=os.environ.get("MYBOT_TOOL_PYTHON", sys.executable or "python3"),
         embedding_model_name=os.environ.get("EMBEDDING_MODEL_NAME", "sentence-transformers/all-MiniLM-L6-v2"),
         imported_owner_actor_id=os.environ.get("MEMORY_IMPORTED_OWNER_ID", "local-owner"),
+        owner_display_name=os.environ.get("OWNER_DISPLAY_NAME", "").strip(),
+        team_name=os.environ.get("TEAM_NAME", "").strip(),
+        guest_owner_access=coerce_bool(os.environ.get("GUEST_OWNER_ACCESS"), True),
+        claude_bash_sandbox=coerce_bool(os.environ.get("CLAUDE_BASH_SANDBOX"), True),
         session_tail_pairs=session_tail_pairs,
         compaction_trigger_message_count=int(os.environ.get("COMPACTION_TRIGGER_MESSAGES", "40")),
         compaction_trigger_char_count=int(os.environ.get("COMPACTION_TRIGGER_CHARS", "16000")),
@@ -3481,6 +4267,7 @@ def main() -> None:
     if refresh.get("rebuilt"):
         print("Refreshed stale trajectory chunk index before startup")
     state.start_trajectory_index_background_refresh()
+    state.maybe_start_identity_onboarding()
     server = StandaloneServer((config.host, config.port), ChatHandler, state)
     print(f"Listening on http://{config.host}:{config.port}")
     server.serve_forever()
