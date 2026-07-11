@@ -22,6 +22,8 @@ state/trajectory_memory.json
 state/known_projects.json
 state/run/
 state/retrieval_budgets/
+state/people.json
+state/owner_identity.json
 profiles/*/.mybot/
 backups/
 macapp/.build/
