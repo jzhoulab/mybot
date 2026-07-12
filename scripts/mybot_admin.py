@@ -938,9 +938,293 @@ def cmd_automated(args: argparse.Namespace) -> dict[str, Any]:
             "note": "changed sessions re-index now; a full rebuild restores all automated history"}
 
 
+def _suggested_bot_handle() -> str:
+    """Best-guess handle for naming the bot (<handle>-mybot), from the
+    discovered owner identity, so the doctor can prefill the app name."""
+    from sources.common import derive_bot_handle
+
+    identity: dict[str, Any] = {}
+    try:
+        identity = json.loads((REPO_ROOT / "state" / "owner_identity.json").read_text())
+    except (OSError, json.JSONDecodeError, ValueError):
+        identity = {}
+    override = os.environ.get("BOT_HANDLE", "").strip()
+    aliases = [str(a) for a in (identity.get("aliases") or []) if str(a).strip()]
+    return derive_bot_handle(
+        override=override, aliases=aliases, display_name=str(identity.get("display_name") or "")
+    )
+
+
+def _http_json(url: str, *, headers: dict[str, str], method: str = "GET", data: bytes | None = None):
+    """Return (status_code, parsed_json_or_None). Never raises on HTTP errors."""
+    import urllib.error
+    import urllib.request
+
+    request = urllib.request.Request(url, headers=headers, method=method, data=data)
+    try:
+        with urllib.request.urlopen(request, timeout=15) as response:
+            return response.status, json.loads(response.read().decode("utf-8"))
+    except urllib.error.HTTPError as exc:
+        try:
+            return exc.code, json.loads(exc.read().decode("utf-8"))
+        except (json.JSONDecodeError, ValueError):
+            return exc.code, None
+    except (urllib.error.URLError, json.JSONDecodeError, ValueError, OSError):
+        return 0, None
+
+
+def _prompt(label: str, provided: str) -> str:
+    if provided:
+        return provided.strip()
+    try:
+        return input(label).strip()
+    except EOFError:
+        return ""
+
+
+def _write_env(path: Path, mapping: dict[str, str], *, force: bool) -> tuple[bool, str]:
+    """Write a KEY=value env file. Refuses to clobber an existing file unless
+    force. Returns (written, message)."""
+    if path.exists() and not force:
+        return False, f"{path.name} already exists — re-run with --force to overwrite (a backup is made)."
+    if path.exists():
+        backup = path.with_suffix(path.suffix + ".bak")
+        backup.write_text(path.read_text())
+    body = "".join(f"{key}={value}\n" for key, value in mapping.items())
+    path.write_text(body)
+    try:
+        path.chmod(0o600)  # tokens — keep it owner-readable only
+    except OSError:
+        pass
+    return True, f"wrote {path.name}"
+
+
+def _connect_status(platform: str) -> dict[str, Any]:
+    """Configured state without touching the network — env file present and its
+    bot token filled in. For the menu app's Connections card."""
+    env_path = REPO_ROOT / (".discord.env" if platform == "discord" else ".slack.env")
+    key = "DISCORD_BOT_TOKEN" if platform == "discord" else "SLACK_BOT_TOKEN"
+    configured = False
+    if env_path.exists():
+        for line in env_path.read_text().splitlines():
+            if line.startswith(key + "="):
+                value = line.split("=", 1)[1].strip()
+                configured = bool(value) and "REPLACE" not in value and "REGENERATE" not in value
+                break
+    handle = _suggested_bot_handle()
+    return {
+        "ok": True, "platform": platform, "configured": configured,
+        "bot_handle": handle, "bot_name": f"{handle}-mybot",
+    }
+
+
+def _connect_discord(args: argparse.Namespace) -> dict[str, Any]:
+    handle = _suggested_bot_handle()
+    json_mode = getattr(args, "json", False)
+    if json_mode:
+        if not args.bot_token:
+            return {"ok": False, "platform": "discord", "error": "bot token is required (--bot-token)"}
+        status, body = _http_json(
+            "https://discord.com/api/v10/users/@me", headers={"Authorization": f"Bot {args.bot_token}"}
+        )
+        if not (status == 200 and isinstance(body, dict)):
+            reason = "token rejected" if status in (401, 403) else f"validation failed (status {status})"
+            return {"ok": False, "platform": "discord", "error": f"Discord {reason}."}
+        env = {
+            "DISCORD_BOT_TOKEN": args.bot_token,
+            "DISCORD_ALLOWED_CHANNEL_IDS": args.channels,
+            "DISCORD_AUTO_REPLY_CHANNEL_IDS": args.channels,
+            "DISCORD_ENABLE_MESSAGE_CONTENT": "true",
+            "DISCORD_REQUIRE_MENTION_IN_GUILDS": "true",
+            "DISCORD_USE_TRAJECTORY_MEMORY": "true",
+            "CHATBOT_HOST": "127.0.0.1", "CHATBOT_PORT": "8787",
+            "CHATBOT_BASE_URL": "http://127.0.0.1:8787", "START_LOCAL_CHAT_SERVER": "true",
+        }
+        written, message = _write_env(REPO_ROOT / ".discord.env", env, force=args.force)
+        return {
+            "ok": written, "platform": "discord", "bot_handle": handle,
+            "bot_name": f"{handle}-mybot", "bot_username": body.get("username"),
+            "message": message, **({} if written else {"error": message}),
+        }
+    print(f"""
+== Connect mybot to Discord ==
+
+1. Open https://discord.com/developers/applications  ->  New Application.
+   Name it  '{handle}-mybot'  so your teammates can tell whose bot is whose.
+2. Left sidebar -> Bot -> (the bot is auto-created). Under 'Privileged Gateway
+   Intents', turn ON  'Message Content Intent'  and Save.
+3. Still on the Bot page -> 'Reset Token' -> Copy the token.
+4. Left sidebar -> OAuth2 -> URL Generator: check scopes  'bot'  and
+   'applications.commands'; under Bot Permissions check  'Send Messages',
+   'Read Message History', 'Change Nickname'. Open the generated URL and add
+   the bot to your server.
+""".rstrip())
+    token = _prompt("\nPaste the Bot Token: ", args.bot_token)
+    if not token:
+        return {"ok": False, "error": "no token provided"}
+
+    status, body = _http_json(
+        "https://discord.com/api/v10/users/@me", headers={"Authorization": f"Bot {token}"}
+    )
+    if status == 200 and isinstance(body, dict):
+        print(f"  OK  token valid — bot is '{body.get('username')}' (id {body.get('id')}).")
+    elif status in (401, 403):
+        return {"ok": False, "error": "Discord rejected the token. Use 'Reset Token' on the Bot page and paste the fresh one."}
+    else:
+        return {"ok": False, "error": f"could not validate token (status {status}); check your network and try again."}
+
+    channels = _prompt(
+        "\nOptional — channel IDs to allow (comma-separated, blank = reply anywhere): ",
+        args.channels,
+    )
+    env = {
+        "DISCORD_BOT_TOKEN": token,
+        "DISCORD_ALLOWED_CHANNEL_IDS": channels,
+        "DISCORD_AUTO_REPLY_CHANNEL_IDS": channels,
+        "DISCORD_ENABLE_MESSAGE_CONTENT": "true",
+        "DISCORD_REQUIRE_MENTION_IN_GUILDS": "true",
+        "DISCORD_USE_TRAJECTORY_MEMORY": "true",
+        "CHATBOT_HOST": "127.0.0.1",
+        "CHATBOT_PORT": "8787",
+        "CHATBOT_BASE_URL": "http://127.0.0.1:8787",
+        "START_LOCAL_CHAT_SERVER": "true",
+    }
+    written, message = _write_env(REPO_ROOT / ".discord.env", env, force=args.force)
+    print(f"\n  {message}")
+    if written:
+        print("  Next:  ./run_discord_chatbot.sh")
+        print(f"  The bot will name itself '{handle}-mybot' in each server automatically.")
+    return {"ok": written, "platform": "discord", "bot_handle": handle}
+
+
+def _slack_validate(bot_token: str, app_token: str) -> str:
+    """Return '' if both tokens validate live, else a human error string."""
+    if bot_token.startswith("xapp-") or app_token.startswith("xoxb-"):
+        return "the two tokens look swapped — bot token is xoxb-..., app token is xapp-..."
+    _, body = _http_json(
+        "https://slack.com/api/auth.test", headers={"Authorization": f"Bearer {bot_token}"},
+        method="POST", data=b"",
+    )
+    if not (isinstance(body, dict) and body.get("ok")):
+        return f"Slack rejected the bot token ({(body or {}).get('error', 'invalid')})."
+    _, appbody = _http_json(
+        "https://slack.com/api/apps.connections.open", headers={"Authorization": f"Bearer {app_token}"},
+        method="POST", data=b"",
+    )
+    if not (isinstance(appbody, dict) and appbody.get("ok")):
+        return f"Slack rejected the app token ({(appbody or {}).get('error', 'invalid')}); needs Socket Mode + connections:write."
+    return ""
+
+
+def _slack_env(bot_token: str, app_token: str) -> dict[str, str]:
+    return {
+        "SLACK_BOT_TOKEN": bot_token, "SLACK_APP_TOKEN": app_token,
+        "SLACK_GROUP_SESSIONS": "true", "SLACK_OBSERVE_CHANNELS": "true",
+        "SLACK_USE_TRAJECTORY_MEMORY": "true", "CHATBOT_BASE_URL": "http://127.0.0.1:8787",
+        "START_LOCAL_CHAT_SERVER": "true",
+    }
+
+
+def _connect_slack(args: argparse.Namespace) -> dict[str, Any]:
+    handle = _suggested_bot_handle()
+    json_mode = getattr(args, "json", False)
+    if json_mode:
+        if not args.bot_token or not args.app_token:
+            return {"ok": False, "platform": "slack", "error": "both --bot-token (xoxb) and --app-token (xapp) are required"}
+        error = _slack_validate(args.bot_token, args.app_token)
+        if error:
+            return {"ok": False, "platform": "slack", "error": error}
+        written, message = _write_env(REPO_ROOT / ".slack.env", _slack_env(args.bot_token, args.app_token), force=args.force)
+        return {
+            "ok": written, "platform": "slack", "bot_handle": handle,
+            "bot_name": f"{handle}-mybot", "message": message,
+            **({} if written else {"error": message}),
+        }
+    print(f"""
+== Connect mybot to Slack (Socket Mode — no public URL needed) ==
+
+1. Open https://api.slack.com/apps  ->  Create New App  ->  From scratch.
+   Name it  '{handle}-mybot'  so teammates can tell whose bot is whose.
+2. Socket Mode -> enable. Generate an App-Level Token with scope
+   'connections:write'  -> copy it (starts with xapp-).
+3. OAuth & Permissions -> Bot Token Scopes, add:
+     app_mentions:read, chat:write, channels:history, groups:history,
+     im:history, mpim:history, channels:read, groups:read, users:read,
+     reactions:write
+   Then 'Install to Workspace' -> copy the Bot User OAuth Token (xoxb-).
+4. Event Subscriptions -> Subscribe to bot events:
+     message.channels, message.groups, message.im, message.mpim, app_mention
+5. Invite the bot to channels it should watch:  /invite @{handle}-mybot
+""".rstrip())
+    bot_token = _prompt("\nPaste the Bot User OAuth Token (xoxb-...): ", args.bot_token)
+    app_token = _prompt("Paste the App-Level Token (xapp-...): ", args.app_token)
+    if not bot_token or not app_token:
+        return {"ok": False, "error": "both the bot token (xoxb-) and app token (xapp-) are required"}
+    if bot_token.startswith("xapp-") or app_token.startswith("xoxb-"):
+        return {"ok": False, "error": "the two tokens look swapped — bot token is xoxb-..., app token is xapp-..."}
+
+    status, body = _http_json(
+        "https://slack.com/api/auth.test",
+        headers={"Authorization": f"Bearer {bot_token}"},
+        method="POST",
+        data=b"",
+    )
+    if not (isinstance(body, dict) and body.get("ok")):
+        err = (body or {}).get("error") if isinstance(body, dict) else f"status {status}"
+        return {"ok": False, "error": f"Slack rejected the bot token ({err}). Re-copy the Bot User OAuth Token after installing."}
+    print(f"  OK  bot token valid — '{body.get('user')}' in workspace '{body.get('team')}'.")
+
+    status, appbody = _http_json(
+        "https://slack.com/api/apps.connections.open",
+        headers={"Authorization": f"Bearer {app_token}"},
+        method="POST",
+        data=b"",
+    )
+    if not (isinstance(appbody, dict) and appbody.get("ok")):
+        err = (appbody or {}).get("error") if isinstance(appbody, dict) else f"status {status}"
+        return {"ok": False, "error": f"Slack rejected the app token ({err}). It needs Socket Mode + connections:write."}
+    print("  OK  app token valid — Socket Mode connection opens.")
+
+    env = {
+        "SLACK_BOT_TOKEN": bot_token,
+        "SLACK_APP_TOKEN": app_token,
+        "SLACK_GROUP_SESSIONS": "true",
+        "SLACK_OBSERVE_CHANNELS": "true",
+        "SLACK_USE_TRAJECTORY_MEMORY": "true",
+        "CHATBOT_BASE_URL": "http://127.0.0.1:8787",
+        "START_LOCAL_CHAT_SERVER": "true",
+    }
+    written, message = _write_env(REPO_ROOT / ".slack.env", env, force=args.force)
+    print(f"\n  {message}")
+    if written:
+        print("  Next:  ./run_slack_chatbot.sh")
+    return {"ok": written, "platform": "slack", "bot_handle": handle}
+
+
+def cmd_connect(args: argparse.Namespace) -> dict[str, Any]:
+    """Guided, validating setup for a chat platform. Interactive by default
+    (prints steps, prompts for tokens); --json validates + writes silently and
+    returns a JSON result (for the menu app); --status reports configured state
+    without network or writes."""
+    if getattr(args, "status", False):
+        return _connect_status(args.platform)
+    if args.platform == "discord":
+        return _connect_discord(args)
+    return _connect_slack(args)
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     sub = parser.add_subparsers(dest="command", required=True)
+
+    pc = sub.add_parser("connect", help="guided setup for Discord or Slack (validates tokens)")
+    pc.add_argument("platform", choices=["discord", "slack"])
+    pc.add_argument("--bot-token", default="", help="skip the prompt (Discord bot token / Slack xoxb token)")
+    pc.add_argument("--app-token", default="", help="Slack xapp app-level token")
+    pc.add_argument("--channels", default="", help="Discord: comma-separated channel IDs to allow")
+    pc.add_argument("--force", action="store_true", help="overwrite an existing .env file (backs it up)")
+    pc.add_argument("--json", action="store_true", help="non-interactive: validate+write, emit JSON (for the menu app)")
+    pc.add_argument("--status", action="store_true", help="report configured state as JSON (no network, no write)")
 
     sub.add_parser("state", help="dump index health, projects, and scope as JSON")
 
@@ -1004,12 +1288,19 @@ def main() -> None:
         "model": cmd_model,
         "capabilities": cmd_capabilities,
         "automated": cmd_automated,
+        "connect": cmd_connect,
     }
     try:
         result = handlers[args.command](args)
     except Exception as exc:  # surface as JSON so the app can show it
         print(json.dumps({"ok": False, "error": f"{type(exc).__name__}: {exc}"}))
         raise SystemExit(1)
+    # connect's interactive flow prints its own guidance; --json/--status emit a
+    # single JSON object like the other commands (consumed by the menu app).
+    if args.command == "connect" and not (getattr(args, "json", False) or getattr(args, "status", False)):
+        if not result.get("ok"):
+            print(f"\n  ✗ {result.get('error', 'setup did not complete')}")
+        raise SystemExit(0 if result.get("ok") else 1)
     print(json.dumps(result, default=str))
 
 

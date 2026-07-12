@@ -109,6 +109,9 @@ class BridgeConfig:
     # Record non-addressed messages from explicitly listed channels into the
     # channel session so the bot has context when it IS addressed.
     observe_channels: bool
+    # Set the per-guild nickname to '<handle>-mybot' so a team's instances are
+    # distinguishable in a shared server.
+    set_guild_nickname: bool
 
 
 @dataclass
@@ -136,6 +139,22 @@ class ChatRequestBuffer:
 class ChatbotApi:
     def __init__(self, config: BridgeConfig) -> None:
         self.config = config
+
+    async def fetch_bot_name(self) -> str:
+        """The instance's display name (e.g. 'alice-mybot') from /health, so the
+        bridge can name itself consistently in shared servers."""
+        def _get() -> str:
+            request = urllib.request.Request(
+                url=f"{self.config.chatbot_base_url.rstrip('/')}/health", method="GET"
+            )
+            try:
+                with urllib.request.urlopen(request, timeout=10) as response:
+                    parsed = json.loads(response.read().decode("utf-8"))
+            except (urllib.error.URLError, json.JSONDecodeError, OSError):
+                return ""
+            return str(parsed.get("bot_name") or "") if isinstance(parsed, dict) else ""
+
+        return await asyncio.to_thread(_get)
 
     def _post_json(self, path: str, payload: dict[str, Any]) -> dict[str, Any]:
         request = urllib.request.Request(
@@ -396,6 +415,31 @@ class DiscordBridgeClient(discord.Client):
     async def on_ready(self) -> None:
         assert self.user is not None
         log.info("logged in as %s (%s)", self.user, self.user.id)
+        await self._apply_bot_nickname()
+
+    async def on_guild_join(self, guild: discord.Guild) -> None:
+        await self._apply_bot_nickname(guilds=[guild])
+
+    async def _apply_bot_nickname(self, guilds: list[discord.Guild] | None = None) -> None:
+        """Name this instance '<handle>-mybot' in every server so a team running
+        many instances can tell whose bot is whose. Best-effort — needs the
+        Change Nickname permission; skipped silently if denied."""
+        if not self.config.set_guild_nickname:
+            return
+        name = await self.api.fetch_bot_name()
+        if not name:
+            return
+        for guild in (guilds if guilds is not None else list(self.guilds)):
+            member = guild.me
+            if member is None or member.nick == name:
+                continue
+            try:
+                await member.edit(nick=name)
+                log.info("set nickname %r in guild %s", name, guild.id)
+            except discord.Forbidden:
+                log.info("no permission to set nickname in guild %s (need Change Nickname)", guild.id)
+            except discord.HTTPException:
+                log.warning("failed to set nickname in guild %s", guild.id, exc_info=True)
 
     async def on_disconnect(self) -> None:
         log.warning("disconnected from Discord; waiting for reconnect (messages sent now are missed)")
@@ -1028,6 +1072,7 @@ def load_config(args: argparse.Namespace) -> BridgeConfig:
         message_coalesce_seconds=max(0.0, message_coalesce_seconds),
         group_sessions=env_bool("DISCORD_GROUP_SESSIONS", True),
         observe_channels=env_bool("DISCORD_OBSERVE_CHANNELS", True),
+        set_guild_nickname=env_bool("DISCORD_SET_GUILD_NICKNAME", True),
     )
 
 
