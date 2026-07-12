@@ -1,6 +1,7 @@
 .DS_Store
 .venv/
 .discord.env
+.slack.env
 .env
 .env.local
 config/sync_tokens.json
@@ -24,6 +25,7 @@ state/run/
 state/retrieval_budgets/
 state/people.json
 state/owner_identity.json
+state/session_pointers.json
 profiles/*/.mybot/
 backups/
 macapp/.build/

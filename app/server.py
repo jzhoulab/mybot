@@ -35,6 +35,7 @@ from sources.access import (
     normalize_visibility_mode,
     save_access_config,
 )
+from sources.common import derive_bot_handle, format_bot_name
 from sources.trajectory_lookup import (
     TrajectoryLookup,
     candidate_refs_from_memory,
@@ -366,6 +367,32 @@ def safe_session_key(user: str, requested: str | None = None, new_session: bool 
     return base
 
 
+def parse_iso(value: str) -> datetime | None:
+    try:
+        return datetime.fromisoformat(str(value or "").replace("Z", "+00:00"))
+    except ValueError:
+        return None
+
+
+def looks_like_followup(query: str, prev_user_turn: str = "") -> bool:
+    """Does this query lean on the prior conversation rather than stand alone?
+    True for deixis/continuation markers, very short queries, or ones that
+    share a distinctive anchor token with the previous user turn. Used to keep
+    genuine follow-ups in the same session while letting topic-shifts start
+    fresh."""
+    text = query or ""
+    if FOLLOWUP_QUERY_RE.search(text):
+        return True
+    tokens = query_tokens(text)
+    if len(tokens) <= 2:
+        return True
+    if prev_user_turn:
+        prev_anchors = {t for t in query_tokens(prev_user_turn) if len(t) >= 5}
+        if prev_anchors and prev_anchors & {t for t in tokens if len(t) >= 5}:
+            return True
+    return False
+
+
 def parse_memory_scope(raw: Any) -> str:
     value = normalize_text(str(raw or "private"), 32).lower()
     if value not in VALID_MEMORY_SCOPES:
@@ -450,11 +477,17 @@ class AppConfig:
     imported_owner_actor_id: str
     owner_display_name: str
     team_name: str
+    bot_name_template: str
+    bot_handle_override: str
     guest_owner_access: bool
     claude_bash_sandbox: bool
     session_tail_pairs: int
     compaction_trigger_message_count: int
     compaction_trigger_char_count: int
+    session_idle_rollover_seconds: float
+    session_topic_shift_seconds: float
+    group_context_window_seconds: float
+    group_observe_max_messages: int
     memory_match_limit: int
     trajectory_max_files_per_tool: int
     trajectory_sources: list[str]
@@ -506,9 +539,94 @@ class SessionStore:
         self.archived_dir = self.state_dir / "archived_sessions"
         self.sessions_dir.mkdir(parents=True, exist_ok=True)
         self.archived_dir.mkdir(parents=True, exist_ok=True)
+        self._pointers_path = self.state_dir / "session_pointers.json"
+        self._pointers_lock = threading.Lock()
 
     def session_path(self, session_key: str) -> Path:
         return self.sessions_dir / f"{slugify(session_key)}.jsonl"
+
+    # -- Session routing: a stable LOGICAL key (per DM / channel / menu) points
+    # at a rolling ACTIVE storage key. Idle conversations roll to a fresh active
+    # session so perpetual threads stop growing unbounded and topics stop
+    # bleeding, while a one-line carry-forward preserves continuity. --
+
+    def _load_pointers(self) -> dict[str, dict[str, Any]]:
+        try:
+            data = json.loads(self._pointers_path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            return {}
+        return data if isinstance(data, dict) else {}
+
+    def _save_pointers(self, pointers: dict[str, dict[str, Any]]) -> None:
+        try:
+            self._pointers_path.write_text(
+                json.dumps(pointers, indent=1, ensure_ascii=False, sort_keys=True), encoding="utf-8"
+            )
+        except OSError:
+            log.warning("session pointer write failed", exc_info=True)
+
+    def _carry_forward_from(self, active_key: str) -> str:
+        summary = (self.get_session_summary(active_key) or {}).get("summary") or ""
+        if summary:
+            return normalize_text(summary, 600)
+        # No summary yet — synthesize a crude gist from recent user turns.
+        turns = [
+            normalize_text(str(m.get("content") or ""), 160)
+            for m in self.load_messages(active_key, limit=6)
+            if m.get("role") == "user"
+        ]
+        return normalize_text(" / ".join(turns[-3:]), 600)
+
+    def resolve_active_session(
+        self, logical_key: str, *, idle_seconds: float | None, force_new: bool = False
+    ) -> tuple[str, str]:
+        """Map a logical key to its active storage key, rolling over when idle
+        (or when force_new). Returns (active_key, carry_forward)."""
+        logical = slugify(logical_key)
+        now = datetime.now(timezone.utc)
+        with self._pointers_lock:
+            pointers = self._load_pointers()
+            rec = dict(pointers.get(logical) or {})
+            active = str(rec.get("active_key") or logical_key)
+            carry = str(rec.get("carry_forward") or "")
+            last = parse_iso(str(rec.get("last_activity") or ""))
+            idle = (
+                idle_seconds is not None
+                and last is not None
+                and (now - last).total_seconds() > idle_seconds
+            )
+            if force_new:
+                # Explicit reset: fresh key, forget the carry-forward.
+                epoch = int(rec.get("epoch") or 0) + 1
+                active, carry = f"{logical_key}#e{epoch}", ""
+                rec = {"active_key": active, "epoch": epoch, "carry_forward": ""}
+            elif idle and bool(self.load_messages(active, limit=1)):
+                carry = self._carry_forward_from(active)
+                epoch = int(rec.get("epoch") or 0) + 1
+                active = f"{logical_key}#e{epoch}"
+                rec = {"active_key": active, "epoch": epoch, "carry_forward": carry}
+            rec["active_key"] = active
+            rec["last_activity"] = utc_now()
+            rec.setdefault("carry_forward", carry)
+            pointers[logical] = rec
+            self._save_pointers(pointers)
+        return active, carry
+
+    def touch_session(self, logical_key: str) -> None:
+        with self._pointers_lock:
+            pointers = self._load_pointers()
+            rec = pointers.get(slugify(logical_key))
+            if isinstance(rec, dict):
+                rec["last_activity"] = utc_now()
+                self._save_pointers(pointers)
+
+    def peek_active_key(self, logical_key: str) -> str:
+        """Current active storage key without rolling over (for pre-resolve
+        inspection, e.g. reading the last turn to judge a follow-up)."""
+        rec = self._load_pointers().get(slugify(logical_key))
+        if isinstance(rec, dict) and rec.get("active_key"):
+            return str(rec["active_key"])
+        return logical_key
 
     def _iter_entries(self, session_key: str) -> list[dict[str, Any]]:
         path = self.session_path(session_key)
@@ -1237,6 +1355,31 @@ class PersonRegistry:
                 )
         except OSError:
             log.warning("person registry write failed for actor %s", actor_id, exc_info=True)
+
+    def set_conversation_gist(self, *, actor_id: str, gist: str) -> None:
+        """Store the rolling gist of what this person and the bot have discussed,
+        so long-term continuity survives session rollover without living inside
+        the transcript. Best-effort."""
+        actor_id = normalize_text(actor_id, 128)
+        gist = normalize_text(gist, 900)
+        if not actor_id or not gist:
+            return
+        try:
+            with self._lock:
+                data = self._load()
+                record = data.get(actor_id)
+                if not isinstance(record, dict):
+                    record = {"first_seen": utc_now(), "chat_count": 0, "observed_count": 0}
+                record["conversation_gist"] = gist
+                record["gist_updated_at"] = utc_now()
+                data[actor_id] = record
+                self.path.parent.mkdir(parents=True, exist_ok=True)
+                self.path.write_text(
+                    json.dumps(data, indent=1, ensure_ascii=False, sort_keys=True),
+                    encoding="utf-8",
+                )
+        except OSError:
+            log.warning("person gist write failed for actor %s", actor_id, exc_info=True)
 
 
 class AppState:
@@ -2589,6 +2732,21 @@ class AppState:
         name = normalize_text(str(self.get_owner_identity().get("display_name") or ""), 80)
         return name or self.config.owner_display_name
 
+    def bot_handle(self) -> str:
+        """Short handle for naming this instance — from the discovered owner
+        identity so each teammate's bot is legible in a shared server."""
+        identity = self.get_owner_identity()
+        aliases = [str(a) for a in (identity.get("aliases") or []) if str(a).strip()]
+        return derive_bot_handle(
+            override=self.config.bot_handle_override,
+            aliases=aliases,
+            display_name=self.owner_name(),
+        )
+
+    def bot_name(self) -> str:
+        """Display name for this bot instance, e.g. 'alice-mybot'."""
+        return format_bot_name(self.config.bot_name_template, self.bot_handle())
+
     def investigate_owner_identity(self) -> dict[str, Any]:
         """Sherlock run: the agent deduces the owner's name/handles from the
         trajectories. Returns the parsed identity draft (not saved)."""
@@ -2760,6 +2918,9 @@ class AppState:
             if topics:
                 history_line += " Recent topics: " + "; ".join(topics)
             lines.append(history_line)
+        gist = normalize_text(str(record.get("conversation_gist") or ""), 700)
+        if gist:
+            lines.append(f"What you've discussed with them before: {gist}")
         return "\n".join(lines)
 
     def build_system_prompt(
@@ -2775,6 +2936,7 @@ class AppState:
         actor_display_name: str = "",
         channel_kind: str = "",
         channel_label: str = "",
+        carry_forward: str = "",
     ) -> tuple[str, list[dict[str, Any]], bool]:
         sections: list[str] = []
         workspace_prompt = self.workspace.render()
@@ -2827,6 +2989,14 @@ class AppState:
         session_summary_used = bool(session_summary)
         if session_summary:
             sections.append(f"## Session Summary\n{session_summary}")
+        elif carry_forward:
+            # This is a fresh session that rolled over from an idle one; the
+            # transcript is empty but continuity is worth keeping.
+            sections.append(
+                "## Continuing From Earlier\n"
+                "This is a new conversation, but here's the gist of what you were last discussing "
+                f"with this person (use only if they pick it back up):\n{carry_forward}"
+            )
 
         trajectory_allowed = self.can_use_local_trajectory_lookup(
             actor_id=actor_id,
@@ -2924,7 +3094,9 @@ class AppState:
             session_summary_used,
         )
 
-    def maybe_compact_session(self, *, session_key: str, user: str) -> dict[str, Any] | None:
+    def maybe_compact_session(
+        self, *, session_key: str, user: str, actor_id: str | None = None
+    ) -> dict[str, Any] | None:
         all_messages = self.sessions.load_messages(session_key, limit=None)
         if not all_messages:
             return None
@@ -2956,12 +3128,19 @@ class AppState:
         if not new_summary:
             return summary_state or None
 
-        return self.sessions.set_session_summary(
+        result = self.sessions.set_session_summary(
             session_key,
             user,
             summary=new_summary,
             compacted_message_count=compactable_count,
         )
+        # Promote the durable gist OUT of the (disposable, rollover-prone)
+        # transcript into the person's long-term record, so continuity survives
+        # session rollover. Single-actor sessions only — group summaries conflate
+        # multiple people.
+        if actor_id:
+            self.people.set_conversation_gist(actor_id=actor_id, gist=new_summary)
+        return result
 
 
 class ChatHandler(BaseHTTPRequestHandler):
@@ -2985,6 +3164,8 @@ class ChatHandler(BaseHTTPRequestHandler):
                     "provider_backend": active["backend"],
                     "active_model": active["model"],
                     "active_thinking": active["thinking"],
+                    "bot_name": self.server.state.bot_name(),
+                    "bot_handle": self.server.state.bot_handle(),
                     "model_base_url": cfg.model_base_url,
                     "model_name": cfg.model_name,
                     "model_api_style": cfg.model_api_style,
@@ -3214,19 +3395,53 @@ class ChatHandler(BaseHTTPRequestHandler):
             # several people talk to the bot in the same conversation.
             message = f"[{author_label}] {message}"
 
-        session_key = safe_session_key(
+        sessions = self.server.state.sessions
+        config = self.server.state.config
+        is_group = channel_kind == "group"
+        # Stable logical key per surface; the router maps it to a rolling active
+        # storage key (idle rollover). Freshness is the router's job now, so we
+        # don't append a timestamp here.
+        logical_key = safe_session_key(
             user=user,
             requested=str(body["session_key"]) if body.get("session_key") else None,
-            new_session=coerce_bool(body.get("new_session")),
+            new_session=False,
         )
+        force_new = coerce_bool(body.get("new_session"))
+        if is_group:
+            # Channels are ongoing; don't roll them on idle — the recent-window
+            # filter below bounds context instead.
+            idle_seconds: float | None = None
+        else:
+            prev_active = sessions.peek_active_key(logical_key)
+            last_user_turn = ""
+            for entry in reversed(sessions.load_messages(prev_active, limit=8)):
+                if entry.get("role") == "user":
+                    last_user_turn = str(entry.get("content") or "")
+                    break
+            followup = looks_like_followup(raw_message, last_user_turn)
+            idle_seconds = (
+                config.session_idle_rollover_seconds if followup else config.session_topic_shift_seconds
+            )
+        session_key, carry_forward = sessions.resolve_active_session(
+            logical_key, idle_seconds=idle_seconds, force_new=force_new
+        )
+
         use_memory = coerce_bool(body.get("use_trajectory_memory"), True)
-        all_messages = self.server.state.sessions.load_messages(session_key, limit=None)
-        summary_state = self.server.state.sessions.get_session_summary(session_key) or {}
-        summary_text = str(summary_state.get("summary") or "")
+        all_messages = sessions.load_messages(session_key, limit=None)
+        summary_state = sessions.get_session_summary(session_key) or {}
+        # Group sessions blend many people's parallel threads; a rolling summary
+        # of that conflates them, so groups rely on the recent window only.
+        summary_text = "" if is_group else str(summary_state.get("summary") or "")
         compacted_message_count = int(summary_state.get("compacted_message_count") or 0)
-        visible_messages = all_messages[compacted_message_count:]
-        if self.server.state.config.history_max_messages:
-            visible_messages = visible_messages[-self.server.state.config.history_max_messages :]
+        visible_messages = all_messages if is_group else all_messages[compacted_message_count:]
+        if is_group and config.group_context_window_seconds > 0:
+            cutoff = datetime.now(timezone.utc).timestamp() - config.group_context_window_seconds
+            visible_messages = [
+                entry for entry in visible_messages
+                if (parse_iso(str(entry.get("timestamp") or "")) or datetime.now(timezone.utc)).timestamp() >= cutoff
+            ]
+        if config.history_max_messages:
+            visible_messages = visible_messages[-config.history_max_messages :]
 
         history_for_model: list[dict[str, Any]] = []
         total_chars = 0
@@ -3250,6 +3465,7 @@ class ChatHandler(BaseHTTPRequestHandler):
                 actor_display_name=actor_display_name,
                 channel_kind=channel_kind,
                 channel_label=channel_label,
+                carry_forward=carry_forward if not summary_text else "",
             )
         except ValueError as exc:
             return None, (400, str(exc))
@@ -3271,7 +3487,7 @@ class ChatHandler(BaseHTTPRequestHandler):
         return {
             "message": message, "raw_message": raw_message, "user": user, "actor_id": actor_id,
             "actor_display_name": actor_display_name, "channel_kind": channel_kind,
-            "channel_label": channel_label,
+            "channel_label": channel_label, "logical_key": logical_key, "is_group": is_group,
             "memory_scope": memory_scope, "target_user_id": target_user_id,
             "session_key": session_key, "use_memory": use_memory,
             "history_for_model": history_for_model, "system_prompt": system_prompt,
@@ -3360,16 +3576,23 @@ class ChatHandler(BaseHTTPRequestHandler):
             channel_label=ctx.get("channel_label", "") or session_key,
             topic=ctx.get("raw_message", ctx["message"]),
         )
+        # Keep the logical session's idle clock fresh (the router uses it to
+        # decide the next rollover).
+        self.server.state.sessions.touch_session(ctx.get("logical_key") or session_key)
 
         try:
-            self.server.state.maybe_compact_session(session_key=session_key, user=user)
+            self.server.state.maybe_compact_session(
+                session_key=session_key,
+                user=user,
+                actor_id=None if ctx.get("is_group") else actor_id,
+            )
         except RuntimeError as exc:
             print(f"Session compaction failed for {session_key}: {exc}")
 
         return_sources = coerce_bool(body.get("return_sources"), True)
         payload: dict[str, Any] = {
             "ok": True,
-            "session_key": session_key,
+            "session_key": ctx.get("logical_key") or session_key,
             "text": answer,
             "provider_backend": self.server.state.config.provider_backend,
             "backend_session_id": backend_session_id,
@@ -4040,6 +4263,12 @@ class ChatHandler(BaseHTTPRequestHandler):
             str(body.get("author_label") or body.get("actor_display_name") or ""), 80
         )
         content = f"[{author_label}] {message}" if author_label else message
+        # Rotate the observe log before it grows unbounded. Deep channel history
+        # is not the durable memory (person registry + !remember are), so the
+        # old transcript is archived and observation continues in a fresh file.
+        cap = self.server.state.config.group_observe_max_messages
+        if cap > 0 and len(self.server.state.sessions.load_messages(session_key, limit=cap + 1)) > cap:
+            self.server.state.sessions.archive_session(session_key)
         self.server.state.sessions.append_message(
             session_key, user, "user", content,
             meta={"source": "observed", "actor_id": actor_id},
@@ -4068,15 +4297,21 @@ class ChatHandler(BaseHTTPRequestHandler):
         )
 
     def handle_session_reset(self, body: dict[str, Any]) -> None:
-        session_key = safe_session_key(
+        logical_key = safe_session_key(
             user=str(body.get("user") or DEFAULT_SESSION_MAIN_KEY),
             requested=str(body["session_key"]) if body.get("session_key") else None,
         )
-        archived_path = self.server.state.sessions.archive_session(session_key)
+        sessions = self.server.state.sessions
+        # Archive whatever's active, then force the router to a fresh session so
+        # the next turn starts clean (no carry-forward — an explicit reset means
+        # "forget this").
+        active_key = sessions.peek_active_key(logical_key)
+        archived_path = sessions.archive_session(active_key)
+        sessions.resolve_active_session(logical_key, idle_seconds=None, force_new=True)
         if archived_path is None:
-            self.respond_json(404, {"ok": False, "error": "session not found"})
+            self.respond_json(200, {"ok": True, "session_key": logical_key, "already_empty": True})
             return
-        self.respond_json(200, {"ok": True, "session_key": session_key, "archived_path": archived_path})
+        self.respond_json(200, {"ok": True, "session_key": logical_key, "archived_path": archived_path})
 
     def read_json_body(self) -> dict[str, Any]:
         length = self.headers.get("Content-Length")
@@ -4223,11 +4458,23 @@ def load_config(args: argparse.Namespace) -> AppConfig:
         imported_owner_actor_id=os.environ.get("MEMORY_IMPORTED_OWNER_ID", "local-owner"),
         owner_display_name=os.environ.get("OWNER_DISPLAY_NAME", "").strip(),
         team_name=os.environ.get("TEAM_NAME", "").strip(),
+        bot_name_template=os.environ.get("BOT_NAME_TEMPLATE", "{handle}-mybot").strip() or "{handle}-mybot",
+        bot_handle_override=os.environ.get("BOT_HANDLE", "").strip(),
         guest_owner_access=coerce_bool(os.environ.get("GUEST_OWNER_ACCESS"), True),
         claude_bash_sandbox=coerce_bool(os.environ.get("CLAUDE_BASH_SANDBOX"), True),
         session_tail_pairs=session_tail_pairs,
         compaction_trigger_message_count=int(os.environ.get("COMPACTION_TRIGGER_MESSAGES", "40")),
         compaction_trigger_char_count=int(os.environ.get("COMPACTION_TRIGGER_CHARS", "16000")),
+        # A conversation idle past this rolls to a fresh session (continuity kept
+        # via a one-line carry-forward). Follow-up queries tolerate the full idle
+        # window; a topic-shift after the shorter grace period rolls immediately.
+        session_idle_rollover_seconds=float(os.environ.get("SESSION_IDLE_ROLLOVER_SECONDS", "21600")),  # 6h
+        session_topic_shift_seconds=float(os.environ.get("SESSION_TOPIC_SHIFT_SECONDS", "900")),  # 15m
+        # Group channels: only the last window of chatter is loaded as context,
+        # and the observe log rotates past this many messages (deep history is
+        # not the durable memory — the person registry + !remember are).
+        group_context_window_seconds=float(os.environ.get("GROUP_CONTEXT_WINDOW_SECONDS", "43200")),  # 12h
+        group_observe_max_messages=int(os.environ.get("GROUP_OBSERVE_MAX_MESSAGES", "400")),
         memory_match_limit=int(os.environ.get("MEMORY_MATCH_LIMIT", "5")),
         trajectory_max_files_per_tool=int(os.environ.get("TRAJECTORY_MAX_FILES_PER_TOOL", "200")),
         trajectory_sources=[name.strip().lower() for name in os.environ.get("TRAJECTORY_SOURCES", "codex,claude").split(",") if name.strip()],

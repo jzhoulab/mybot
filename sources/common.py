@@ -89,6 +89,39 @@ def recent_files(patterns: list[str], limit: int) -> list[str]:
     return files[:limit]
 
 
+BOT_HANDLE_RE = re.compile(r"^[a-z0-9][a-z0-9._-]{1,19}$")
+
+
+def derive_bot_handle(*, override: str = "", aliases: list[str] | None = None, display_name: str = "") -> str:
+    """A short, legible handle for naming the bot instance (<handle>-mybot), so a
+    team can tell whose bot is whose in a shared server/workspace. Prefer an
+    explicit override, else the shortest username-like alias the identity
+    discovered (e.g. 'alice'), else a slug of the display name."""
+    override = (override or "").strip().lower()
+    if override:
+        slug = re.sub(r"[^a-z0-9._-]+", "-", override).strip("-._")
+        if slug:
+            return slug[:20]
+    candidates = [
+        alias.strip().lower()
+        for alias in (aliases or [])
+        if BOT_HANDLE_RE.match(alias.strip().lower())
+    ]
+    if candidates:
+        return min(candidates, key=lambda handle: (len(handle), handle))
+    slug = re.sub(r"[^a-z0-9]+", "-", (display_name or "").lower()).strip("-")
+    return slug[:20] or "owner"
+
+
+def format_bot_name(template: str, handle: str) -> str:
+    template = template or "{handle}-mybot"
+    try:
+        name = template.format(handle=handle)
+    except (KeyError, IndexError, ValueError):
+        name = f"{handle}-mybot"
+    return name.strip()[:32] or f"{handle}-mybot"
+
+
 def is_human_title(title: str) -> bool:
     if not title:
         return False
