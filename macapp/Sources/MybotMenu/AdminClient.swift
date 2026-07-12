@@ -81,4 +81,17 @@ struct AdminClient {
     func setModel(_ presetId: String) -> Result {
         run(["model", "--action", "set", "--preset", presetId])
     }
+
+    /// Whether a platform is configured (env file + token), no network.
+    func connectStatus(_ platform: String) -> Result {
+        run(["connect", platform, "--status"])
+    }
+
+    /// Validate pasted tokens live and write the env file. Networked → allow time.
+    func connect(_ platform: String, botToken: String, appToken: String, channels: String) -> Result {
+        var args = ["connect", platform, "--json", "--force", "--bot-token", botToken]
+        if !appToken.isEmpty { args += ["--app-token", appToken] }
+        if !channels.isEmpty { args += ["--channels", channels] }
+        return run(args, timeout: 30)
+    }
 }

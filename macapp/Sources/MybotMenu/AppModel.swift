@@ -66,6 +66,13 @@ final class AppModel: ObservableObject {
     @Published var ownerConfirmed = false
     @Published var identityInvestigating = false
 
+    // Chat-platform connections (Connections card).
+    @Published var discordConfigured = false
+    @Published var slackConfigured = false
+    @Published var connecting = false
+    @Published var connectMessage = ""      // last connect result (success or error)
+    @Published var connectOk = false
+
     @Published var search = ""
     @Published var sourceFilter = "all"
     @Published var statusFilter: StatusFilter = .included
@@ -96,6 +103,7 @@ final class AppModel: ObservableObject {
         reload()
         loadModelPresets()
         refreshIdentity()
+        refreshConnections()
         timer = Timer.scheduledTimer(withTimeInterval: 15, repeats: true) { [weak self] _ in
             Task { @MainActor in
                 guard let self, self.busyMessage == nil else { return }  // don't shift numbers mid-op
@@ -143,6 +151,44 @@ final class AppModel: ObservableObject {
         }
     }
 
+    // MARK: connections
+
+    func refreshConnections() {
+        let admin = AdminClient(config: config)
+        DispatchQueue.global(qos: .utility).async {
+            let d = admin.connectStatus("discord")
+            let s = admin.connectStatus("slack")
+            DispatchQueue.main.async {
+                self.discordConfigured = (d.json["configured"] as? Bool) ?? false
+                self.slackConfigured = (s.json["configured"] as? Bool) ?? false
+            }
+        }
+    }
+
+    /// Validate pasted tokens and write the env file. `channels` is Discord-only;
+    /// `appToken` is Slack-only.
+    func connectPlatform(_ platform: String, botToken: String, appToken: String, channels: String) {
+        connecting = true
+        connectMessage = ""
+        let admin = AdminClient(config: config)
+        DispatchQueue.global(qos: .userInitiated).async {
+            let r = admin.connect(platform, botToken: botToken, appToken: appToken, channels: channels)
+            DispatchQueue.main.async {
+                self.connecting = false
+                self.connectOk = r.ok
+                if r.ok {
+                    let name = (r.json["bot_name"] as? String) ?? "your bot"
+                    self.connectMessage = "Connected as \(name). Start it with run_\(platform)_chatbot.sh."
+                    if platform == "discord" { self.discordConfigured = true }
+                    if platform == "slack" { self.slackConfigured = true }
+                } else {
+                    self.connectMessage = (r.json["error"] as? String)
+                        ?? (r.stderr.isEmpty ? "connection failed" : r.stderr)
+                }
+            }
+        }
+    }
+
     /// Static sample data for offline UI rendering / previews (no I/O, no timer).
     static func sample() -> AppModel {
         let model = AppModel()
@@ -168,7 +214,9 @@ final class AppModel: ObservableObject {
         model.newProjects = [NewProject(source: "codex", cwd: "/Users/you/Code/newapp", sessions: 4)]
         model.ownerName = "Ada Lovelace"
         model.ownerAliases = ["alice", "alice"]
-        model.ownerConfirmed = false
+        model.ownerConfirmed = true
+        model.discordConfigured = true
+        model.slackConfigured = false
         return model
     }
 
@@ -401,8 +449,21 @@ final class AppModel: ObservableObject {
     }
 
     func reviewProject(_ project: NewProject, decision: String) {
-        runAction("\(decision == "exclude" ? "Excluding" : "Keeping") \(project.displayName)…") {
-            $0.review(source: project.source, cwd: project.cwd, decision: decision)
+        // Optimistic: drop the card from the pending list instantly so the click
+        // feels immediate. The backend write + reindex (a Python subprocess) run
+        // quietly in the background — no full-panel busy overlay for a one-tap
+        // review. reload() reconciles afterward.
+        newProjects.removeAll { $0.id == project.id }
+        let admin = AdminClient(config: config)
+        DispatchQueue.global(qos: .userInitiated).async {
+            let result = admin.review(source: project.source, cwd: project.cwd, decision: decision)
+            DispatchQueue.main.async {
+                if !result.ok {
+                    self.lastError = (result.json["error"] as? String)
+                        ?? (result.stderr.isEmpty ? "review failed" : result.stderr)
+                }
+                self.reload()
+            }
         }
     }
 

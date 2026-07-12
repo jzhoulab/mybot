@@ -170,6 +170,100 @@ private struct IdentityConfirmCard: View {
     }
 }
 
+/// Collapsible "Connections" card: shows Discord/Slack configured status and,
+/// on expand, lets the owner paste tokens and connect (validated live via the
+/// connect doctor's --json mode). Collapsed by default — a slim status bar.
+private struct ConnectionsCard: View {
+    @ObservedObject var model: AppModel
+    @State private var expanded = false
+    @State private var openForm = ""           // which platform's form is showing
+    @State private var botToken = ""
+    @State private var appToken = ""
+    @State private var channels = ""
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 0) {
+            Button { withAnimation(.easeOut(duration: 0.15)) { expanded.toggle() } } label: {
+                HStack(spacing: 8) {
+                    Image(systemName: "link").font(.system(size: 11, weight: .semibold)).foregroundStyle(.secondary)
+                    Text("Connections").font(.system(size: 11.5, weight: .semibold))
+                    Spacer()
+                    statusDot(model.discordConfigured); Text("Discord").font(.system(size: 10)).foregroundStyle(.secondary)
+                    statusDot(model.slackConfigured); Text("Slack").font(.system(size: 10)).foregroundStyle(.secondary)
+                    Image(systemName: expanded ? "chevron.down" : "chevron.right")
+                        .font(.system(size: 9, weight: .semibold)).foregroundStyle(.secondary)
+                }
+                .contentShape(Rectangle())
+            }
+            .buttonStyle(.plain)
+            if expanded {
+                platformRow("discord", "Discord", configured: model.discordConfigured)
+                Divider().opacity(0.3).padding(.vertical, 2)
+                platformRow("slack", "Slack", configured: model.slackConfigured)
+                if !model.connectMessage.isEmpty {
+                    Text(model.connectMessage)
+                        .font(.system(size: 10.5))
+                        .foregroundStyle(model.connectOk ? Palette.good : Palette.bad)
+                        .padding(.top, 6)
+                }
+            }
+        }
+        .padding(10)
+        .background(RoundedRectangle(cornerRadius: 11, style: .continuous).fill(Color.primary.opacity(0.04)))
+        .padding(.horizontal, 12).padding(.top, 4)
+    }
+
+    private func statusDot(_ ok: Bool) -> some View {
+        Circle().fill(ok ? Palette.good : Color.secondary.opacity(0.4)).frame(width: 6, height: 6)
+    }
+
+    @ViewBuilder private func platformRow(_ platform: String, _ title: String, configured: Bool) -> some View {
+        VStack(alignment: .leading, spacing: 6) {
+            HStack(spacing: 8) {
+                statusDot(configured)
+                Text(title).font(.system(size: 12, weight: .semibold))
+                Text(configured ? "connected" : "not connected")
+                    .font(.system(size: 10)).foregroundStyle(.secondary)
+                Spacer()
+                Button(openForm == platform ? "Cancel" : (configured ? "Reconfigure" : "Set up")) {
+                    withAnimation(.easeOut(duration: 0.12)) {
+                        openForm = openForm == platform ? "" : platform
+                        botToken = ""; appToken = ""; channels = ""; model.connectMessage = ""
+                    }
+                }
+                .buttonStyle(.plain).font(.system(size: 11, weight: .semibold)).foregroundStyle(Palette.accent)
+            }
+            if openForm == platform {
+                if platform == "discord" {
+                    SecureField("Bot token", text: $botToken).textFieldStyle(.roundedBorder).font(.system(size: 11))
+                    TextField("Channel IDs (optional, comma-separated)", text: $channels)
+                        .textFieldStyle(.roundedBorder).font(.system(size: 11))
+                } else {
+                    SecureField("Bot token (xoxb-…)", text: $botToken).textFieldStyle(.roundedBorder).font(.system(size: 11))
+                    SecureField("App token (xapp-…)", text: $appToken).textFieldStyle(.roundedBorder).font(.system(size: 11))
+                }
+                HStack(spacing: 8) {
+                    Text("Create the app first — see .\(platform).env.example for the exact steps.")
+                        .font(.system(size: 9.5)).foregroundStyle(.secondary)
+                    Spacer()
+                    if model.connecting {
+                        ProgressView().controlSize(.small)
+                    } else {
+                        Button("Connect") {
+                            model.connectPlatform(platform, botToken: botToken, appToken: appToken, channels: channels)
+                        }
+                        .buttonStyle(.plain).font(.system(size: 11, weight: .semibold))
+                        .padding(.horizontal, 12).padding(.vertical, 5)
+                        .background(Capsule().fill(Palette.accent)).foregroundStyle(.white)
+                        .disabled(botToken.isEmpty || (platform == "slack" && appToken.isEmpty))
+                    }
+                }
+            }
+        }
+        .padding(.top, 6)
+    }
+}
+
 // MARK: - Root
 
 struct ContentView: View {
@@ -191,6 +285,7 @@ struct ContentView: View {
                         AskView(model: model)
                     } else {
                         controls
+                        if !model.selecting { ConnectionsCard(model: model) }
                         projectScroll
                         if model.selecting {
                             batchBar
