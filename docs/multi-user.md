@@ -70,15 +70,87 @@ person returns, on any channel. Guests can also build their own long-term memory
   allowlist = reply anywhere, observe nowhere).
 - Raw `<@id>` mentions are resolved to `@DisplayName` before storage.
 
-## Slack later
+## Connecting a chat platform (guided setup)
 
-The server API is transport-neutral: a Slack bridge only needs to map
-`slack_user_id → actor_id`, `channel → session_key`/`channel_label`, send
-`actor_display_name`, call `/sessions/observe` for non-addressed channel messages,
-and `/chat` when addressed. One caveat to solve then: `!ask @owner` should map the
-Slack mention format, and the owner's `actor_id` will differ per transport — either
-give the owner a canonical actor id at import time (current setup uses the Discord
-id) or add an alias map in config.
+The Discord/Slack app setup is fiddly, so there's a validating doctor:
+
+```
+python scripts/mybot_admin.py connect discord   # or: connect slack
+```
+
+It prints the exact click-path, takes the pasted token(s), **validates them
+live** (Discord `GET /users/@me`; Slack `auth.test` + `apps.connections.open`),
+writes `.discord.env` / `.slack.env` (0600; won't clobber without `--force`,
+which backs up first), and prints the next command. Non-interactive:
+`--bot-token`, `--app-token`, `--channels`, `--force`.
+
+## Naming: `<handle>-mybot`
+
+Each teammate runs their own instance, so in a shared server they must be
+distinguishable. The convention is **`<owner-handle>-mybot`** (e.g.
+`alice-mybot`), derived from the discovered owner identity (shortest
+username-like alias, else a display-name slug). `/health` exposes `bot_name` /
+`bot_handle`; the Discord bridge auto-sets its per-guild nickname to it on ready
+(`DISCORD_SET_GUILD_NICKNAME`, needs the Change Nickname permission). Slack can't
+rename at runtime, so the doctor prefills `<handle>-mybot` as the app name at
+creation. Override with `BOT_HANDLE` or reshape with `BOT_NAME_TEMPLATE`
+(default `{handle}-mybot`).
+
+## Context management
+
+Conversation context is a short, disposable working set; durable memory lives in
+the trajectory index, the person registry, and promoted `!remember` notes. The two
+are kept separate so sessions can reset without losing continuity.
+
+- **Session routing** (`SessionStore.resolve_active_session`): a stable *logical*
+  key per surface (DM / channel / thread / `menuapp`) points at a rolling *active*
+  storage key via `state/session_pointers.json`. When a conversation goes idle the
+  active session rolls over to a fresh one, and a one-line **carry-forward** (the
+  prior summary, or a gist of recent turns) seeds the new session so continuity
+  survives (`## Continuing From Earlier` in the prompt).
+- **Idle vs topic-shift** (DM/menu): a follow-up query tolerates the full idle
+  window (`SESSION_IDLE_ROLLOVER_SECONDS`, 6h); a topic-shift (not a follow-up by
+  `looks_like_followup`) rolls after the shorter grace period
+  (`SESSION_TOPIC_SHIFT_SECONDS`, 15m). So rapid multi-part questions cohere, but an
+  unrelated question after a break starts clean. This replaces the old perpetual
+  `menuapp` blob.
+- **Threads get their own session** on every surface (Discord threads, Slack
+  `thread_ts`), which is the natural conversation atom.
+- **Durable promotion**: on compaction, single-actor sessions promote the rolling
+  gist into the person registry (`conversation_gist`), surfaced next time as "What
+  you've discussed with them before". Long-term memory no longer depends on an
+  unbounded transcript.
+- **Group channels stay bounded**: no idle rollover (channels are ongoing), no
+  rolling summary (it would conflate parallel threads) — only the last
+  `GROUP_CONTEXT_WINDOW_SECONDS` (12h) of messages is loaded, and the observe log
+  rotates past `GROUP_OBSERVE_MAX_MESSAGES` (400). Deep channel history is not the
+  durable memory.
+
+## Slack
+
+Built as a Socket Mode bridge (`app/slack_bridge.py`, launcher
+`run_slack_chatbot.sh`, tokens in `.slack.env` — see `.slack.env.example`). It is a
+transport-neutral twin of the Discord bridge and needs **no server changes**:
+
+- `slack_user_id → actor_id`; `slack-user-<id>` user key.
+- DM → `slack-dm-user-<id>`; channel → `slack-<team>-channel-<id>`; thread →
+  `slack-<team>-thread-<thread_ts>` (thread-as-session). Channel replies post in a
+  thread to keep channels tidy.
+- `channel_kind` = `dm` for IMs, `group` for channels/groups/mpim; `channel_label`
+  from `conversations.info`; `actor_display_name` from `users_info` (both cached).
+- Addressed (DM, or bot mentioned) → `/chat`; otherwise non-addressed channel
+  messages → `/sessions/observe` (when `SLACK_OBSERVE_CHANNELS=true`). `<@id>`
+  mentions resolve to `@Name`; the bot's own mention is stripped.
+- Commands mirror Discord: `!iam <name>`, `!remember`, `!remember-shared`,
+  `!new`/`!reset`. An `eyes` reaction acknowledges receipt while the answer runs.
+- Runs `App(bot_token)` + `SocketModeHandler(app_token)` — no public URL. The
+  launcher shares the chat server (won't start a second one if healthy) and uses its
+  own single-instance lock, so Discord and Slack can run side by side.
+
+Caveat still open (both transports): the owner's `actor_id` differs per platform
+(Discord id today). To make the SAME human the owner on Slack, either set
+`MEMORY_IMPORTED_OWNER_ID` to their Slack id for the Slack install or add an
+actor-alias map — otherwise a Slack owner is treated as a teammate.
 
 ## New/changed endpoints & fields
 
