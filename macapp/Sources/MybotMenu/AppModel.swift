@@ -45,7 +45,11 @@ final class AppModel: ObservableObject {
     /// True while the index is being rewritten under us (read failed or looked
     /// wiped). We keep showing the last good snapshot instead of zeros.
     @Published var indexBusy = false
-    private var suspectEmptyReads = 0
+    // When the index read comes back degraded (mid-update), we hold the last
+    // good snapshot rather than flashing 0. This marks how long it's been
+    // degraded so a genuine wipe eventually reflects instead of holding forever.
+    private var degradedSince: Date?
+    private let maxDegradedHoldSeconds: TimeInterval = 180
 
     // ---- ask (search + chat) ----
     enum Mode { case projects, ask }
@@ -293,17 +297,24 @@ final class AppModel: ObservableObject {
                 self.holdSnapshotWhileBusy()  // db locked mid-rebuild
                 return
             }
-            // A suddenly-empty index while we had data is almost always a
-            // rebuild in flight, not a real wipe. Hold a few reads before
-            // believing it.
-            let hadData = DispatchQueue.main.sync { self.health.totalChunks > 0 }
-            if snapshot.total == 0 && hadData {
-                var giveUp = false
-                DispatchQueue.main.sync {
-                    self.suspectEmptyReads += 1
-                    giveUp = self.suspectEmptyReads > 3
+            // The index is mid-update when a read comes back degraded versus what
+            // we last had good: either emptied (total 0), or its embeddings
+            // dropped to 0 while chunks remain — a rebuild re-inserts chunks
+            // before re-embedding them. In either case hold the last good
+            // snapshot and show the "updating" hint instead of flashing 0. Only
+            // accept the degraded numbers if they persist past a long bound (a
+            // real wipe, not a transient rebuild).
+            let (hadChunks, hadEmbeddings) = DispatchQueue.main.sync {
+                (self.health.totalChunks > 0, self.health.embeddedChunks > 0)
+            }
+            let degraded = (snapshot.total == 0 && hadChunks)
+                || (snapshot.total > 0 && snapshot.embedded == 0 && hadEmbeddings)
+            if degraded {
+                let keepHolding: Bool = DispatchQueue.main.sync {
+                    if self.degradedSince == nil { self.degradedSince = Date() }
+                    return Date().timeIntervalSince(self.degradedSince ?? Date()) < self.maxDegradedHoldSeconds
                 }
-                if !giveUp {
+                if keepHolding {
                     self.holdSnapshotWhileBusy()
                     return
                 }
@@ -362,7 +373,7 @@ final class AppModel: ObservableObject {
                 self.clusters = clusters
                 self.currentModelId = modelId
                 self.indexBusy = false
-                self.suspectEmptyReads = 0
+                self.degradedSince = nil
                 self.renderIcon()
             }
         }
@@ -493,7 +504,6 @@ final class AppModel: ObservableObject {
         }
     }
 
-    func openControlRoom() { NSWorkspace.shared.open(config.guiURL) }
 
     func setModel(_ preset: ModelPreset) {
         guard preset.id != currentModelId else { return }
@@ -589,6 +599,14 @@ final class AppModel: ObservableObject {
     }
 
     // ---- session drill-down -----------------------------------------------
+    /// Inspect a pending-review project's sessions before deciding. New projects
+    /// are already indexed (detection diffs indexed projects against a baseline),
+    /// so the normal index-backed detail view works.
+    func openNewProject(_ np: NewProject) {
+        openDetail(Project(source: np.source, cwd: np.cwd, sessions: np.sessions,
+                           chunks: 0, updatedAt: "", included: false))
+    }
+
     func openDetail(_ project: Project) {
         detail = project
         sessions = []

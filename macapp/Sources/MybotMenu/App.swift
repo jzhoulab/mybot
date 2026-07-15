@@ -41,9 +41,11 @@ private enum Palette {
     // Drawn from the bunny icon: crisp neutrals carry the UI, ONE confident
     // teal-blue (the icon's gradient) marks everything interactive, and status
     // hues stay small — dots, icons, and single words, never colored slabs.
-    static let iconTeal = Color(red: 0.36, green: 0.80, blue: 0.72)   // icon gradient start
-    static let iconBlue = Color(red: 0.22, green: 0.58, blue: 0.86)   // icon gradient end
-    static let accent   = Color(red: 0.14, green: 0.55, blue: 0.71)   // the gradient, deepened for text/controls
+    static let iconTeal = Color(red: 0.20, green: 0.84, blue: 0.76)   // icon gradient start (vivid)
+    static let iconBlue = Color(red: 0.12, green: 0.56, blue: 0.94)   // icon gradient end (vivid)
+    // A saturated teal-blue, not a greyed-down one — deepening it for contrast
+    // shouldn't leave it dull.
+    static let accent   = Color(red: 0.03, green: 0.58, blue: 0.90)   // the gradient, for text/controls
     static var brandGradient: LinearGradient {
         LinearGradient(colors: [iconTeal, iconBlue], startPoint: .topLeading, endPoint: .bottomTrailing)
     }
@@ -280,12 +282,12 @@ struct ContentView: View {
                 } else if let project = model.detail {
                     SessionDetail(model: model, project: project)
                 } else {
+                    if !model.selecting { ConnectionsCard(model: model) }
                     modeTabs
                     if model.mode == .ask {
                         AskView(model: model)
                     } else {
                         controls
-                        if !model.selecting { ConnectionsCard(model: model) }
                         projectScroll
                         if model.selecting {
                             batchBar
@@ -487,9 +489,18 @@ struct ContentView: View {
             }
             ForEach(model.newProjects.prefix(3)) { np in
                 HStack(spacing: 8) {
-                    SourceTag(source: np.source)
-                    Text(np.displayName).font(.system(size: 11.5, weight: .medium)).lineLimit(1)
-                    Text("· \(np.sessions) sess").font(.system(size: 10)).foregroundStyle(.secondary)
+                    // Tap the project to inspect its sessions before deciding.
+                    Button { model.openNewProject(np) } label: {
+                        HStack(spacing: 8) {
+                            SourceTag(source: np.source)
+                            Text(np.displayName).font(.system(size: 11.5, weight: .medium)).lineLimit(1)
+                            Text("· \(np.sessions) sess").font(.system(size: 10)).foregroundStyle(.secondary)
+                            Image(systemName: "chevron.right").font(.system(size: 9, weight: .semibold))
+                                .foregroundStyle(.secondary.opacity(0.6))
+                        }
+                        .contentShape(Rectangle())
+                    }
+                    .buttonStyle(.plain)
                     Spacer()
                     Button("Keep") { model.reviewProject(np, decision: "keep") }
                         .buttonStyle(.plain).font(.system(size: 11, weight: .semibold)).foregroundStyle(Palette.accent)
@@ -633,9 +644,6 @@ struct ContentView: View {
             }
             .menuStyle(.borderlessButton).fixedSize()
             .disabled(model.busyMessage != nil)
-
-            Button { model.openControlRoom() } label: { chipLabel("Web UI", "safari.fill") }
-                .buttonStyle(.plain)
 
             modelMenu
 
@@ -899,6 +907,75 @@ struct SessionRow: View {
 struct TrajectoryView: View {
     @ObservedObject var model: AppModel
     let session: Session
+    @State private var search = ""
+    @State private var conversationOnly = false
+    @State private var copied = false
+
+    /// Flat events after the conversation-only filter and the in-session search.
+    private var filteredEvents: [TrajectoryEvent] {
+        var events = model.trajectoryEvents
+        if conversationOnly {
+            events = events.filter { $0.kind == "user" || $0.kind == "assistant" }
+        }
+        let query = search.trimmingCharacters(in: .whitespaces).lowercased()
+        if !query.isEmpty {
+            events = events.filter { $0.text.lowercased().contains(query) || $0.tool.lowercased().contains(query) }
+        }
+        return events
+    }
+
+    /// Render units: each tool_use is paired with its tool_result. Claude emits
+    /// a whole batch of calls in one turn and all the results in the next
+    /// (use,use,result,result), so we collect the run of calls and the following
+    /// run of results and match them positionally — the k-th call to the k-th
+    /// result — rather than assuming call/result strictly alternate.
+    private var items: [TrajectoryItem] {
+        let events = filteredEvents
+        var out: [TrajectoryItem] = []
+        var index = 0
+        while index < events.count {
+            guard events[index].kind == "tool_use" else {
+                out.append(TrajectoryItem(event: events[index], result: nil))
+                index += 1
+                continue
+            }
+            var uses: [TrajectoryEvent] = []
+            while index < events.count, events[index].kind == "tool_use" {
+                uses.append(events[index]); index += 1
+            }
+            var results: [TrajectoryEvent] = []
+            while index < events.count, events[index].kind == "tool_result" {
+                results.append(events[index]); index += 1
+            }
+            for (offset, use) in uses.enumerated() {
+                out.append(TrajectoryItem(event: use, result: offset < results.count ? results[offset] : nil))
+            }
+            if results.count > uses.count {
+                for extra in results[uses.count...] {
+                    out.append(TrajectoryItem(event: extra, result: nil))
+                }
+            }
+        }
+        return out
+    }
+
+    /// A contiguous run of tool calls collapses into one summary block
+    /// ("Glob ×3 · Bash ×5"); conversation turns and thinking stay as-is.
+    private var blocks: [TrajectoryBlock] {
+        var out: [TrajectoryBlock] = []
+        var run: [TrajectoryItem] = []
+        func flush() { if !run.isEmpty { out.append(.tools(run)); run = [] } }
+        for item in items {
+            if item.event.kind == "tool_use" {
+                run.append(item)
+            } else {
+                flush()
+                out.append(.event(item))
+            }
+        }
+        flush()
+        return out
+    }
 
     var body: some View {
         VStack(spacing: 0) {
@@ -913,16 +990,24 @@ struct TrajectoryView: View {
                 }
                 .buttonStyle(.plain)
                 Spacer()
+                SourceTag(source: sourceName)
+                Button { copyTranscript() } label: {
+                    Image(systemName: copied ? "checkmark" : "doc.on.doc")
+                        .font(.system(size: 11, weight: .semibold))
+                        .foregroundStyle(copied ? Palette.good : .secondary)
+                }
+                .buttonStyle(.plain).help("Copy transcript")
             }
             .padding(.horizontal, 14).padding(.top, 4).padding(.bottom, 6)
 
             VStack(alignment: .leading, spacing: 2) {
                 Text(session.displayTitle).font(.system(size: 13, weight: .bold)).lineLimit(2)
-                Text("\(session.shortId) · \(model.trajectoryEvents.count) events")
-                    .font(.system(size: 10)).foregroundStyle(.secondary)
+                Text(metaLine).font(.system(size: 10)).foregroundStyle(.secondary)
             }
             .frame(maxWidth: .infinity, alignment: .leading)
             .padding(.horizontal, 16).padding(.bottom, 6)
+
+            filterBar
 
             Divider().opacity(0.4)
 
@@ -930,9 +1015,26 @@ struct TrajectoryView: View {
                 Spacer(); ProgressView().controlSize(.small); Spacer()
             } else {
                 ScrollView {
-                    LazyVStack(spacing: 8) {
-                        ForEach(model.trajectoryEvents) { event in EventRow(event: event) }
-                        if model.trajectoryTruncated || model.trajectoryOmitted > 0 {
+                    LazyVStack(spacing: 6) {
+                        ForEach(blocks) { block in
+                            switch block {
+                            case .event(let item):
+                                EventRow(event: item.event, result: item.result)
+                            case .tools(let group):
+                                if group.count == 1 {
+                                    EventRow(event: group[0].event, result: group[0].result)
+                                } else {
+                                    ToolGroupView(items: group)
+                                }
+                            }
+                        }
+                        if blocks.isEmpty {
+                            Text(search.isEmpty ? "No conversation turns here — turn off the filter to see tool activity."
+                                                : "No events match \"\(search)\".")
+                                .font(.system(size: 11)).foregroundStyle(.secondary)
+                                .frame(maxWidth: .infinity).padding(.top, 30)
+                        }
+                        if search.isEmpty && !conversationOnly && (model.trajectoryTruncated || model.trajectoryOmitted > 0) {
                             VStack(spacing: 2) {
                                 if model.trajectoryTruncated {
                                     Text("Showing the first \(model.trajectoryEvents.count) events (truncated)")
@@ -951,10 +1053,149 @@ struct TrajectoryView: View {
         }
         .frame(maxHeight: .infinity)
     }
+
+    private var filterBar: some View {
+        HStack(spacing: 8) {
+            Button { withAnimation(.easeOut(duration: 0.12)) { conversationOnly.toggle() } } label: {
+                HStack(spacing: 4) {
+                    Image(systemName: conversationOnly ? "text.bubble.fill" : "text.bubble")
+                        .font(.system(size: 10))
+                    Text("Conversation").font(.system(size: 10.5, weight: .semibold))
+                }
+                .padding(.horizontal, 9).padding(.vertical, 5)
+                .background(Capsule().fill(conversationOnly ? Palette.accent.opacity(0.16) : Color.primary.opacity(0.06)))
+                .foregroundStyle(conversationOnly ? Palette.accent : Color.secondary)
+            }
+            .buttonStyle(.plain)
+            HStack(spacing: 5) {
+                Image(systemName: "magnifyingglass").font(.system(size: 10)).foregroundStyle(.secondary)
+                TextField("Search this session", text: $search).textFieldStyle(.plain).font(.system(size: 11))
+                if !search.isEmpty {
+                    Button { search = "" } label: { Image(systemName: "xmark.circle.fill").font(.system(size: 11)) }
+                        .buttonStyle(.plain).foregroundStyle(.secondary)
+                }
+            }
+            .padding(.horizontal, 8).padding(.vertical, 5)
+            .background(Capsule().fill(Color.primary.opacity(0.06)))
+        }
+        .padding(.horizontal, 14).padding(.bottom, 6)
+    }
+
+    private var sourceName: String {
+        session.ref.split(separator: ":").first.map(String.init) ?? ""
+    }
+
+    private var metaLine: String {
+        var line = "\(session.shortId) · \(model.trajectoryEvents.count) events"
+        if conversationOnly || !search.isEmpty { line += " · \(filteredEvents.count) shown" }
+        if !session.updatedAgo.isEmpty { line += " · \(session.updatedAgo)" }
+        return line
+    }
+
+    private func copyTranscript() {
+        let text = filteredEvents.map { event -> String in
+            let label = event.tool.isEmpty ? event.kind.uppercased() : "\(event.kind.uppercased()) [\(event.tool)]"
+            return "\(label)\n\(event.text)"
+        }.joined(separator: "\n\n")
+        NSPasteboard.general.clearContents()
+        NSPasteboard.general.setString(text, forType: .string)
+        withAnimation { copied = true }
+        DispatchQueue.main.asyncAfter(deadline: .now() + 1.5) { withAnimation { copied = false } }
+    }
+}
+
+/// A render unit for the trajectory: a single event, plus the paired
+/// tool_result when the event is a tool_use.
+struct TrajectoryItem: Identifiable {
+    var id: UUID { event.id }
+    let event: TrajectoryEvent
+    let result: TrajectoryEvent?
+}
+
+/// Top-level render block: either a conversation/thinking event, or a
+/// contiguous run of tool calls shown as one collapsed summary.
+enum TrajectoryBlock: Identifiable {
+    case event(TrajectoryItem)
+    case tools([TrajectoryItem])
+    var id: UUID {
+        switch self {
+        case .event(let item): return item.id
+        case .tools(let items): return items.first?.id ?? UUID()
+        }
+    }
+}
+
+/// Extract a short, clean preview from tool args/output — the value of a common
+/// arg key (command, pattern, path…) or the first substantive line — never the
+/// raw JSON braces.
+func toolPreview(_ text: String) -> String? {
+    let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
+    if trimmed.hasPrefix("{"), let data = trimmed.data(using: .utf8),
+       let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any] {
+        for key in ["command", "cmd", "pattern", "query", "path", "file_path", "url", "prompt", "description"] {
+            if let value = obj[key] as? String, !value.isEmpty { return value }
+        }
+        for (_, value) in obj { if let str = value as? String, !str.isEmpty { return str } }
+        return nil
+    }
+    for raw in text.split(whereSeparator: \.isNewline) {
+        let line = raw.trimmingCharacters(in: .whitespaces)
+        if !line.isEmpty && !line.allSatisfy({ "{}[](),".contains($0) }) { return line }
+    }
+    return nil
+}
+
+/// A run of tool calls as one collapsed row ("Glob ×3 · Bash ×5"); expands to
+/// the individual calls, each still individually openable.
+struct ToolGroupView: View {
+    let items: [TrajectoryItem]
+    @State private var expanded = false
+
+    private var summary: String {
+        var order: [String] = []
+        var counts: [String: Int] = [:]
+        for item in items {
+            let name = item.event.tool.isEmpty ? "Tool" : item.event.tool
+            if counts[name] == nil { order.append(name) }
+            counts[name, default: 0] += 1
+        }
+        return order.map { counts[$0]! > 1 ? "\($0) ×\(counts[$0]!)" : $0 }.joined(separator: " · ")
+    }
+
+    var body: some View {
+        let tint = Palette.accent
+        return VStack(alignment: .leading, spacing: 0) {
+            Button { expanded.toggle() } label: {
+                HStack(spacing: 5) {
+                    Image(systemName: "wrench.and.screwdriver.fill").font(.system(size: 9)).foregroundStyle(tint)
+                    Text(summary).font(.system(size: 10.5, weight: .semibold)).foregroundStyle(tint)
+                        .lineLimit(1)
+                    Spacer(minLength: 4)
+                    Text("\(items.count) calls").font(.system(size: 9)).foregroundStyle(.secondary.opacity(0.7))
+                    Image(systemName: expanded ? "chevron.down" : "chevron.right")
+                        .font(.system(size: 8, weight: .semibold)).foregroundStyle(.secondary.opacity(0.6))
+                }
+                .contentShape(Rectangle())
+                .padding(.vertical, 3).padding(.horizontal, 8)
+            }
+            .buttonStyle(.plain)
+            if expanded {
+                VStack(spacing: 2) {
+                    ForEach(items) { EventRow(event: $0.event, result: $0.result) }
+                }
+                .padding(.leading, 8).padding(.bottom, 4)
+            }
+        }
+        .background(RoundedRectangle(cornerRadius: 8, style: .continuous)
+            .fill(expanded ? tint.opacity(0.05) : Color.clear))
+        .overlay(RoundedRectangle(cornerRadius: 8, style: .continuous)
+            .strokeBorder(tint.opacity(expanded ? 0.14 : 0)))
+    }
 }
 
 struct EventRow: View {
     let event: TrajectoryEvent
+    var result: TrajectoryEvent? = nil
     @State private var expanded = false
 
     var body: some View {
@@ -962,19 +1203,67 @@ struct EventRow: View {
         case "user": bubble(role: "You", tint: Palette.accent, align: .trailing)
         case "assistant": bubble(role: "Assistant", tint: .secondary, align: .leading)
         case "thinking": foldable(icon: "brain", title: "Thinking", tint: .secondary, mono: false, italic: true)
-        case "tool_use": foldable(icon: "wrench.and.screwdriver.fill",
-                                  title: event.tool.isEmpty ? "Tool call" : event.tool, tint: Palette.accent, mono: true)
+        case "tool_use": toolRow()
         case "tool_result": foldable(icon: "arrow.turn.down.right",
                                      title: "Result · \(event.text.count) chars", tint: .secondary, mono: true)
         default: EmptyView()
         }
     }
 
+    /// A tool call and its result as one compact entry: name + args preview on a
+    /// slim row (with a "↳ N" result-size hint), expanding to args then result.
+    private func toolRow() -> some View {
+        let tint = Palette.accent
+        return VStack(alignment: .leading, spacing: 0) {
+            Button { expanded.toggle() } label: {
+                HStack(spacing: 5) {
+                    Image(systemName: "wrench.and.screwdriver.fill").font(.system(size: 9)).foregroundStyle(tint)
+                    Text(event.tool.isEmpty ? "Tool call" : event.tool)
+                        .font(.system(size: 10.5, weight: .semibold)).foregroundStyle(tint).lineLimit(1).fixedSize()
+                    if !expanded, let preview = inlinePreview {
+                        Text(preview).font(.system(size: 10, design: .monospaced))
+                            .foregroundStyle(.secondary).lineLimit(1).truncationMode(.tail)
+                    }
+                    Spacer(minLength: 4)
+                    if let result, !expanded {
+                        Text("↳ \(result.text.count)").font(.system(size: 9)).foregroundStyle(.secondary.opacity(0.7))
+                    }
+                    Image(systemName: expanded ? "chevron.down" : "chevron.right")
+                        .font(.system(size: 8, weight: .semibold)).foregroundStyle(.secondary.opacity(0.6))
+                }
+                .contentShape(Rectangle())
+                .padding(.vertical, 3).padding(.horizontal, 8)
+            }
+            .buttonStyle(.plain)
+            if expanded {
+                Text(event.text).font(.system(size: 10.5, design: .monospaced)).textSelection(.enabled)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .padding(.horizontal, 8).padding(.bottom, result == nil ? 7 : 5)
+                if let result {
+                    HStack(spacing: 4) {
+                        Image(systemName: "arrow.turn.down.right").font(.system(size: 9))
+                        Text("Result · \(result.text.count) chars").font(.system(size: 9.5, weight: .semibold))
+                    }
+                    .foregroundStyle(.secondary).padding(.horizontal, 8).padding(.bottom, 3)
+                    Text(result.text).font(.system(size: 10.5, design: .monospaced)).textSelection(.enabled)
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                        .padding(.horizontal, 8).padding(.bottom, 7)
+                }
+            }
+        }
+        .background(RoundedRectangle(cornerRadius: 8, style: .continuous)
+            .fill(expanded ? tint.opacity(0.06) : Color.clear))
+        .overlay(RoundedRectangle(cornerRadius: 8, style: .continuous)
+            .strokeBorder(tint.opacity(expanded ? 0.16 : 0)))
+    }
+
     private func bubble(role: String, tint: Color, align: HorizontalAlignment) -> some View {
         VStack(alignment: align, spacing: 3) {
             Text(role.uppercased()).font(.system(size: 8.5, weight: .heavy)).tracking(0.5)
                 .foregroundStyle(tint)
-            Text(event.text)
+            // Render inline markdown (bold/italic/code/links) so conversation
+            // turns read like the chat view rather than raw asterisks.
+            Text(.init(event.text))
                 .font(.system(size: 12))
                 .textSelection(.enabled)
                 .frame(maxWidth: .infinity, alignment: .leading)
@@ -985,17 +1274,32 @@ struct EventRow: View {
         .frame(maxWidth: .infinity, alignment: align == .trailing ? .trailing : .leading)
     }
 
+    /// Clean inline preview for the compact row — no raw JSON braces.
+    private var inlinePreview: String? { toolPreview(event.text) }
+
+    /// Tool calls, results, and thinking are secondary to the conversation, so
+    /// they render as slim single-line rows (icon + name + a dimmed preview of
+    /// the args/output) instead of full-width cards. Tap to expand the detail;
+    /// the card treatment is reserved for the expanded state.
     private func foldable(icon: String, title: String, tint: Color, mono: Bool, italic: Bool = false) -> some View {
         VStack(alignment: .leading, spacing: 0) {
             Button { expanded.toggle() } label: {
-                HStack(spacing: 6) {
-                    Image(systemName: icon).font(.system(size: 10)).foregroundStyle(tint)
-                    Text(title).font(.system(size: 11, weight: .semibold)).foregroundStyle(tint).lineLimit(1)
-                    Spacer()
+                HStack(spacing: 5) {
+                    Image(systemName: icon).font(.system(size: 9)).foregroundStyle(tint)
+                    Text(title).font(.system(size: 10.5, weight: .semibold)).foregroundStyle(tint)
+                        .lineLimit(1).fixedSize()
+                    if !expanded, let preview = inlinePreview {
+                        Text(preview)
+                            .font(.system(size: 10, design: mono ? .monospaced : .default))
+                            .foregroundStyle(.secondary)
+                            .lineLimit(1).truncationMode(.tail)
+                    }
+                    Spacer(minLength: 4)
                     Image(systemName: expanded ? "chevron.down" : "chevron.right")
-                        .font(.system(size: 9, weight: .semibold)).foregroundStyle(.secondary)
+                        .font(.system(size: 8, weight: .semibold)).foregroundStyle(.secondary.opacity(0.6))
                 }
                 .contentShape(Rectangle())
+                .padding(.vertical, 3).padding(.horizontal, 8)
             }
             .buttonStyle(.plain)
             if expanded {
@@ -1004,12 +1308,13 @@ struct EventRow: View {
                     .italic(italic)
                     .textSelection(.enabled)
                     .frame(maxWidth: .infinity, alignment: .leading)
-                    .padding(.top, 6)
+                    .padding(.horizontal, 8).padding(.bottom, 7)
             }
         }
-        .padding(9)
-        .background(RoundedRectangle(cornerRadius: 10, style: .continuous).fill(tint.opacity(0.06)))
-        .overlay(RoundedRectangle(cornerRadius: 10, style: .continuous).strokeBorder(tint.opacity(0.16)))
+        .background(RoundedRectangle(cornerRadius: 8, style: .continuous)
+            .fill(expanded ? tint.opacity(0.06) : Color.clear))
+        .overlay(RoundedRectangle(cornerRadius: 8, style: .continuous)
+            .strokeBorder(tint.opacity(expanded ? 0.16 : 0)))
     }
 }
 
