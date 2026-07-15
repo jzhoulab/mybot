@@ -70,6 +70,23 @@ def utc_now() -> str:
     return datetime.now(timezone.utc).isoformat()
 
 
+def on_battery_power() -> bool:
+    """True only when we can POSITIVELY confirm the machine is on battery
+    (macOS). Any error or non-macOS host returns False, so background indexing
+    is only ever suppressed when we're sure — never accidentally paused on a
+    server or when the power state can't be read."""
+    if sys.platform != "darwin":
+        return False
+    try:
+        proc = subprocess.run(
+            ["/usr/bin/pmset", "-g", "ps"],
+            capture_output=True, text=True, timeout=3,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return False
+    return "Battery Power" in proc.stdout
+
+
 def slugify(value: str) -> str:
     cleaned = re.sub(r"[^a-zA-Z0-9._-]+", "-", value.strip().lower()).strip("-")
     return cleaned or "user"
@@ -502,6 +519,7 @@ class AppConfig:
     trajectory_index_autobuild_min_interval_seconds: int
     trajectory_index_refresh_max_sessions: int
     trajectory_index_background_refresh_seconds: int
+    trajectory_index_pause_on_battery: bool
     trajectory_agentic_search: bool
     trajectory_agentic_max_steps: int
     trajectory_query_planner: bool
@@ -1429,6 +1447,7 @@ class AppState:
         self.known_projects_path = Path(config.state_dir) / "known_projects.json"
         self.background_refresh_error: dict[str, Any] | None = None
         self.background_refresh_last_ok: str = ""
+        self.background_refresh_paused_on_battery: bool = False
 
     def ensure_runtime_tool_wrapper(self) -> None:
         codex_cwd = Path(self.config.codex_cwd).expanduser().resolve()
@@ -1802,6 +1821,20 @@ class AppState:
         def worker() -> None:
             while True:
                 time.sleep(interval)
+                # Don't drain the battery indexing in the background. On-demand
+                # refresh during a user's search still runs; only this unattended
+                # loop backs off. Resumes automatically on AC power.
+                if self.config.trajectory_index_pause_on_battery and on_battery_power():
+                    if not self.background_refresh_paused_on_battery:
+                        self.background_refresh_paused_on_battery = True
+                        print(
+                            "Trajectory index background refresh paused (on battery). "
+                            "Set TRAJECTORY_INDEX_PAUSE_ON_BATTERY=false to override."
+                        )
+                    continue
+                if self.background_refresh_paused_on_battery:
+                    self.background_refresh_paused_on_battery = False
+                    print("Trajectory index background refresh resumed (on AC power).")
                 try:
                     refresh = self.ensure_trajectory_chunk_index_current()
                     self.background_refresh_last_ok = utc_now()
@@ -3175,6 +3208,7 @@ class ChatHandler(BaseHTTPRequestHandler):
                     "memory_loaded": self.server.state.get_memory_index() is not None,
                     "semantic_memory_stats": self.server.state.memory_store.get_stats(),
                     "sync_auth_configured": self.server.state.sync_auth.configured(),
+                    "index_refresh_paused_on_battery": self.server.state.background_refresh_paused_on_battery,
                 },
             )
             return
@@ -4492,6 +4526,12 @@ def load_config(args: argparse.Namespace) -> AppConfig:
         trajectory_index_refresh_max_sessions=int(os.environ.get("TRAJECTORY_INDEX_REFRESH_MAX_SESSIONS", "0")),
         trajectory_index_background_refresh_seconds=int(
             os.environ.get("TRAJECTORY_INDEX_BACKGROUND_REFRESH_SECONDS", "300")
+        ),
+        # Skip unattended index refresh + embedding (CPU-heavy) while on battery,
+        # so mybot doesn't drain the laptop in the background. User-initiated
+        # searches still refresh on demand; set false to always index.
+        trajectory_index_pause_on_battery=coerce_bool(
+            os.environ.get("TRAJECTORY_INDEX_PAUSE_ON_BATTERY"), True
         ),
         trajectory_agentic_search=coerce_bool(os.environ.get("TRAJECTORY_AGENTIC_SEARCH"), True),
         trajectory_agentic_max_steps=int(os.environ.get("TRAJECTORY_AGENTIC_MAX_STEPS", "6")),
