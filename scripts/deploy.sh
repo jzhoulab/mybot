@@ -111,7 +111,7 @@ echo "  GitHub origin/main: $REMOTE_SHA"
 echo "  installed app:      $APP_SHA ($APP_DEST)"
 if $SERVICES; then
   curl -fsS --max-time 3 http://127.0.0.1:8788/health 2>/dev/null \
-    | python3 -c 'import json,sys; h=json.load(sys.stdin); print(f"  server:             healthy ({h.get(\"provider_backend\")}/{h.get(\"active_model\")}), index battery-paused: {h.get(\"index_refresh_paused_on_battery\")}")' \
+    | python3 -c "import json,sys; h=json.load(sys.stdin); print(f'  server:             healthy ({h.get(\"provider_backend\")}/{h.get(\"active_model\")}), index battery-paused: {h.get(\"index_refresh_paused_on_battery\")}')" \
     || echo "  server:             NOT RESPONDING"
 fi
 sqlite3 "$ROOT/state/trajectory_index.sqlite3" \
