@@ -70,6 +70,35 @@ person returns, on any channel. Guests can also build their own long-term memory
   allowlist = reply anywhere, observe nowhere).
 - Raw `<@id>` mentions are resolved to `@DisplayName` before storage.
 
+## Cross-bot relay (ask a teammate's bot)
+
+Teammates already query each other's bots directly: a human @mentions
+`alice-mybot` in a shared channel and it answers, guest-scoped, about Alice's
+owner's work. That needs no relay — it's the default human→bot path.
+
+The **relay** exists so one bot can ask another *on a human's behalf* (the
+foundation for asking a teammate's bot from inside the menu app, with
+Discord/Slack as the wire — no custom mesh, hosting, or VPN). Design:
+
+- A relay message carries a machine-readable envelope
+  (`⟦mybot ask id=… actor=… name=…⟧ <question>` / `⟦mybot ans id=…⟧ <answer>`)
+  so the receiver can tell an **ask** from an **answer**, recover the asking
+  human's identity for guest-scoped retrieval, and correlate the reply.
+- `MYBOT_SIBLING_BOT_IDS` lists the Discord user ids of trusted sibling bots.
+  Only their relay-tagged, mention-addressed messages bypass the usual
+  bot-author filter; everything else from bots is still ignored. Empty = off.
+- **Loop guards:** a bot answers *asks* only (never treats an *answer* as a new
+  ask), only when addressed to it, and its reply is tagged as an *answer* — so
+  no bot-to-bot loop forms.
+- The receiver answers as the asking human (`actor_id` from the envelope, guest
+  scope, a per-asker `relay-<guild>-<actor>` session).
+
+**Status:** the receiver side (answer a relayed ask, with identity + loop
+guards) is implemented and unit-tested; the live bot↔bot round-trip needs ≥2
+bot instances in a shared server to exercise. Still to build: the **sender** —
+a menu-app "ask a teammate" UI + a server endpoint that posts the relay ask and
+correlates the tagged answer back to the app.
+
 ## Connecting a chat platform (guided setup)
 
 The Discord/Slack app setup is fiddly, so there's a validating doctor:

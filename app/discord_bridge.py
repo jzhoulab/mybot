@@ -90,6 +90,53 @@ def command_argument(text: str, prefix: str) -> str | None:
     return None
 
 
+# -- Bot-to-bot relay envelope --------------------------------------------
+# When one mybot instance asks another on a human's behalf, it posts a message
+# carrying a machine-readable marker so the receiving bot can (a) tell it's a
+# relayed ASK vs an ANSWER (the loop guard — a bot answers asks but never treats
+# an answer as a new ask), (b) recover the asking human's identity for
+# guest-scoped retrieval, and (c) correlate the reply. Rare bracket delimiters
+# keep it from colliding with normal prose.
+_RELAY_OPEN, _RELAY_CLOSE = "⟦", "⟧"  # ⟦ ⟧
+_RELAY_RE = re.compile(
+    r"(?:<@!?\d+>\s*)*" + _RELAY_OPEN + r"mybot (ask|ans)([^" + _RELAY_CLOSE + r"]*)"
+    + _RELAY_CLOSE + r"\s?(.*)",
+    re.DOTALL,
+)
+
+
+def build_relay_ask(*, request_id: str, actor_id: str, display_name: str, question: str) -> str:
+    from urllib.parse import quote
+    name = quote(display_name or "", safe="")
+    return f"{_RELAY_OPEN}mybot ask id={request_id} actor={actor_id} name={name}{_RELAY_CLOSE} {question}"
+
+
+def build_relay_answer(*, request_id: str, answer: str) -> str:
+    return f"{_RELAY_OPEN}mybot ans id={request_id}{_RELAY_CLOSE} {answer}"
+
+
+def parse_relay(text: str) -> dict[str, Any] | None:
+    """Parse a relay envelope, tolerating leading @mentions. Returns
+    {kind: 'ask'|'ans', id, actor_id, name, body} or None if not a relay."""
+    from urllib.parse import unquote
+    match = _RELAY_RE.search(text or "")
+    if not match:
+        return None
+    kind, fields_raw, body = match.group(1), match.group(2), match.group(3)
+    fields: dict[str, str] = {}
+    for token in fields_raw.split():
+        if "=" in token:
+            key, value = token.split("=", 1)
+            fields[key] = value
+    return {
+        "kind": kind,
+        "id": fields.get("id", ""),
+        "actor_id": fields.get("actor", ""),
+        "name": unquote(fields.get("name", "")),
+        "body": (body or "").strip(),
+    }
+
+
 @dataclass
 class BridgeConfig:
     discord_bot_token: str
@@ -112,6 +159,10 @@ class BridgeConfig:
     # Set the per-guild nickname to '<handle>-mybot' so a team's instances are
     # distinguishable in a shared server.
     set_guild_nickname: bool
+    # Discord user ids of other mybot instances we trust to relay human asks
+    # (each teammate's bot). Their relay-tagged messages are answered instead of
+    # ignored by the usual bot-author filter.
+    sibling_bot_ids: set[int]
 
 
 @dataclass
@@ -448,6 +499,15 @@ class DiscordBridgeClient(discord.Client):
         log.info("session resumed after reconnect")
 
     async def on_message(self, message: discord.Message) -> None:
+        # A trusted sibling mybot relaying a human's question gets answered
+        # instead of being dropped by the usual bot-author filter below.
+        if (
+            self.user is not None
+            and message.author.id != self.user.id
+            and message.author.id in self.config.sibling_bot_ids
+        ):
+            await self._handle_relay(message)
+            return
         if message.author.bot:
             return
         if not self.config.enable_message_content:
@@ -512,6 +572,44 @@ class DiscordBridgeClient(discord.Client):
             )
         except Exception:
             log.exception("failed to observe channel message author=%s", message.author.id)
+
+    async def _handle_relay(self, message: discord.Message) -> None:
+        """Answer a relayed ASK from a trusted sibling mybot, as the asking
+        human (guest scope). Loop guards: only ASKs are answered (ANSWERs and
+        non-relay bot chatter are ignored), and only when addressed to us — so a
+        bot never treats another bot's answer as a new question."""
+        relay = parse_relay(message.content or "")
+        if relay is None or relay["kind"] != "ask":
+            return
+        if self.user is None or self.user not in message.mentions:
+            return
+        actor_id = relay["actor_id"]
+        question = normalize_text(relay["body"])
+        if not actor_id or not question:
+            return
+        guild_id = getattr(message.guild, "id", "dm")
+        try:
+            async with message.channel.typing():
+                result = await self.api.chat(
+                    actor_id=actor_id,
+                    user_key=self._user_key(actor_id),
+                    # Per-asker relay session, separate from that human's own
+                    # conversations with their own bot.
+                    session_key=f"relay-{guild_id}-{actor_id}",
+                    message=question,
+                    memory_scope="private",
+                    display_name=relay.get("name") or "",
+                    channel_kind="group",
+                    channel_label=self._channel_kind_label(message.channel)[1],
+                )
+            answer = result.get("text") or "(empty response)"
+        except Exception as exc:
+            log.exception("relay answer failed id=%s actor=%s", relay["id"], actor_id)
+            answer = f"(couldn't answer: {exc})"
+        # Reply tagged as an ANSWER (never an ask) mentioning the asking bot, so
+        # its bridge can correlate by id and no loop forms.
+        payload = f"<@{message.author.id}> " + build_relay_answer(request_id=relay["id"], answer=answer)
+        await self._send_channel_text(message.channel, payload, reference=message)
 
     async def _handle_command_message(self, message: discord.Message, text: str) -> bool:
         if text.lower() in {"!new", "!reset"}:
@@ -1073,6 +1171,9 @@ def load_config(args: argparse.Namespace) -> BridgeConfig:
         group_sessions=env_bool("DISCORD_GROUP_SESSIONS", True),
         observe_channels=env_bool("DISCORD_OBSERVE_CHANNELS", True),
         set_guild_nickname=env_bool("DISCORD_SET_GUILD_NICKNAME", True),
+        sibling_bot_ids=parse_id_set(
+            os.environ.get("MYBOT_SIBLING_BOT_IDS", ""), label="MYBOT_SIBLING_BOT_IDS"
+        ),
     )
 
 
