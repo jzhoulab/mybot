@@ -54,6 +54,40 @@ struct MybotConfig {
         return URL(fileURLWithPath: "/Users/you/Code/mybot")
     }
 
+    /// Commit the running binary was built from (stamped by macapp/build.sh).
+    static var buildSHA: String {
+        (Bundle.main.infoDictionary?["MybotGitSHA"] as? String) ?? "dev"
+    }
+
+    static var buildDate: String {
+        (Bundle.main.infoDictionary?["MybotBuildDate"] as? String) ?? ""
+    }
+
+    /// Current HEAD of the source repo, read straight from .git (no subprocess)
+    /// so the footer can flag an installed app that has fallen behind.
+    static func sourceHeadSHA() -> String? {
+        let repo = repoRoot()
+        guard let head = try? String(contentsOf: repo.appendingPathComponent(".git/HEAD"), encoding: .utf8)
+            .trimmingCharacters(in: .whitespacesAndNewlines) else { return nil }
+        if !head.hasPrefix("ref: ") { return String(head.prefix(7)) }
+        let ref = String(head.dropFirst(5))
+        if let sha = try? String(contentsOf: repo.appendingPathComponent(".git/\(ref)"), encoding: .utf8) {
+            return String(sha.trimmingCharacters(in: .whitespacesAndNewlines).prefix(7))
+        }
+        if let packed = try? String(contentsOf: repo.appendingPathComponent(".git/packed-refs"), encoding: .utf8) {
+            for line in packed.split(separator: "\n") where line.hasSuffix(" \(ref)") {
+                return String(line.prefix(7))
+            }
+        }
+        return nil
+    }
+
+    /// True when the app was built from a different commit than the repo HEAD.
+    static var appBehindSource: Bool {
+        guard let head = sourceHeadSHA() else { return false }
+        return !buildSHA.hasPrefix(head)
+    }
+
     static func parseDotEnv(_ url: URL) -> [String: String] {
         guard let text = try? String(contentsOf: url, encoding: .utf8) else { return [:] }
         var out: [String: String] = [:]

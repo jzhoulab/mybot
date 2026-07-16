@@ -4400,7 +4400,7 @@ def parse_args() -> argparse.Namespace:
     root = Path(__file__).resolve().parent.parent
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--host", default="127.0.0.1")
-    parser.add_argument("--port", default=8787, type=int)
+    parser.add_argument("--port", default=8788, type=int)
     parser.add_argument("--workspace-dir", default=str(root / "profiles" / "default"))
     parser.add_argument("--state-dir", default=str(root / "state"))
     parser.add_argument("--memory-index-path", default=str(root / "state" / "trajectory_memory.json"))

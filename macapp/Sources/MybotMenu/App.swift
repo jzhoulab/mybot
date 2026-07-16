@@ -649,6 +649,8 @@ struct ContentView: View {
 
             Spacer()
 
+            versionChip
+
             if let err = model.lastError {
                 Image(systemName: "exclamationmark.triangle.fill")
                     .font(.system(size: 12)).foregroundStyle(Palette.bad).help(err)
@@ -658,6 +660,18 @@ struct ContentView: View {
         }
         .padding(.horizontal, 12).padding(.vertical, 10)
         .background(Color.primary.opacity(0.035))
+    }
+
+    /// Build commit, with a warning tint when the repo HEAD has moved past it —
+    /// the installed app is stale; scripts/deploy.sh rebuilds and reinstalls.
+    private var versionChip: some View {
+        let behind = MybotConfig.appBehindSource
+        return Text(MybotConfig.buildSHA)
+            .font(.system(size: 10, design: .monospaced))
+            .foregroundStyle(behind ? Palette.bad : Color.secondary.opacity(0.7))
+            .help(behind
+                ? "App built from \(MybotConfig.buildSHA) but the repo is at \(MybotConfig.sourceHeadSHA() ?? "?") — run scripts/deploy.sh to update"
+                : "Built \(MybotConfig.buildDate) from commit \(MybotConfig.buildSHA)")
     }
 }
 

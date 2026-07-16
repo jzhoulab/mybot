@@ -1037,8 +1037,8 @@ def _connect_discord(args: argparse.Namespace) -> dict[str, Any]:
             "DISCORD_ENABLE_MESSAGE_CONTENT": "true",
             "DISCORD_REQUIRE_MENTION_IN_GUILDS": "true",
             "DISCORD_USE_TRAJECTORY_MEMORY": "true",
-            "CHATBOT_HOST": "127.0.0.1", "CHATBOT_PORT": "8787",
-            "CHATBOT_BASE_URL": "http://127.0.0.1:8787", "START_LOCAL_CHAT_SERVER": "true",
+            "CHATBOT_HOST": "127.0.0.1", "CHATBOT_PORT": "8788",
+            "CHATBOT_BASE_URL": "http://127.0.0.1:8788", "START_LOCAL_CHAT_SERVER": "true",
         }
         written, message = _write_env(REPO_ROOT / ".discord.env", env, force=args.force)
         return {
@@ -1085,8 +1085,8 @@ def _connect_discord(args: argparse.Namespace) -> dict[str, Any]:
         "DISCORD_REQUIRE_MENTION_IN_GUILDS": "true",
         "DISCORD_USE_TRAJECTORY_MEMORY": "true",
         "CHATBOT_HOST": "127.0.0.1",
-        "CHATBOT_PORT": "8787",
-        "CHATBOT_BASE_URL": "http://127.0.0.1:8787",
+        "CHATBOT_PORT": "8788",
+        "CHATBOT_BASE_URL": "http://127.0.0.1:8788",
         "START_LOCAL_CHAT_SERVER": "true",
     }
     written, message = _write_env(REPO_ROOT / ".discord.env", env, force=args.force)
@@ -1120,7 +1120,7 @@ def _slack_env(bot_token: str, app_token: str) -> dict[str, str]:
     return {
         "SLACK_BOT_TOKEN": bot_token, "SLACK_APP_TOKEN": app_token,
         "SLACK_GROUP_SESSIONS": "true", "SLACK_OBSERVE_CHANNELS": "true",
-        "SLACK_USE_TRAJECTORY_MEMORY": "true", "CHATBOT_BASE_URL": "http://127.0.0.1:8787",
+        "SLACK_USE_TRAJECTORY_MEMORY": "true", "CHATBOT_BASE_URL": "http://127.0.0.1:8788",
         "START_LOCAL_CHAT_SERVER": "true",
     }
 
@@ -1191,7 +1191,7 @@ def _connect_slack(args: argparse.Namespace) -> dict[str, Any]:
         "SLACK_GROUP_SESSIONS": "true",
         "SLACK_OBSERVE_CHANNELS": "true",
         "SLACK_USE_TRAJECTORY_MEMORY": "true",
-        "CHATBOT_BASE_URL": "http://127.0.0.1:8787",
+        "CHATBOT_BASE_URL": "http://127.0.0.1:8788",
         "START_LOCAL_CHAT_SERVER": "true",
     }
     written, message = _write_env(REPO_ROOT / ".slack.env", env, force=args.force)

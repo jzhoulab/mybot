@@ -39,7 +39,7 @@ if [[ -z "${SLACK_APP_TOKEN:-}" || "${SLACK_APP_TOKEN}" == xapp-REPLACE-ME ]]; t
 fi
 
 : "${CHATBOT_HOST:=127.0.0.1}"
-: "${CHATBOT_PORT:=8787}"
+: "${CHATBOT_PORT:=8788}"
 : "${CHATBOT_BASE_URL:=http://${CHATBOT_HOST}:${CHATBOT_PORT}}"
 export CHATBOT_BASE_URL
 if [[ -n "${SYNC_TOKENS_PATH:-}" && ! -e "$SYNC_TOKENS_PATH" ]]; then

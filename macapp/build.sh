@@ -8,6 +8,14 @@ APP_NAME="mybot"
 BUNDLE_ID="com.example.mybot.menu"
 CONFIG="${1:-release}"
 
+# Stamp the bundle with the source commit so the app (and deploy.sh) can tell
+# whether an installed copy is behind the repo.
+GIT_SHA="$(git -C .. rev-parse --short HEAD 2>/dev/null || echo unknown)"
+if [[ -n "$(git -C .. status --porcelain 2>/dev/null)" ]]; then
+    GIT_SHA="${GIT_SHA}-dirty"
+fi
+BUILD_DATE="$(date '+%Y-%m-%d %H:%M')"
+
 echo "==> swift build -c $CONFIG"
 swift build -c "$CONFIG"
 
@@ -32,6 +40,8 @@ cat > "$APP/Contents/Info.plist" <<PLIST
     <key>CFBundlePackageType</key><string>APPL</string>
     <key>CFBundleShortVersionString</key><string>1.0</string>
     <key>CFBundleVersion</key><string>1</string>
+    <key>MybotGitSHA</key><string>${GIT_SHA}</string>
+    <key>MybotBuildDate</key><string>${BUILD_DATE}</string>
     <key>LSMinimumSystemVersion</key><string>14.0</string>
     <key>LSUIElement</key><true/>
     <key>CFBundleIconFile</key><string>AppIcon</string>
@@ -60,5 +70,5 @@ fi
 # Ad-hoc sign so macOS will run it and notifications get a stable identity.
 codesign --force --deep --sign - "$APP" >/dev/null 2>&1 || echo "(codesign skipped)"
 
-echo "==> built $APP"
+echo "==> built $APP (commit $GIT_SHA)"
 echo "Launch:  open $APP   (or ./dist/${APP_NAME}.app/Contents/MacOS/${APP_NAME} for logs)"

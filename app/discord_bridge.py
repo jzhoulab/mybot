@@ -1111,7 +1111,7 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
         "--chatbot-base-url",
-        default=os.environ.get("CHATBOT_BASE_URL", "http://127.0.0.1:8787"),
+        default=os.environ.get("CHATBOT_BASE_URL", "http://127.0.0.1:8788"),
     )
     parser.add_argument(
         "--request-timeout-seconds",

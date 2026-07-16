@@ -42,7 +42,7 @@ if [[ -z "${DISCORD_BOT_TOKEN:-}" || "${DISCORD_BOT_TOKEN}" == "REGENERATE_AND_P
 fi
 
 : "${CHATBOT_HOST:=127.0.0.1}"
-: "${CHATBOT_PORT:=8787}"
+: "${CHATBOT_PORT:=8788}"
 : "${CHATBOT_BASE_URL:=http://${CHATBOT_HOST}:${CHATBOT_PORT}}"
 if [[ -n "${SYNC_TOKENS_PATH:-}" && ! -e "$SYNC_TOKENS_PATH" ]]; then
   export SYNC_TOKENS_PATH="$ROOT_DIR/config/sync_tokens.json"

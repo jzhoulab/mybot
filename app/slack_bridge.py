@@ -252,7 +252,7 @@ def build_bridge() -> tuple[App, SlackBridge, str]:
     if not bot_token or not app_token:
         raise SystemExit("SLACK_BOT_TOKEN (xoxb-...) and SLACK_APP_TOKEN (xapp-...) are required")
 
-    base_url = os.environ.get("CHATBOT_BASE_URL", "http://127.0.0.1:8787")
+    base_url = os.environ.get("CHATBOT_BASE_URL", "http://127.0.0.1:8788")
     api = ChatbotApi(
         base_url,
         timeout_seconds=int(os.environ.get("CHATBOT_REQUEST_TIMEOUT_SECONDS", "150")),

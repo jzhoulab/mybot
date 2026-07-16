@@ -200,7 +200,7 @@ Then place that hash in `config/sync_tokens.json`.
 ## Start the shared server
 
 ```bash
-python3 standalone_agent_backbone.py --host 127.0.0.1 --port 8787
+python3 standalone_agent_backbone.py --host 127.0.0.1 --port 8788
 ```
 
 Important endpoints:
@@ -267,7 +267,7 @@ Trajectory investigation modes:
 Search allowed local trajectories without answering through the model:
 
 ```bash
-curl -sS http://127.0.0.1:8787/trajectory/search \
+curl -sS http://127.0.0.1:8788/trajectory/search \
   -H 'Content-Type: application/json' \
   -d '{
     "query": "figure compression",
@@ -283,7 +283,7 @@ The fast path uses an agentic multi-step retrieval loop: it searches the persist
 Rebuild the persistent reduced trajectory chunk index from the currently allowed Codex and Claude trajectory roots:
 
 ```bash
-curl -sS http://127.0.0.1:8787/trajectory/index/rebuild \
+curl -sS http://127.0.0.1:8788/trajectory/index/rebuild \
   -H 'Content-Type: application/json' \
   -d '{
     "actor_id": "000000000000000000",
@@ -300,7 +300,7 @@ With `TRAJECTORY_INDEX_AUTOBUILD=true`, startup and trajectory lookup refresh th
 Backfill vector embeddings for existing reduced chunks in small batches:
 
 ```bash
-curl -sS http://127.0.0.1:8787/trajectory/index/embed \
+curl -sS http://127.0.0.1:8788/trajectory/index/embed \
   -H 'Content-Type: application/json' \
   -d '{
     "actor_id": "000000000000000000",
@@ -315,7 +315,7 @@ This is useful after rebuilding with `"include_vectors": false`; repeat it until
 Inspect the current chunk index:
 
 ```bash
-curl -sS http://127.0.0.1:8787/trajectory/index/stats \
+curl -sS http://127.0.0.1:8788/trajectory/index/stats \
   -H 'Content-Type: application/json' \
   -d '{"actor_id": "000000000000000000"}'
 ```
@@ -325,7 +325,7 @@ curl -sS http://127.0.0.1:8787/trajectory/index/stats \
 Read a parsed trajectory by `source_ref`, bounded by `max_chars`:
 
 ```bash
-curl -sS http://127.0.0.1:8787/trajectory/read \
+curl -sS http://127.0.0.1:8788/trajectory/read \
   -H 'Content-Type: application/json' \
   -d '{
     "source_ref": "codex:example-session-id",
@@ -342,7 +342,7 @@ This endpoint requires `Authorization: Bearer <token>`.
 Example:
 
 ```bash
-curl -sS http://127.0.0.1:8787/memory/import-batch \
+curl -sS http://127.0.0.1:8788/memory/import-batch \
   -H 'Content-Type: application/json' \
   -H 'Authorization: Bearer your-real-sync-token' \
   -d '{
@@ -359,7 +359,7 @@ curl -sS http://127.0.0.1:8787/memory/import-batch \
 This endpoint also requires the bearer token:
 
 ```bash
-curl -sS http://127.0.0.1:8787/memory/sync-status \
+curl -sS http://127.0.0.1:8788/memory/sync-status \
   -H 'Content-Type: application/json' \
   -H 'Authorization: Bearer your-real-sync-token' \
   -d '{
@@ -374,7 +374,7 @@ Run this on each teammate’s own machine:
 
 ```bash
 python -m client.sync_trajectories sync \
-  --server http://private-host:8787 \
+  --server http://private-host:8788 \
   --actor-id 000000000000000000 \
   --sources codex,claude \
   --token your-real-sync-token
@@ -384,7 +384,7 @@ Check current server-side sync status:
 
 ```bash
 python -m client.sync_trajectories status \
-  --server http://private-host:8787 \
+  --server http://private-host:8788 \
   --actor-id 000000000000000000 \
   --sources codex,claude \
   --token your-real-sync-token
