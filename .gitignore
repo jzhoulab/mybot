@@ -38,3 +38,4 @@ screenlog.*
 
 # Runtime logs (bot + server)
 logs/
+.discord2.env
