@@ -20,7 +20,9 @@ echo "==> swift build -c $CONFIG"
 swift build -c "$CONFIG"
 
 BIN="$(swift build -c "$CONFIG" --show-bin-path)/MybotMenu"
-APP="dist/${APP_NAME}.app"
+# Stage the bundle in a dot-directory so Spotlight/Launchpad only ever see the
+# installed copy (scripts/deploy.sh puts it in ~/Applications).
+APP=".dist/${APP_NAME}.app"
 MACOS="$APP/Contents/MacOS"
 
 echo "==> bundling $APP"
@@ -71,4 +73,4 @@ fi
 codesign --force --deep --sign - "$APP" >/dev/null 2>&1 || echo "(codesign skipped)"
 
 echo "==> built $APP (commit $GIT_SHA)"
-echo "Launch:  open $APP   (or ./dist/${APP_NAME}.app/Contents/MacOS/${APP_NAME} for logs)"
+echo "Launch:  open $APP   (or ./.dist/${APP_NAME}.app/Contents/MacOS/${APP_NAME} for logs)"

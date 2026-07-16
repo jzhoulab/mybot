@@ -1,6 +1,7 @@
 import Foundation
 import AppKit
 import SwiftUI
+import ServiceManagement
 
 enum SortOrder: String, CaseIterable, Identifiable {
     case sessions = "Sessions"
@@ -70,6 +71,9 @@ final class AppModel: ObservableObject {
     @Published var ownerConfirmed = false
     @Published var identityInvestigating = false
 
+    // Launch at login (SMAppService login item).
+    @Published var launchAtLogin = false
+
     // Chat-platform connections (Connections card).
     @Published var discordConfigured = false
     @Published var slackConfigured = false
@@ -108,6 +112,7 @@ final class AppModel: ObservableObject {
         loadModelPresets()
         refreshIdentity()
         refreshConnections()
+        initLoginItem()
         timer = Timer.scheduledTimer(withTimeInterval: 15, repeats: true) { [weak self] _ in
             Task { @MainActor in
                 guard let self, self.busyMessage == nil else { return }  // don't shift numbers mid-op
@@ -153,6 +158,42 @@ final class AppModel: ObservableObject {
         ChatClient(config: config).rediscoverIdentity { [weak self] identity in
             self?.applyIdentity(identity)
         }
+    }
+
+    // MARK: launch at login
+
+    /// Autolaunch should only ever pin an installed copy, never the build
+    /// staging bundle in the repo.
+    private var installedInApplications: Bool {
+        Bundle.main.bundlePath.contains("/Applications/")
+    }
+
+    /// Auto-enable once for an installed app, then follow the user's toggle.
+    func initLoginItem() {
+        launchAtLogin = SMAppService.mainApp.status == .enabled
+        let onceKey = "mybot.loginItem.autoEnabled"
+        if installedInApplications, !launchAtLogin,
+           !UserDefaults.standard.bool(forKey: onceKey) {
+            UserDefaults.standard.set(true, forKey: onceKey)
+            setLaunchAtLogin(true)
+        }
+    }
+
+    func setLaunchAtLogin(_ on: Bool) {
+        if on && !installedInApplications {
+            lastError = "Run the installed app (~/Applications/mybot.app) to enable launch at login"
+            return
+        }
+        do {
+            if on {
+                try SMAppService.mainApp.register()
+            } else {
+                try SMAppService.mainApp.unregister()
+            }
+        } catch {
+            lastError = "Login item: \(error.localizedDescription)"
+        }
+        launchAtLogin = SMAppService.mainApp.status == .enabled
     }
 
     // MARK: connections

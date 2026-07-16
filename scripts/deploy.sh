@@ -62,7 +62,7 @@ if pgrep -xq mybot; then
   for _ in {1..20}; do pgrep -xq mybot || break; sleep 0.5; done
 fi
 rm -rf "$APP_DEST"
-ditto macapp/dist/mybot.app "$APP_DEST"
+ditto macapp/.dist/mybot.app "$APP_DEST"
 open "$APP_DEST"
 echo "  menu app running from $APP_DEST"
 

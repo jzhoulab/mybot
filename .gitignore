@@ -29,7 +29,7 @@ state/session_pointers.json
 profiles/*/.mybot/
 backups/
 macapp/.build/
-macapp/dist/
+macapp/.dist/
 *.log
 screenlog.*
 *.sqlite3

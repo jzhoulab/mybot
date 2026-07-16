@@ -639,6 +639,11 @@ struct ContentView: View {
                         }
                     }
                 }
+                Divider()
+                Toggle("Start at login", isOn: Binding(
+                    get: { model.launchAtLogin },
+                    set: { model.setLaunchAtLogin($0) }
+                ))
             } label: {
                 chipLabel("Maintain", "wrench.and.screwdriver.fill")
             }
