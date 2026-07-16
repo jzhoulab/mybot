@@ -1,0 +1,21 @@
+#!/bin/sh
+# `mybot` — thin CLI over the mybot memory tool, preset for this install so the
+# agent can just call `mybot trajectory-search ...` / `mybot sql ...` etc.
+# It forwards to scripts/mybot_tool.py with the owner actor id and server URL
+# filled in from the local mybot install. Requires the mybot server running
+# (default http://127.0.0.1:8788).
+#
+# Override MYBOT_HOME if mybot isn't at ~/Code/mybot.
+MYBOT_HOME="${MYBOT_HOME:-$HOME/Code/mybot}"
+if [ ! -f "$MYBOT_HOME/scripts/mybot_tool.py" ]; then
+  echo "mybot: could not find mybot at '$MYBOT_HOME' (set MYBOT_HOME)" >&2
+  exit 2
+fi
+
+owner="$(grep -E '^MEMORY_IMPORTED_OWNER_ID=' "$MYBOT_HOME/.env" 2>/dev/null | head -1 | cut -d= -f2-)"
+py="$(grep -E '^MYBOT_TOOL_PYTHON=' "$MYBOT_HOME/.env" 2>/dev/null | head -1 | cut -d= -f2-)"
+
+export MYBOT_TOOL_ACTOR_ID="${MYBOT_TOOL_ACTOR_ID:-$owner}"
+export MYBOT_TOOL_BASE_URL="${MYBOT_TOOL_BASE_URL:-http://127.0.0.1:8788}"
+
+exec "${py:-/usr/bin/python3}" "$MYBOT_HOME/scripts/mybot_tool.py" "$@"
