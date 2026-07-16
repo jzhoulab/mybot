@@ -1,7 +1,8 @@
 #!/bin/zsh
 # One-command sync so the three copies of mybot can never drift:
 #   repo (main)  ->  GitHub (origin/main)
-#                ->  /Applications/mybot.app   (menu app, rebuilt + reinstalled)
+#                ->  installed menu app        (/Applications, or ~/Applications
+#                                               for a non-admin account)
 #                ->  running services          (server + Discord bridge restarted)
 #                ->  agent skill               (~/.local/bin/mybot, ~/.claude/skills)
 # Run after committing. Flags: --no-push (skip GitHub), --no-services (leave
@@ -46,20 +47,24 @@ fi
 step "Building menu app"
 ./macapp/build.sh release
 
-# 3) Install to /Applications, replacing the running copy if there is one
-step "Installing /Applications/mybot.app"
-APP_WAS_RUNNING=false
+# 3) Install the app, replacing the running copy if there is one.
+# /Applications needs admin; a non-admin account installs to ~/Applications
+# (Spotlight and Launchpad index both the same).
+if [[ -w /Applications ]]; then
+  APP_DEST="/Applications/mybot.app"
+else
+  mkdir -p "$HOME/Applications"
+  APP_DEST="$HOME/Applications/mybot.app"
+fi
+step "Installing $APP_DEST"
 if pgrep -xq mybot; then
-  APP_WAS_RUNNING=true
   osascript -e 'tell application "mybot" to quit' >/dev/null 2>&1 || pkill -x mybot || true
   for _ in {1..20}; do pgrep -xq mybot || break; sleep 0.5; done
 fi
-rm -rf /Applications/mybot.app
-ditto macapp/dist/mybot.app /Applications/mybot.app
-if $APP_WAS_RUNNING; then
-  open /Applications/mybot.app
-  echo "  relaunched menu app from /Applications"
-fi
+rm -rf "$APP_DEST"
+ditto macapp/dist/mybot.app "$APP_DEST"
+open "$APP_DEST"
+echo "  menu app running from $APP_DEST"
 
 # 4) Restart server + Discord bridge on the new code
 if $SERVICES; then
@@ -100,10 +105,10 @@ sh "$ROOT/skills/mybot-memory/install.sh" | sed 's/^/  /'
 # 6) Drift report
 step "Sync summary"
 REMOTE_SHA="$(git rev-parse --short origin/main 2>/dev/null || echo '?')"
-APP_SHA="$(defaults read /Applications/mybot.app/Contents/Info MybotGitSHA 2>/dev/null || echo '?')"
+APP_SHA="$(defaults read "$APP_DEST/Contents/Info" MybotGitSHA 2>/dev/null || echo '?')"
 echo "  repo HEAD:          $HEAD_SHA"
 echo "  GitHub origin/main: $REMOTE_SHA"
-echo "  /Applications app:  $APP_SHA"
+echo "  installed app:      $APP_SHA ($APP_DEST)"
 if $SERVICES; then
   curl -fsS --max-time 3 http://127.0.0.1:8788/health 2>/dev/null \
     | python3 -c 'import json,sys; h=json.load(sys.stdin); print(f"  server:             healthy ({h.get(\"provider_backend\")}/{h.get(\"active_model\")}), index battery-paused: {h.get(\"index_refresh_paused_on_battery\")}")' \
