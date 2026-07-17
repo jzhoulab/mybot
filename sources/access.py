@@ -217,10 +217,22 @@ class TrajectoryAccessAccount:
 class TrajectoryAccessConfig:
     version: int
     sources: dict[str, list[TrajectoryAccessAccount]]
+    # Dirs (or parents of dirs) that tools use as dedicated agent-chat
+    # workspaces (e.g. ~/.mytool/agent). Sessions there stay indexed and
+    # searchable, but never flag as new projects needing owner review.
+    agent_workspace_roots: list[str] = field(default_factory=list)
 
     def accounts_for_source(self, source_name: str) -> list[TrajectoryAccessAccount]:
         accounts = self.sources.get(source_name, [])
         return [account for account in accounts if account.enabled]
+
+    def is_agent_workspace(self, cwd: str) -> bool:
+        cwd = (cwd or "").rstrip("/")
+        for raw in self.agent_workspace_roots:
+            root = os.path.expanduser(str(raw)).rstrip("/")
+            if root and (cwd == root or cwd.startswith(root + "/")):
+                return True
+        return False
 
     def to_json(self) -> dict[str, Any]:
         return {
@@ -232,6 +244,7 @@ class TrajectoryAccessConfig:
                     "Use visibility_mode=whitelist to allow only included workdirs/classes."
                 ),
             },
+            "agent_workspace_roots": list(self.agent_workspace_roots),
             "sources": {
                 source_name: {"roots": [account.to_json() for account in accounts]}
                 for source_name, accounts in sorted(self.sources.items())
@@ -377,7 +390,14 @@ def load_access_config(path: str | os.PathLike[str] | None = None) -> Trajectory
     for source_name, accounts in defaults.sources.items():
         sources.setdefault(source_name, accounts)
 
-    return TrajectoryAccessConfig(version=int(data.get("version", 1)) if isinstance(data, dict) else 1, sources=sources)
+    agent_roots = data.get("agent_workspace_roots", []) if isinstance(data, dict) else []
+    return TrajectoryAccessConfig(
+        version=int(data.get("version", 1)) if isinstance(data, dict) else 1,
+        sources=sources,
+        agent_workspace_roots=[str(root) for root in agent_roots if str(root).strip()]
+        if isinstance(agent_roots, list)
+        else [],
+    )
 
 
 def save_access_config(config: TrajectoryAccessConfig, path: str | os.PathLike[str] | None = None) -> Path:

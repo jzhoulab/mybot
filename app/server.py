@@ -1551,12 +1551,13 @@ class AppState:
                 key = f"{source_name}:{cwd}"
                 sessions = int(entry.get("sessions") or 0)
                 human_sessions = int(entry.get("human_sessions") or 0)
+                # Only a human session makes a project review-worthy, and
+                # dedicated agent-chat workspaces never are — those sessions
+                # stay indexed, they just aren't a project the owner opened.
+                review_worthy = human_sessions > 0 and not self.access_config.is_agent_workspace(cwd)
                 existing = projects.get(key)
                 if existing is None:
-                    # Only a human session makes a project review-worthy; a
-                    # project that so far exists only through AI-driven sessions
-                    # flags later, if and when the owner works there themselves.
-                    if human_sessions == 0 and not first_run:
+                    if not review_worthy and not first_run:
                         continue
                     projects[key] = {
                         "source_name": source_name,
@@ -1566,7 +1567,7 @@ class AppState:
                         "reviewed": bool(first_run),
                     }
                     changed = True
-                elif not existing.get("reviewed") and human_sessions == 0:
+                elif not existing.get("reviewed") and not review_worthy:
                     del projects[key]
                     changed = True
                 elif existing.get("sessions") != sessions:

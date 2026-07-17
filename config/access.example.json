@@ -4,6 +4,10 @@
     "mode": "per_root_visibility",
     "description": "Enabled roots use blacklist mode by default. Use visibility_mode=whitelist to allow only included workdirs/classes."
   },
+  "agent_workspace_roots": [
+    "~/.mytool/agent",
+    "~/.mytool-agent"
+  ],
   "sources": {
     "codex": {
       "roots": [

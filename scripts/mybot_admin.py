@@ -194,7 +194,9 @@ def _latest_source_mtime(config: Any) -> float:
     return latest
 
 
-def _detect_new_projects(cfg: dict[str, Any], breakdown: list[dict[str, Any]]) -> list[dict[str, Any]]:
+def _detect_new_projects(
+    cfg: dict[str, Any], breakdown: list[dict[str, Any]], access_config: Any = None
+) -> list[dict[str, Any]]:
     """Same baseline-then-flag logic as the server, sharing the same file."""
     path = Path(cfg["known_projects_path"])
     try:
@@ -214,10 +216,14 @@ def _detect_new_projects(cfg: dict[str, Any], breakdown: list[dict[str, Any]]) -
         key = f"{source_name}:{cwd}"
         sessions = int(entry.get("sessions") or 0)
         human_sessions = int(entry.get("human_sessions") or 0)
+        # Review-worthiness requires a human session outside any dedicated
+        # agent-chat workspace (see server logic).
+        review_worthy = human_sessions > 0 and not (
+            access_config is not None and access_config.is_agent_workspace(cwd)
+        )
         existing = projects.get(key)
         if existing is None:
-            # Review-worthiness requires a human session (see server logic).
-            if human_sessions == 0 and not first_run:
+            if not review_worthy and not first_run:
                 continue
             projects[key] = {
                 "source_name": source_name,
@@ -227,7 +233,7 @@ def _detect_new_projects(cfg: dict[str, Any], breakdown: list[dict[str, Any]]) -
                 "reviewed": bool(first_run),
             }
             changed = True
-        elif not existing.get("reviewed") and human_sessions == 0:
+        elif not existing.get("reviewed") and not review_worthy:
             del projects[key]
             changed = True
         elif existing.get("sessions") != sessions:
@@ -287,7 +293,7 @@ def cmd_state(_args: argparse.Namespace) -> dict[str, Any]:
         "latest_source_file_mtime": latest_mtime,
         "accounts": accounts,
         "projects": breakdown,
-        "new_projects": _detect_new_projects(cfg, breakdown),
+        "new_projects": _detect_new_projects(cfg, breakdown, config),
     }
 
 
