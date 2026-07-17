@@ -213,8 +213,12 @@ def _detect_new_projects(cfg: dict[str, Any], breakdown: list[dict[str, Any]]) -
         source_name = str(entry.get("source_name") or "")
         key = f"{source_name}:{cwd}"
         sessions = int(entry.get("sessions") or 0)
+        human_sessions = int(entry.get("human_sessions") or 0)
         existing = projects.get(key)
         if existing is None:
+            # Review-worthiness requires a human session (see server logic).
+            if human_sessions == 0 and not first_run:
+                continue
             projects[key] = {
                 "source_name": source_name,
                 "cwd": cwd,
@@ -222,6 +226,9 @@ def _detect_new_projects(cfg: dict[str, Any], breakdown: list[dict[str, Any]]) -
                 "sessions": sessions,
                 "reviewed": bool(first_run),
             }
+            changed = True
+        elif not existing.get("reviewed") and human_sessions == 0:
+            del projects[key]
             changed = True
         elif existing.get("sessions") != sessions:
             existing["sessions"] = sessions

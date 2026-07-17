@@ -530,6 +530,9 @@ class TrajectoryChunkIndex:
                 SELECT source_name,
                        cwd,
                        COUNT(DISTINCT source_ref) AS sessions,
+                       COUNT(DISTINCT CASE
+                           WHEN COALESCE(json_extract(metadata_json, '$.origin'), '') != 'automated'
+                           THEN source_ref END) AS human_sessions,
                        COUNT(*) AS chunks,
                        MAX(updated_at) AS updated_at
                 FROM trajectory_chunks

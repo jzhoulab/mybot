@@ -819,8 +819,9 @@ struct SessionDetail: View {
                                        exclude: { model.excludeSession(session) })
                         }
                         if visibleSessions.isEmpty {
-                            Text(showAutomated ? "No sessions indexed"
-                                               : "Only AI-driven sessions here — toggle above to see them")
+                            Text(showAutomated || automatedSessions.isEmpty
+                                 ? "No sessions indexed yet — the index may still be catching up"
+                                 : "Only AI-driven sessions here — toggle above to see them")
                                 .font(.system(size: 11)).foregroundStyle(.secondary)
                                 .frame(maxWidth: .infinity).padding(.top, 30)
                         }

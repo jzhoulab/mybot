@@ -113,6 +113,7 @@ final class AppModel: ObservableObject {
         refreshIdentity()
         refreshConnections()
         initLoginItem()
+        ensureServerRunning()
         timer = Timer.scheduledTimer(withTimeInterval: 15, repeats: true) { [weak self] _ in
             Task { @MainActor in
                 guard let self, self.busyMessage == nil else { return }  // don't shift numbers mid-op
@@ -194,6 +195,41 @@ final class AppModel: ObservableObject {
             lastError = "Login item: \(error.localizedDescription)"
         }
         launchAtLogin = SMAppService.mainApp.status == .enabled
+    }
+
+    // MARK: local server
+
+    private var serverStartAttempted = false
+
+    /// Start the chat server + Discord bridge when the app comes up and finds
+    /// them down. The launcher is single-instance, so racing a manually
+    /// started copy is harmless. One attempt per app run — if the owner shuts
+    /// the server down on purpose, the app doesn't fight them.
+    func ensureServerRunning() {
+        guard !serverStartAttempted else { return }
+        guard var parts = URLComponents(url: config.guiURL, resolvingAgainstBaseURL: false) else { return }
+        parts.path = "/health"
+        guard let healthURL = parts.url else { return }
+        var request = URLRequest(url: healthURL)
+        request.timeoutInterval = 3
+        URLSession.shared.dataTask(with: request) { [weak self] _, response, _ in
+            if (response as? HTTPURLResponse)?.statusCode == 200 { return }
+            Task { @MainActor in self?.startLocalServer() }
+        }.resume()
+    }
+
+    private func startLocalServer() {
+        guard !serverStartAttempted else { return }
+        serverStartAttempted = true
+        let script = config.repoRoot.appendingPathComponent("run_discord_chatbot.sh").path
+        let log = config.repoRoot.appendingPathComponent("state/run/mybot-launcher.log").path
+        let process = Process()
+        process.executableURL = URL(fileURLWithPath: "/bin/zsh")
+        process.arguments = [
+            "-c",
+            "MYBOT_SERVER_START_TIMEOUT_SECONDS=180 nohup '\(script)' >> '\(log)' 2>&1 &",
+        ]
+        try? process.run()
     }
 
     // MARK: connections
@@ -644,8 +680,10 @@ final class AppModel: ObservableObject {
     /// are already indexed (detection diffs indexed projects against a baseline),
     /// so the normal index-backed detail view works.
     func openNewProject(_ np: NewProject) {
+        let policy = AccessPolicy.load(config.accessConfigPath)
         openDetail(Project(source: np.source, cwd: np.cwd, sessions: np.sessions,
-                           chunks: 0, updatedAt: "", included: false))
+                           chunks: 0, updatedAt: "",
+                           included: policy.included(source: np.source, cwd: np.cwd)))
     }
 
     func openDetail(_ project: Project) {
