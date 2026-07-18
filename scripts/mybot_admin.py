@@ -239,6 +239,16 @@ def _detect_new_projects(
         elif existing.get("sessions") != sessions:
             existing["sessions"] = sessions
             changed = True
+    # Drop unreviewed entries for projects no longer in the index (see server).
+    breakdown_keys = {
+        f"{entry.get('source_name')}:{str(entry.get('cwd') or '').strip()}"
+        for entry in breakdown
+    }
+    for key in [
+        k for k, v in projects.items() if not v.get("reviewed") and k not in breakdown_keys
+    ]:
+        del projects[key]
+        changed = True
     if first_run:
         data["baselined"] = True
         changed = True

@@ -1500,6 +1500,7 @@ class AppState:
         result = self.trajectory_chunk_index.refresh_changed(
             include_vectors=include_vectors,
             max_sessions=self.config.trajectory_index_refresh_max_sessions,
+            is_allowed=self._session_allowed_by_policy,
         )
         if result.get("sessions_updated") or result.get("sessions_removed"):
             self.trajectory_lookup.clear()
@@ -1573,6 +1574,20 @@ class AppState:
                 elif existing.get("sessions") != sessions:
                     existing["sessions"] = sessions
                     changed = True
+            # A pending card must not outlive its evidence: if the project has
+            # left the index entirely (sessions excluded, reclassified, or
+            # deleted), drop the unreviewed entry instead of showing a card
+            # whose detail view is empty.
+            breakdown_keys = {
+                f"{entry.get('source_name')}:{str(entry.get('cwd') or '').strip()}"
+                for entry in breakdown
+            }
+            for key in [
+                k for k, v in projects.items()
+                if not v.get("reviewed") and k not in breakdown_keys
+            ]:
+                del projects[key]
+                changed = True
             if first_run:
                 data["baselined"] = True
                 changed = True

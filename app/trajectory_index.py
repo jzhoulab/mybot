@@ -447,7 +447,9 @@ class TrajectoryChunkIndex:
             "overlap_chars": self.overlap_chars,
         }
 
-    def refresh_changed(self, *, include_vectors: bool = False, max_sessions: int = 0) -> dict[str, Any]:
+    def refresh_changed(
+        self, *, include_vectors: bool = False, max_sessions: int = 0, is_allowed: Any = None
+    ) -> dict[str, Any]:
         started = utc_now()
         self.lookup.clear()
         sessions = self.lookup.sessions()
@@ -458,7 +460,9 @@ class TrajectoryChunkIndex:
         with self._connect() as conn:
             rows = conn.execute(
                 """
-                SELECT source_ref, MAX(updated_at) AS updated_at, COUNT(*) AS chunks
+                SELECT source_ref, MAX(updated_at) AS updated_at, COUNT(*) AS chunks,
+                       MAX(file_path) AS file_path, MAX(session_id) AS session_id,
+                       MAX(cwd) AS cwd, MAX(source_name) AS source_name
                 FROM trajectory_chunks
                 GROUP BY source_ref
                 """
@@ -467,6 +471,10 @@ class TrajectoryChunkIndex:
             str(row["source_ref"]): {
                 "updated_at": str(row["updated_at"] or ""),
                 "chunks": int(row["chunks"] or 0),
+                "file_path": str(row["file_path"] or ""),
+                "session_id": str(row["session_id"] or ""),
+                "cwd": str(row["cwd"] or ""),
+                "source_name": str(row["source_name"] or ""),
             }
             for row in rows
         }
@@ -484,7 +492,20 @@ class TrajectoryChunkIndex:
             selected_refs = stale_refs
             remaining_stale = 0
 
-        removed_refs = sorted(set(indexed_by_ref) - set(session_by_ref))
+        # An indexed session absent from the listing is NOT proof it was
+        # deleted: the source scan caps at the most-recent N files, so old
+        # sessions fall out of the window while their files (and validity)
+        # remain. Only purge when the file is really gone, or the current
+        # policy blocks the session (exclusions must still take effect).
+        removed_refs = []
+        for source_ref in sorted(set(indexed_by_ref) - set(session_by_ref)):
+            info = indexed_by_ref[source_ref]
+            if not info["file_path"] or not os.path.exists(info["file_path"]):
+                removed_refs.append(source_ref)
+            elif is_allowed is not None and not is_allowed(
+                info["source_name"], info["session_id"], info["cwd"]
+            ):
+                removed_refs.append(source_ref)
         drafts: list[ChunkDraft] = []
         counts_by_source: dict[str, int] = {}
         for source_ref in selected_refs:
