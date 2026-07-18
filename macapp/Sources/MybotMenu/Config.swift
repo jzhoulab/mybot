@@ -82,12 +82,6 @@ struct MybotConfig {
         return nil
     }
 
-    /// True when the app was built from a different commit than the repo HEAD.
-    static var appBehindSource: Bool {
-        guard let head = sourceHeadSHA() else { return false }
-        return !buildSHA.hasPrefix(head)
-    }
-
     static func parseDotEnv(_ url: URL) -> [String: String] {
         guard let text = try? String(contentsOf: url, encoding: .utf8) else { return [:] }
         var out: [String: String] = [:]

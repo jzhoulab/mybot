@@ -74,6 +74,11 @@ final class AppModel: ObservableObject {
     // Launch at login (SMAppService login item).
     @Published var launchAtLogin = false
 
+    // Build-vs-repo drift, computed off-main in reload() — the footer must
+    // never touch .git files during body evaluation (menu-open latency).
+    @Published var appBehindSource = false
+    @Published var sourceHead: String?
+
     // Chat-platform connections (Connections card).
     @Published var discordConfigured = false
     @Published var slackConfigured = false
@@ -319,7 +324,11 @@ final class AppModel: ObservableObject {
 
     /// Render the cute bot to an NSImage for the menu bar (non-template so it
     /// keeps its status color).
+    private var renderedIconKey = ""
+
     private func renderIcon() {
+        let key = "\(mood)-\(newProjects.count)"
+        guard key != renderedIconKey else { return }  // 15s ticks mostly change nothing
         let renderer = ImageRenderer(
             content: BotIconMono(mood: mood, badge: newProjects.count)
                 .frame(width: 20, height: 20)
@@ -328,6 +337,7 @@ final class AppModel: ObservableObject {
         if let image = renderer.nsImage {
             image.isTemplate = true  // menu bar tints it (black on light, white on dark)
             statusIcon = image
+            renderedIconKey = key
         }
     }
 
@@ -443,12 +453,17 @@ final class AppModel: ObservableObject {
                 return AutomatedCluster(detail: detail, count: count, excluded: isExcluded)
             }
 
+            let sourceHead = MybotConfig.sourceHeadSHA()
+            let behind = sourceHead.map { !MybotConfig.buildSHA.hasPrefix($0) } ?? false
+
             DispatchQueue.main.async {
                 self.projects = projects
                 self.newProjects = pending
                 self.health = health
                 self.clusters = clusters
                 self.currentModelId = modelId
+                self.sourceHead = sourceHead
+                self.appBehindSource = behind
                 self.indexBusy = false
                 self.degradedSince = nil
                 self.renderIcon()
