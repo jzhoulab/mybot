@@ -860,33 +860,92 @@ class TrajectoryChunkIndex:
     # an unfiltered search anyway, so use the full matrix and post-filter.
     _VECTOR_CANDIDATE_FILTER_MAX = 4000
 
+    _INSTANT_STOPWORDS = frozenset(
+        "i me my we our you your he she it its they them the a an and or but if then else "
+        "of in on at to for from by with about as into is are was were be been being do "
+        "does did done can could should would will shall may might must have has had not "
+        "no nor so than too very just there here what which who whom whose when where why "
+        "how all any both each few more most other some such that this these those tell "
+        "remind forgot remember recently ask asked asking please".split()
+    )
+
     def instant_hits(self, query: str, *, limit: int = 10) -> list[dict[str, Any]]:
-        """The menu app's as-you-type search, server-side: tokenized prefix FTS,
-        best chunk per session. Injected into the chat context so the agent
-        starts from the same candidate list the owner is looking at."""
-        tokens = [t.replace('"', '""') for t in query.split() if t.strip()]
+        """The menu app's as-you-type search, server-side: prefix FTS ranked by
+        bm25, best chunk per session. Injected into the chat context so the
+        agent starts from the same candidate list the owner is looking at.
+        Chat queries are full sentences, so filler words are dropped and the
+        content terms are OR-joined — implicit-AND over 30 tokens matches
+        nothing."""
+        seen_tokens: set[str] = set()
+        tokens: list[str] = []
+        for raw in query.split():
+            t = raw.strip('.,;:!?"\'()[]{}').replace('"', '""')
+            key = t.lower()
+            if not t or len(t) < 2 or key in self._INSTANT_STOPWORDS or key in seen_tokens:
+                continue
+            seen_tokens.add(key)
+            tokens.append(t)
+        tokens = tokens[:8]
         if not tokens:
             return []
-        match = " ".join(f'"{t}"*' for t in tokens)
-        out: list[dict[str, Any]] = []
-        seen: set[str] = set()
+        # Rank by DISTINCT terms matched, then bm25. A single OR query lets one
+        # ubiquitous term (the tool names appear in every transcript) dominate;
+        # counting terms per chunk keeps multi-word matches on top.
+        matched_terms: dict[int, set[str]] = {}
+        title_terms: dict[int, set[str]] = {}
+        best_rank: dict[int, float] = {}
         with self._connect() as conn:
+            for token in tokens:
+                # Title matches are the strongest signal — session titles ARE
+                # the user's past asks — so count them separately and weight
+                # them above transcript-text matches.
+                for column, bucket in (("title", title_terms), ("", matched_terms)):
+                    match = f'{column}: "{token}"*' if column else f'"{token}"*'
+                    try:
+                        rows = conn.execute(
+                            """
+                            SELECT rowid, bm25(trajectory_chunks_fts) AS rank
+                            FROM trajectory_chunks_fts
+                            WHERE trajectory_chunks_fts MATCH ?
+                            ORDER BY rank
+                            LIMIT 300
+                            """,
+                            (match,),
+                        ).fetchall()
+                    except sqlite3.OperationalError:
+                        continue
+                    for row in rows:
+                        rowid = int(row["rowid"])
+                        bucket.setdefault(rowid, set()).add(token.lower())
+                        rank = float(row["rank"])
+                        if rank < best_rank.get(rowid, 0.0):
+                            best_rank[rowid] = rank
+            if not matched_terms and not title_terms:
+                return []
+
+            def hit_score(rid: int) -> tuple[int, float]:
+                score = 2 * len(title_terms.get(rid, ())) + len(matched_terms.get(rid, ()))
+                return (-score, best_rank.get(rid, 0.0))
+
+            ranked = sorted(set(matched_terms) | set(title_terms), key=hit_score)[: limit * 4]
+            placeholders = ",".join("?" for _ in ranked)
             try:
                 rows = conn.execute(
-                    """
-                    SELECT c.source_ref, c.source_name, c.title, c.cwd,
-                           c.updated_at, c.metadata_json
-                    FROM trajectory_chunks_fts f
-                    JOIN trajectory_chunks c ON c.id = f.rowid
-                    WHERE trajectory_chunks_fts MATCH ?
-                    ORDER BY f.rank
-                    LIMIT 60
+                    f"""
+                    SELECT id, source_ref, source_name, title, cwd, updated_at, metadata_json
+                    FROM trajectory_chunks WHERE id IN ({placeholders})
                     """,
-                    (match,),
+                    ranked,
                 ).fetchall()
             except sqlite3.OperationalError:
                 return []
-        for row in rows:
+        by_id = {int(row["id"]): row for row in rows}
+        out: list[dict[str, Any]] = []
+        seen: set[str] = set()
+        for rowid in ranked:
+            row = by_id.get(rowid)
+            if row is None:
+                continue
             ref = str(row["source_ref"])
             if ref in seen:
                 continue
@@ -903,6 +962,7 @@ class TrajectoryChunkIndex:
                     "cwd": str(row["cwd"]),
                     "updated_at": str(row["updated_at"]),
                     "metadata": metadata,
+                    "terms_matched": len(matched_terms.get(rowid, set()) | title_terms.get(rowid, set())),
                 }
             )
             if len(out) >= limit:
