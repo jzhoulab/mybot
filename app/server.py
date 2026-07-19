@@ -2043,10 +2043,16 @@ class AppState:
         owner_id = normalize_text(self.config.imported_owner_actor_id, 128)
         return bool(owner_id) and normalize_text(actor_id, 128) == owner_id
 
-    @staticmethod
-    def trajectory_payload_is_private(payload: dict[str, Any]) -> bool:
-        metadata = payload.get("metadata")
-        return isinstance(metadata, dict) and metadata.get("visibility") == "private"
+    def trajectory_payload_is_private(self, payload: dict[str, Any]) -> bool:
+        metadata = payload.get("metadata") if isinstance(payload.get("metadata"), dict) else {}
+        if metadata.get("visibility") == "private":
+            return True
+        # Also honor the LIVE policy by cwd: chunks indexed before a workdir
+        # was marked private carry no stamp, and a config edit must take
+        # effect immediately, not at next re-index.
+        source_name = str(payload.get("source_name") or metadata.get("tool") or "")
+        cwd = str(payload.get("cwd") or metadata.get("cwd") or "")
+        return bool(source_name and cwd) and self.access_config.is_private_workdir(source_name, cwd)
 
     def strip_private_trajectory_payloads(
         self, payloads: list[dict[str, Any]], actor_id: str
