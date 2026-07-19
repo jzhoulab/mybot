@@ -217,9 +217,13 @@ def _detect_new_projects(
         sessions = int(entry.get("sessions") or 0)
         human_sessions = int(entry.get("human_sessions") or 0)
         # Review-worthiness requires a human session outside any dedicated
-        # agent-chat workspace (see server logic).
+        # agent-chat workspace or private chat home (see server logic).
         review_worthy = human_sessions > 0 and not (
-            access_config is not None and access_config.is_agent_workspace(cwd)
+            access_config is not None
+            and (
+                access_config.is_agent_workspace(cwd)
+                or access_config.is_private_workdir(source_name, cwd)
+            )
         )
         existing = projects.get(key)
         if existing is None:

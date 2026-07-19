@@ -105,6 +105,12 @@ class TrajectoryAccessAccount:
     # Per-cluster automated exclusion (origin_detail values: "subagent", "sdk",
     # "exec", "no-user-turns"). exclude_automated=True still means all of them.
     excluded_origin_details: list[str] = field(default_factory=list)
+    # Owner-only visibility: sessions from these workdirs/classes ARE indexed
+    # and searchable by the owner, but never served to other actors (guest
+    # owner-access included). private_workdirs is EXACT cwd match only — a
+    # prefix rule for "/Users/x" would swallow every project under home.
+    private_workdirs: list[str] = field(default_factory=list)
+    private_workdir_classes: list[str] = field(default_factory=list)
 
     @property
     def expanded_base_dir(self) -> str:
@@ -156,6 +162,20 @@ class TrajectoryAccessAccount:
         if mode == "whitelist":
             return self.is_workdir_allowed(workdir) and not self.is_workdir_blocked(workdir)
         return not self.is_workdir_blocked(workdir)
+
+    def is_workdir_private(self, workdir: str | None) -> bool:
+        if not workdir:
+            return False
+        classes = self.workdir_classes(workdir)
+        private_classes = {value.lower() for value in self.private_workdir_classes}
+        if classes & private_classes:
+            return True
+        cwd = workdir.strip().rstrip("/")
+        return any(
+            cwd == expand_path(str(rule)).rstrip("/")
+            for rule in self.private_workdirs
+            if str(rule).strip()
+        )
 
     def is_entrypoint_blocked(self, entrypoints: list[str]) -> bool:
         excluded = {entrypoint.lower() for entrypoint in self.excluded_entrypoints}
@@ -210,6 +230,8 @@ class TrajectoryAccessAccount:
             "excluded_session_ids": self.excluded_session_ids,
             "exclude_automated": self.exclude_automated,
             "excluded_origin_details": self.excluded_origin_details,
+            "private_workdirs": self.private_workdirs,
+            "private_workdir_classes": self.private_workdir_classes,
         }
 
 
@@ -233,6 +255,12 @@ class TrajectoryAccessConfig:
             if root and (cwd == root or cwd.startswith(root + "/")):
                 return True
         return False
+
+    def is_private_workdir(self, source_name: str, cwd: str) -> bool:
+        return any(
+            account.is_workdir_private(cwd)
+            for account in self.accounts_for_source(source_name)
+        )
 
     def to_json(self) -> dict[str, Any]:
         return {
@@ -361,6 +389,16 @@ def _coerce_accounts(source_name: str, raw: Any) -> list[TrajectoryAccessAccount
                 excluded_origin_details=[
                     str(value).strip().lower()
                     for value in item.get("excluded_origin_details", []) or []
+                    if str(value).strip()
+                ],
+                private_workdirs=[
+                    str(value).strip()
+                    for value in item.get("private_workdirs", []) or []
+                    if str(value).strip()
+                ],
+                private_workdir_classes=[
+                    str(value).strip().lower()
+                    for value in item.get("private_workdir_classes", []) or []
                     if str(value).strip()
                 ],
             )

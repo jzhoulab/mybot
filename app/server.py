@@ -1563,10 +1563,15 @@ class AppState:
                 key = f"{source_name}:{cwd}"
                 sessions = int(entry.get("sessions") or 0)
                 human_sessions = int(entry.get("human_sessions") or 0)
-                # Only a human session makes a project review-worthy, and
-                # dedicated agent-chat workspaces never are — those sessions
-                # stay indexed, they just aren't a project the owner opened.
-                review_worthy = human_sessions > 0 and not self.access_config.is_agent_workspace(cwd)
+                # Only a human session makes a project review-worthy; dedicated
+                # agent-chat workspaces and private (owner-only) chat homes
+                # never are — those sessions stay indexed, they just aren't a
+                # project the owner opened.
+                review_worthy = (
+                    human_sessions > 0
+                    and not self.access_config.is_agent_workspace(cwd)
+                    and not self.access_config.is_private_workdir(source_name, cwd)
+                )
                 existing = projects.get(key)
                 if existing is None:
                     if not review_worthy and not first_run:
@@ -1848,6 +1853,43 @@ class AppState:
                 "trajectory_index": result,
             }
 
+    def maybe_run_deep_backfill(self) -> None:
+        """One-time full-history indexing pass. The steady-state scan window is
+        the most-recent N files per tool (energy: every cycle re-parses the
+        window), so sessions older than the window were never indexed. Raise
+        the window once, index everything, and let the purge-only-when-file-
+        gone rule keep the old sessions from then on. Runs only on AC power
+        (the caller gates on battery) and only once (marker file)."""
+        marker = Path(self.config.state_dir) / "deep_backfill_done.json"
+        if marker.exists():
+            return
+        lookup = self.trajectory_chunk_index.lookup
+        original_cap = lookup.max_files_per_tool
+        deep_cap = max(original_cap, 10000)
+        print(f"Deep backfill: one-time indexing pass over up to {deep_cap} files per tool…")
+        try:
+            lookup.max_files_per_tool = deep_cap
+            result = self.trajectory_chunk_index.refresh_changed(
+                include_vectors=False,
+                max_sessions=0,
+                is_allowed=self._session_allowed_by_policy,
+            )
+            marker.write_text(json.dumps({"at": utc_now(), "result": {
+                "sessions_seen": result.get("sessions_seen"),
+                "sessions_updated": result.get("sessions_updated"),
+                "chunks_inserted": result.get("chunks_inserted"),
+            }}, indent=2))
+            print(
+                "Deep backfill complete: "
+                f"{result.get('sessions_updated', 0)} sessions indexed, "
+                f"{result.get('chunks_inserted', 0)} chunks (embeddings fill in gradually)."
+            )
+            self.trajectory_lookup.clear()
+        except Exception as exc:  # pragma: no cover - best-effort maintenance
+            print(f"Deep backfill failed (will retry next cycle): {exc}")
+        finally:
+            lookup.max_files_per_tool = original_cap
+
     def start_trajectory_index_background_refresh(self) -> None:
         interval = max(0, self.config.trajectory_index_background_refresh_seconds)
         if interval <= 0 or self.trajectory_index_background_started:
@@ -1871,6 +1913,7 @@ class AppState:
                 if self.background_refresh_paused_on_battery:
                     self.background_refresh_paused_on_battery = False
                     print("Trajectory index background refresh resumed (on AC power).")
+                self.maybe_run_deep_backfill()
                 try:
                     refresh = self.ensure_trajectory_chunk_index_current()
                     self.background_refresh_last_ok = utc_now()
@@ -1995,6 +2038,26 @@ class AppState:
             else:
                 lines.append(f"- [{tool}][{updated_at}] {title}")
         return "\n".join(lines)
+
+    def actor_is_owner(self, actor_id: str) -> bool:
+        owner_id = normalize_text(self.config.imported_owner_actor_id, 128)
+        return bool(owner_id) and normalize_text(actor_id, 128) == owner_id
+
+    @staticmethod
+    def trajectory_payload_is_private(payload: dict[str, Any]) -> bool:
+        metadata = payload.get("metadata")
+        return isinstance(metadata, dict) and metadata.get("visibility") == "private"
+
+    def strip_private_trajectory_payloads(
+        self, payloads: list[dict[str, Any]], actor_id: str
+    ) -> list[dict[str, Any]]:
+        """Owner-only sessions (visibility=private) never leave the machine for
+        another actor, even with guest owner-access enabled. Row filtering works
+        for search/read; raw SQL cannot be filtered, so /trajectory/sql is
+        owner-only outright."""
+        if self.actor_is_owner(actor_id):
+            return payloads
+        return [p for p in payloads if not self.trajectory_payload_is_private(p)]
 
     def can_use_local_trajectory_lookup(
         self,
@@ -2500,7 +2563,8 @@ class AppState:
                 # Subsequent rounds continue only while results are still weak.
                 engage = self.trajectory_search_needs_iteration(query, current)
 
-        return sort_trajectory_sources(list(combined_by_ref.values()), query=query, limit=limit)
+        results = sort_trajectory_sources(list(combined_by_ref.values()), query=query, limit=limit)
+        return self.strip_private_trajectory_payloads(results, actor_id)
 
     @staticmethod
     def _compose_read_query(query: str, discovered: list[str]) -> str:
@@ -3927,6 +3991,7 @@ class ChatHandler(BaseHTTPRequestHandler):
                 for result in results
                 if self.server.state.source_allowed_by_visibility(payload := result.to_payload())
             ]
+            matches = self.server.state.strip_private_trajectory_payloads(matches, actor_id)
             self.respond_json(
                 200,
                 {
@@ -4020,12 +4085,15 @@ class ChatHandler(BaseHTTPRequestHandler):
             self.respond_json(400, {"ok": False, "error": str(exc)})
             return
         target_user_id = normalize_text(str(body.get("target_user_id") or ""), 128) or None
-        if not self.server.state.can_use_local_trajectory_lookup(
+        # Owner-only, stricter than search/read: arbitrary SELECTs cannot be
+        # row-filtered for private (owner-only) sessions, so guests never get
+        # SQL even when guest owner-access is enabled.
+        if not self.server.state.actor_is_owner(actor_id) or not self.server.state.can_use_local_trajectory_lookup(
             actor_id=actor_id,
             memory_scope=memory_scope,
             target_user_id=target_user_id,
         ):
-            self.respond_json(403, {"ok": False, "error": "trajectory SQL is not allowed for this actor/scope"})
+            self.respond_json(403, {"ok": False, "error": "trajectory SQL is owner-only"})
             return
         # mode=ro + query_only stop writes; ATTACH could still read OTHER
         # database files (memories, anything on disk), so it is refused.
@@ -4189,6 +4257,9 @@ class ChatHandler(BaseHTTPRequestHandler):
             if not self.server.state.source_allowed_by_visibility(window):
                 self.respond_json(403, {"ok": False, "error": "trajectory is hidden by visibility policy"})
                 return
+            if not self.server.state.strip_private_trajectory_payloads([window], actor_id):
+                self.respond_json(403, {"ok": False, "error": "trajectory is private to the owner"})
+                return
             self.respond_json(200, {"ok": True, "trajectory": window})
             return
         source = self.server.state.memory_store.get_trajectory_source(
@@ -4228,6 +4299,9 @@ class ChatHandler(BaseHTTPRequestHandler):
             return
         if not self.server.state.source_allowed_by_visibility(result):
             self.respond_json(403, {"ok": False, "error": "trajectory is hidden by visibility policy"})
+            return
+        if not self.server.state.strip_private_trajectory_payloads([result], actor_id):
+            self.respond_json(403, {"ok": False, "error": "trajectory is private to the owner"})
             return
         self.respond_json(200, {"ok": True, "trajectory": result})
 

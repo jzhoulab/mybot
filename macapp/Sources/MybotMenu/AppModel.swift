@@ -375,9 +375,36 @@ final class AppModel: ObservableObject {
 
     /// Snappy: all local reads (SQLite + two JSON files + file sizes), off the
     /// main thread. Never blocks the UI, never depends on the chat server.
-    func reload() {
+    /// mtime+size fingerprint of every file reload() reads. The 15s poll used
+    /// to re-run GROUP BY scans over the (GB-sized) index each tick — ~430 CPU
+    /// minutes a day and real battery drain. Nothing changed → nothing to do.
+    private var lastReloadFingerprint = ""
+
+    private nonisolated static func reloadFingerprint(_ cfg: MybotConfig) -> String {
+        let fm = FileManager.default
+        var parts: [String] = []
+        var paths = [cfg.dbPath.path, cfg.dbPath.path + "-wal", cfg.modelConfigPath.path,
+                     cfg.accessConfigPath.path]
+        paths.append(cfg.dbPath.deletingLastPathComponent().appendingPathComponent("known_projects.json").path)
+        paths.append(cfg.dbPath.deletingLastPathComponent().appendingPathComponent("owner_identity.json").path)
+        for p in paths {
+            let a = (try? fm.attributesOfItem(atPath: p)) ?? [:]
+            let size = (a[.size] as? NSNumber)?.int64Value ?? -1
+            let mtime = (a[.modificationDate] as? Date)?.timeIntervalSince1970 ?? -1
+            parts.append("\(size):\(mtime)")
+        }
+        return parts.joined(separator: "|")
+    }
+
+    func reload(force: Bool = false) {
         let cfg = config
         DispatchQueue.global(qos: .userInitiated).async {
+            let fingerprint = AppModel.reloadFingerprint(cfg)
+            let unchanged: Bool = DispatchQueue.main.sync {
+                !force && !self.projects.isEmpty && !self.indexBusy
+                    && fingerprint == self.lastReloadFingerprint
+            }
+            if unchanged { return }
             let reader = IndexReader(dbPath: cfg.dbPath.path)
             let policy = AccessPolicy.load(cfg.accessConfigPath)
             guard let rows = reader.projects(), let snapshot = reader.health() else {
@@ -466,6 +493,7 @@ final class AppModel: ObservableObject {
                 self.appBehindSource = behind
                 self.indexBusy = false
                 self.degradedSince = nil
+                self.lastReloadFingerprint = fingerprint
                 self.renderIcon()
             }
         }
@@ -477,7 +505,7 @@ final class AppModel: ObservableObject {
         DispatchQueue.main.async {
             self.indexBusy = true
             DispatchQueue.main.asyncAfter(deadline: .now() + 2) {
-                if self.indexBusy { self.reload() }
+                if self.indexBusy { self.reload(force: true) }
             }
         }
     }
@@ -495,7 +523,7 @@ final class AppModel: ObservableObject {
                     self.lastError = (result.json["error"] as? String)
                         ?? (result.stderr.isEmpty ? "action failed" : result.stderr)
                 }
-                self.reload()
+                self.reload(force: true)
             }
         }
     }
@@ -546,7 +574,7 @@ final class AppModel: ObservableObject {
                 self.busyMessage = nil
                 self.lastError = failure
                 self.endSelecting()
-                self.reload()
+                self.reload(force: true)
             }
         }
     }
@@ -565,7 +593,7 @@ final class AppModel: ObservableObject {
                     self.lastError = (result.json["error"] as? String)
                         ?? (result.stderr.isEmpty ? "review failed" : result.stderr)
                 }
-                self.reload()
+                self.reload(force: true)
             }
         }
     }
@@ -776,7 +804,7 @@ final class AppModel: ObservableObject {
                     self.lastError = (result.json["error"] as? String)
                         ?? (result.stderr.isEmpty ? "action failed" : result.stderr)
                 }
-                self.reload()
+                self.reload(force: true)
                 if let project = self.detail { self.openDetail(project) }
             }
         }

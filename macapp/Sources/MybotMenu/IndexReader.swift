@@ -27,15 +27,23 @@ final class IndexReader {
 
     /// nil = the read failed (db locked mid-rebuild, etc.) — callers must treat
     /// that as "unknown", NOT as an empty index.
+    /// App-chat sessions (Codex app / home dir) each get a generated per-chat
+    /// cwd; hundreds of one-session rows would drown the real projects, so
+    /// they collapse into a single aggregate row per source.
+    static let appChatsRoot = NSHomeDirectory() + "/Documents/Codex"
+
     func projects() -> [(source: String, cwd: String, sessions: Int, chunks: Int, updatedAt: String)]? {
         guard let db = openReadOnly() else { return nil }
         defer { sqlite3_close(db) }
         var out: [(String, String, Int, Int, String)] = []
         var stmt: OpaquePointer?
+        let root = IndexReader.appChatsRoot
         let sql = """
-            SELECT source_name, cwd, COUNT(DISTINCT source_ref), COUNT(*), MAX(updated_at)
+            SELECT source_name,
+                   CASE WHEN cwd LIKE '\(root)/%' THEN '\(root)' ELSE cwd END AS project_cwd,
+                   COUNT(DISTINCT source_ref), COUNT(*), MAX(updated_at)
             FROM trajectory_chunks
-            GROUP BY source_name, cwd
+            GROUP BY source_name, project_cwd
             ORDER BY COUNT(DISTINCT source_ref) DESC
             """
         guard sqlite3_prepare_v2(db, sql, -1, &stmt, nil) == SQLITE_OK else { return nil }
@@ -65,7 +73,8 @@ final class IndexReader {
             SELECT source_ref, MAX(session_id), MAX(title), MAX(updated_at), COUNT(*),
                    MAX(json_extract(metadata_json, '$.origin'))
             FROM trajectory_chunks
-            WHERE source_name = ? AND cwd = ?
+            WHERE source_name = ?
+              AND (cwd = ? OR (? = '\(IndexReader.appChatsRoot)' AND cwd LIKE ? || '/%'))
             GROUP BY source_ref
             ORDER BY MAX(updated_at) DESC
             """
@@ -74,6 +83,8 @@ final class IndexReader {
                 cwd.withCString { cPtr in
                     sqlite3_bind_text(stmt, 1, sPtr, -1, nil)
                     sqlite3_bind_text(stmt, 2, cPtr, -1, nil)
+                    sqlite3_bind_text(stmt, 3, cPtr, -1, nil)
+                    sqlite3_bind_text(stmt, 4, cPtr, -1, nil)
                     while sqlite3_step(stmt) == SQLITE_ROW {
                         out.append((
                             text(stmt, 0), text(stmt, 1), text(stmt, 2), text(stmt, 3),

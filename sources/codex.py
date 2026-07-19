@@ -174,6 +174,7 @@ class CodexSourceAdapter(TrajectorySourceAdapter):
                     "cwd": cwd,
                     "origin": origin,
                     "origin_detail": origin_detail,
+                    **({"visibility": "private"} if self.account.is_workdir_private(cwd) else {}),
                 },
             )
             existing = by_session.get(session.session_id)

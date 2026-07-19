@@ -167,6 +167,7 @@ class ClaudeSourceAdapter(TrajectorySourceAdapter):
                         "entrypoints": entrypoints,
                         "origin": origin,
                         "origin_detail": origin_detail,
+                        **({"visibility": "private"} if self.account.is_workdir_private(cwd) else {}),
                         "human_turns": human_turns,
                     },
                 )
