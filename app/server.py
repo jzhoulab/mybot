@@ -1044,6 +1044,7 @@ class ProviderClient:
         result_text = ""
         usage: Any = None
         tool_blocks: dict[int, dict[str, Any]] = {}  # index -> {name, input_json}
+        break_before_text = False  # separate narration segments across tool calls
         for line in proc.stdout:
             line = line.strip()
             if not line:
@@ -1066,6 +1067,10 @@ class ProviderClient:
                     else:
                         text = delta.get("text") or ""
                         if text:
+                            if break_before_text and text_parts:
+                                text_parts.append("\n\n")
+                                on_event({"kind": "delta", "text": "\n\n"})
+                            break_before_text = False
                             text_parts.append(text)
                             on_event({"kind": "delta", "text": text})
                 elif itype == "content_block_start":
@@ -1078,6 +1083,7 @@ class ProviderClient:
                         parsed_input = json.loads(tb["input_json"] or "{}")
                     except json.JSONDecodeError:
                         parsed_input = {}
+                    break_before_text = True
                     on_event({"kind": "tool",
                               "label": _describe_tool({"name": tb["name"], "input": parsed_input})})
             elif etype == "result":
@@ -1089,8 +1095,13 @@ class ProviderClient:
         if proc.returncode not in (0, None):
             err = normalize_text(proc.stderr.read() if proc.stderr else "", 1000)
             raise RuntimeError(f"Claude CLI failed (exit {proc.returncode}). stderr={err}")
-        # Prefer the accumulated deltas; fall back to the result field.
-        text = ("".join(text_parts)).strip() or result_text.strip()
+        # The result field is the CLI's own final answer — the last assistant
+        # message only. The accumulated deltas span the WHOLE agentic loop
+        # (planning narration between tool calls included), so preferring them
+        # glued pre-search monologue onto the answer ("…Let me dig into
+        # both.Both are…"). Deltas remain the live-streaming feed; the final
+        # reply is the final message.
+        text = result_text.strip() or ("".join(text_parts)).strip()
         if usage:
             on_event({"kind": "usage", "usage": usage})
         return {"text": text, "raw": None, "provider_style": "claude_cli",
@@ -3024,7 +3035,9 @@ class AppState:
             "Use retrieved memory snippets and the current session summary as grounded context. "
             "If no relevant memory is provided for a claim about prior work, a person, or a prior decision, "
             "say that the system does not have grounded memory for it instead of guessing. "
-            "When trajectory evidence contains later corrections or renames, use the later corrected wording."
+            "When trajectory evidence contains later corrections or renames, use the later corrected wording. "
+            "The session summary and earlier turns are conversation context, NOT retrieval results: "
+            "never treat items mentioned there as the candidate set for a question about past work."
         )
 
         if memory_scope == "shared":
@@ -3095,7 +3108,19 @@ class AppState:
                 "then say what's certain vs not (with dates for time-sensitive values). Live numbers "
                 "(balances, quotas, job states) usually ARE recorded in past command output — hunt for the "
                 "literal output line (e.g. text LIKE '%Current Balance%') before concluding there's no "
-                "record. Don't touch raw session files directly."
+                "record. Don't touch raw session files directly.\n"
+                "Recall protocol — when asked what they did/asked/decided before:\n"
+                "1. Search FIRST, anchored to the asker's own words. Candidates you already hold from "
+                "the conversation are hypotheses to test, not the answer set: don't grep for phrasings "
+                "only you used, and don't restrict SQL to directories you suspect until a fresh, "
+                "unrestricted search has confirmed them.\n"
+                "2. Arbitrate on the full hit list before deep-reading. Skim titles/dates of ALL hits "
+                "and check every cue in the request — timeframe ('recent' → prefer the newest), which "
+                "tool (claude vs codex), topic. A hit that fits all cues beats a familiar one that "
+                "fits fewer.\n"
+                "3. After reading, verify the session actually answers the question asked. If a cue "
+                "still mismatches (wrong week, wrong tool, wrong subject), say so and go back to the "
+                "hit list or rephrase the search — do not settle for the best already-open candidate."
             )
         elif use_memory and trajectory_allowed:
             sections.append(f"## Trajectory Memory Overview\n{self.trajectory_overview()}")
