@@ -3192,6 +3192,24 @@ class AppState:
                 "still mismatches (wrong week, wrong tool, wrong subject), say so and go back to the "
                 "hit list or rephrase the search — do not settle for the best already-open candidate."
             )
+            instant = self.strip_private_trajectory_payloads(
+                self.trajectory_chunk_index.instant_hits(query, limit=10), actor_id
+            )
+            if instant:
+                hit_lines = [
+                    "## Instant Index Hits",
+                    "Lexical prefix matches for the asker's literal words — the same list their "
+                    "UI shows while typing. These are CANDIDATES to arbitrate by title/date/tool, "
+                    "not conclusions, and not complete: paraphrased evidence still needs your own "
+                    "semantic trajectory-search. Never answer about past work while ignoring an "
+                    "unruled-out hit below.",
+                ]
+                for hit in instant:
+                    hit_lines.append(
+                        f"- [{hit['source_name']}][{hit['updated_at'][:10]}] {hit['source_ref']} — "
+                        f"{normalize_text(hit['title'], 100)} ({normalize_text(hit['cwd'], 80)})"
+                    )
+                sections.append("\n".join(hit_lines))
         elif use_memory and trajectory_allowed:
             sections.append(f"## Trajectory Memory Overview\n{self.trajectory_overview()}")
             sections.append(f"## Recent Trajectory Catalog\n{self.recent_trajectory_catalog()}")

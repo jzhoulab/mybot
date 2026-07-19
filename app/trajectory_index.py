@@ -860,6 +860,55 @@ class TrajectoryChunkIndex:
     # an unfiltered search anyway, so use the full matrix and post-filter.
     _VECTOR_CANDIDATE_FILTER_MAX = 4000
 
+    def instant_hits(self, query: str, *, limit: int = 10) -> list[dict[str, Any]]:
+        """The menu app's as-you-type search, server-side: tokenized prefix FTS,
+        best chunk per session. Injected into the chat context so the agent
+        starts from the same candidate list the owner is looking at."""
+        tokens = [t.replace('"', '""') for t in query.split() if t.strip()]
+        if not tokens:
+            return []
+        match = " ".join(f'"{t}"*' for t in tokens)
+        out: list[dict[str, Any]] = []
+        seen: set[str] = set()
+        with self._connect() as conn:
+            try:
+                rows = conn.execute(
+                    """
+                    SELECT c.source_ref, c.source_name, c.title, c.cwd,
+                           c.updated_at, c.metadata_json
+                    FROM trajectory_chunks_fts f
+                    JOIN trajectory_chunks c ON c.id = f.rowid
+                    WHERE trajectory_chunks_fts MATCH ?
+                    ORDER BY f.rank
+                    LIMIT 60
+                    """,
+                    (match,),
+                ).fetchall()
+            except sqlite3.OperationalError:
+                return []
+        for row in rows:
+            ref = str(row["source_ref"])
+            if ref in seen:
+                continue
+            seen.add(ref)
+            try:
+                metadata = json.loads(row["metadata_json"] or "{}")
+            except json.JSONDecodeError:
+                metadata = {}
+            out.append(
+                {
+                    "source_ref": ref,
+                    "source_name": str(row["source_name"]),
+                    "title": str(row["title"]),
+                    "cwd": str(row["cwd"]),
+                    "updated_at": str(row["updated_at"]),
+                    "metadata": metadata,
+                }
+            )
+            if len(out) >= limit:
+                break
+        return out
+
     def search(
         self,
         *,
