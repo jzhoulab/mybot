@@ -3201,8 +3201,11 @@ class AppState:
                     "Lexical prefix matches for the asker's literal words — the same list their "
                     "UI shows while typing. These are CANDIDATES to arbitrate by title/date/tool, "
                     "not conclusions, and not complete: paraphrased evidence still needs your own "
-                    "semantic trajectory-search. Never answer about past work while ignoring an "
-                    "unruled-out hit below.",
+                    "semantic trajectory-search. When the question asks about past work, your "
+                    "answer must ACCOUNT FOR every hit below — present it as a candidate, or "
+                    "dismiss it with a one-clause reason (wrong topic/time/tool). Silently "
+                    "omitting a plausible hit is the exact failure this list exists to prevent; "
+                    "when several hits fit, show them all and let the asker pick.",
                 ]
                 for hit in instant:
                     hit_lines.append(
