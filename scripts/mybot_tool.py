@@ -143,7 +143,43 @@ def attach_budget(
     return result
 
 
-def write_budget_log(budget: dict[str, Any], payload: dict[str, Any]) -> None:
+def source_summaries(result: dict[str, Any]) -> list[dict[str, Any]]:
+    """Compact (ref, title) summaries of what a search returned or a read
+    opened — logged per request so the chat server can show the user which
+    trajectories grounded the reply (and make them clickable)."""
+    out: list[dict[str, Any]] = []
+    matches = result.get("matches")
+    if isinstance(matches, list):
+        for match in matches[:8]:
+            if not isinstance(match, dict) or not match.get("source_ref"):
+                continue
+            out.append(
+                {
+                    "source_ref": str(match.get("source_ref")),
+                    "source_name": str(match.get("source_name") or ""),
+                    "record_kind": "match",
+                    "title": str(match.get("title") or match.get("summary_short") or ""),
+                    "match_score": match.get("match_score") or match.get("score"),
+                }
+            )
+    trajectory = result.get("trajectory")
+    if isinstance(trajectory, dict):
+        ref = str(trajectory.get("source_ref") or "")
+        if ref:
+            metadata = trajectory.get("metadata") if isinstance(trajectory.get("metadata"), dict) else {}
+            out.append(
+                {
+                    "source_ref": ref,
+                    "source_name": str(metadata.get("tool") or ref.split(":", 1)[0]),
+                    "record_kind": "read",
+                    "title": str(trajectory.get("title") or ""),
+                    "match_score": None,
+                }
+            )
+    return out
+
+
+def write_budget_log(budget: dict[str, Any], payload: dict[str, Any], result: dict[str, Any] | None = None) -> None:
     log_path = os.environ.get("MYBOT_TOOL_BUDGET_LOG", "").strip()
     if not log_path:
         return
@@ -152,6 +188,10 @@ def write_budget_log(budget: dict[str, Any], payload: dict[str, Any]) -> None:
         **budget,
         "timestamp": datetime.now(timezone.utc).isoformat(),
     }
+    if result is not None:
+        summaries = source_summaries(result)
+        if summaries:
+            record["sources"] = summaries
     query = payload.get("query")
     if isinstance(query, str) and query.strip():
         record["query"] = query[:300]
@@ -229,7 +269,7 @@ def call_and_print(args: argparse.Namespace, path: str, payload: dict[str, Any])
         payload=payload,
         started_at=started_at,
     )
-    write_budget_log(result["_budget"], payload)
+    write_budget_log(result["_budget"], payload, result)
     # The log now includes this call, so spent_seconds() is the true running
     # total — surface what's left so the model can pace its remaining searches.
     if os.environ.get("MYBOT_TOOL_BUDGET_LOG", "").strip():

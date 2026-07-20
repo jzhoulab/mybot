@@ -2765,6 +2765,47 @@ class AppState:
                     budgets.append(record)
         return budgets
 
+    def sources_from_retrieval_budgets(
+        self, budgets: list[dict[str, Any]], actor_id: str
+    ) -> list[dict[str, Any]]:
+        """In agentic-tool-routing mode the agent retrieves through the CLI
+        subprocess, so the server never sees the hits directly — the client's
+        'grounding sources' list would be empty. The tool logs the (ref, title)
+        of everything it opened/matched into the budget log; reconstruct the
+        source chips from there. A session read is stronger evidence than a
+        mere search match, so reads win when a ref appears as both."""
+        best: dict[str, dict[str, Any]] = {}
+        for budget in budgets:
+            for source in budget.get("sources") or []:
+                if not isinstance(source, dict):
+                    continue
+                ref = str(source.get("source_ref") or "")
+                if not ref:
+                    continue
+                kind = str(source.get("record_kind") or "match")
+                prior = best.get(ref)
+                if prior is not None and prior.get("record_kind") == "read" and kind != "read":
+                    continue
+                best[ref] = {
+                    "record_kind": kind,
+                    "scope": "private",
+                    "source_type": "trajectory",
+                    "source_name": str(source.get("source_name") or ref.split(":", 1)[0]),
+                    "source_ref": ref,
+                    "parent_source_ref": None,
+                    "title": normalize_text(str(source.get("title") or ""), 160),
+                    "summary_short": "",
+                    "text_preview": "",
+                    "updated_at": "",
+                    "metadata": {},
+                    "match_score": source.get("match_score"),
+                }
+        ordered = sorted(
+            best.values(),
+            key=lambda record: (record.get("record_kind") != "read", -(record.get("match_score") or 0)),
+        )
+        return self.strip_private_trajectory_payloads(ordered, actor_id)
+
     OWNER_PROFILE_FILE = "USER.md"
     OWNER_INVESTIGATION_PROMPT = (
         "Investigate my own trajectory memory and write a concise profile of ME, the owner "
@@ -3712,6 +3753,15 @@ class ChatHandler(BaseHTTPRequestHandler):
                 }
             )
         source_records.extend(memory_sources)
+        # Agentic tool routing retrieves via the CLI subprocess, so the hits
+        # aren't in memory_sources — recover them from the budget log the tool
+        # wrote, so the grounding-sources list (and its clickable chips) works
+        # in tool-routing mode too. Dedup by ref against what we already have.
+        seen_refs = {str(record.get("source_ref") or "") for record in source_records}
+        for record in self.server.state.sources_from_retrieval_budgets(retrieval_budgets, actor_id):
+            if record["source_ref"] not in seen_refs:
+                source_records.append(record)
+                seen_refs.add(record["source_ref"])
 
         self.server.state.sessions.append_message(
             session_key, user, "user", ctx["message"],

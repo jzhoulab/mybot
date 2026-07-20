@@ -1487,7 +1487,10 @@ struct ChatBubble: View {
                         .font(.system(size: 12)).textSelection(.enabled)
                         .frame(maxWidth: .infinity, alignment: .leading)
                 }
-                if !msg.sources.isEmpty || !msg.toolCalls.isEmpty {
+                if !openableSources.isEmpty {
+                    sourceBadges.padding(.top, 9)
+                }
+                if !msg.toolCalls.isEmpty || !msg.sources.isEmpty {
                     internals.padding(.top, 8)
                 }
             }
@@ -1495,6 +1498,52 @@ struct ChatBubble: View {
             .background(RoundedRectangle(cornerRadius: 10, style: .continuous).fill(Color.primary.opacity(0.05)))
             .id(msg.id)
         }
+    }
+
+    /// Openable trajectory sources, most-referenced kind first (reads over
+    /// mere matches), deduped by ref.
+    private var openableSources: [ChatSource] {
+        var seen = Set<String>()
+        return msg.sources.filter { source in
+            guard source.isOpenable, !seen.contains(source.ref) else { return false }
+            seen.insert(source.ref)
+            return true
+        }
+    }
+
+    /// Always-visible clickable badges for the trajectories that grounded the
+    /// reply — the "matched trajectories" list, restored. Tapping opens the
+    /// session in the trajectory viewer.
+    private var sourceBadges: some View {
+        VStack(alignment: .leading, spacing: 5) {
+            Text("GROUNDED IN")
+                .font(.system(size: 8.5, weight: .heavy)).tracking(0.6)
+                .foregroundStyle(.secondary)
+            FlowLayout(spacing: 5) {
+                ForEach(openableSources) { source in
+                    Button { onOpenSource?(source) } label: {
+                        HStack(spacing: 5) {
+                            SourceTag(source: source.sourceName)
+                            Text(source.title.isEmpty ? source.ref : source.title)
+                                .font(.system(size: 10.5, weight: .medium))
+                                .lineLimit(1).truncationMode(.middle)
+                            Image(systemName: "arrow.up.right.square")
+                                .font(.system(size: 9, weight: .semibold))
+                                .foregroundStyle(Palette.accent)
+                        }
+                        .padding(.vertical, 4).padding(.horizontal, 7)
+                        .background(RoundedRectangle(cornerRadius: 7, style: .continuous)
+                            .fill(Palette.accent.opacity(0.09)))
+                        .overlay(RoundedRectangle(cornerRadius: 7, style: .continuous)
+                            .stroke(Palette.accent.opacity(0.22), lineWidth: 1))
+                        .contentShape(Rectangle())
+                    }
+                    .buttonStyle(.plain)
+                    .help("Open \(source.ref)")
+                }
+            }
+        }
+        .frame(maxWidth: .infinity, alignment: .leading)
     }
 
     /// What mybot did behind the scenes: retrieval steps + grounding sources.
@@ -1524,32 +1573,18 @@ struct ChatBubble: View {
                     .font(.system(size: 10, design: .monospaced))
                     .foregroundStyle(.secondary)
                 }
-                ForEach(msg.sources) { source in
-                    Button {
-                        onOpenSource?(source)
-                    } label: {
-                        HStack(spacing: 6) {
-                            SourceTag(source: source.sourceName)
-                            Text(source.title.isEmpty ? source.ref : source.title)
-                                .font(.system(size: 10.5, weight: .medium)).lineLimit(1)
-                            Spacer(minLength: 4)
-                            if let score = source.score {
-                                Text(String(format: "%.0f", score))
-                                    .font(.system(size: 9.5, design: .monospaced))
-                                    .foregroundStyle(.secondary)
-                            }
-                            if source.isOpenable {
-                                Image(systemName: "chevron.right")
-                                    .font(.system(size: 8, weight: .semibold)).foregroundStyle(.secondary)
-                            }
-                        }
-                        .padding(.vertical, 4).padding(.horizontal, 6)
-                        .background(RoundedRectangle(cornerRadius: 7, style: .continuous)
-                            .fill(Color.primary.opacity(0.045)))
-                        .contentShape(Rectangle())
+                // Non-openable grounding (session summary, promoted notes) —
+                // the openable trajectories already show as badges above.
+                ForEach(msg.sources.filter { !$0.isOpenable }) { source in
+                    HStack(spacing: 6) {
+                        SourceTag(source: source.sourceName)
+                        Text(source.title.isEmpty ? source.ref : source.title)
+                            .font(.system(size: 10.5, weight: .medium)).lineLimit(1)
+                        Spacer(minLength: 4)
                     }
-                    .buttonStyle(.plain)
-                    .disabled(!source.isOpenable)
+                    .padding(.vertical, 4).padding(.horizontal, 6)
+                    .background(RoundedRectangle(cornerRadius: 7, style: .continuous)
+                        .fill(Color.primary.opacity(0.045)))
                 }
             }
         }
@@ -1561,10 +1596,48 @@ struct ChatBubble: View {
             let secs = msg.toolCalls.reduce(0) { $0 + $1.seconds }
             parts.append("\(msg.toolCalls.count) retrieval step\(msg.toolCalls.count == 1 ? "" : "s") · \(String(format: "%.2fs", secs))")
         }
-        if !msg.sources.isEmpty {
-            parts.append("\(msg.sources.count) source\(msg.sources.count == 1 ? "" : "s")")
+        let other = msg.sources.filter { !$0.isOpenable }.count
+        if other > 0 {
+            parts.append("\(other) note\(other == 1 ? "" : "s")")
         }
-        return parts.joined(separator: " · ")
+        return parts.isEmpty ? "how mybot answered" : parts.joined(separator: " · ")
+    }
+}
+
+/// Minimal wrapping HStack — badges flow onto new lines when they run out of
+/// width. SwiftUI has no built-in equivalent that ships pre-Sonoma.
+struct FlowLayout: Layout {
+    var spacing: CGFloat = 6
+
+    func sizeThatFits(proposal: ProposedViewSize, subviews: Subviews, cache: inout Void) -> CGSize {
+        let maxWidth = proposal.width ?? .infinity
+        var x: CGFloat = 0, y: CGFloat = 0, rowHeight: CGFloat = 0, maxRowWidth: CGFloat = 0
+        for view in subviews {
+            let size = view.sizeThatFits(.unspecified)
+            if x > 0 && x + size.width > maxWidth {
+                y += rowHeight + spacing
+                x = 0; rowHeight = 0
+            }
+            x += size.width + spacing
+            rowHeight = max(rowHeight, size.height)
+            maxRowWidth = max(maxRowWidth, x - spacing)
+        }
+        return CGSize(width: min(maxRowWidth, maxWidth), height: y + rowHeight)
+    }
+
+    func placeSubviews(in bounds: CGRect, proposal: ProposedViewSize, subviews: Subviews, cache: inout Void) {
+        let maxWidth = bounds.width
+        var x: CGFloat = 0, y: CGFloat = 0, rowHeight: CGFloat = 0
+        for view in subviews {
+            let size = view.sizeThatFits(.unspecified)
+            if x > 0 && x + size.width > maxWidth {
+                y += rowHeight + spacing
+                x = 0; rowHeight = 0
+            }
+            view.place(at: CGPoint(x: bounds.minX + x, y: bounds.minY + y), proposal: ProposedViewSize(size))
+            x += size.width + spacing
+            rowHeight = max(rowHeight, size.height)
+        }
     }
 }
 
