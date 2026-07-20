@@ -2804,7 +2804,13 @@ class AppState:
             best.values(),
             key=lambda record: (record.get("record_kind") != "read", -(record.get("match_score") or 0)),
         )
-        return self.strip_private_trajectory_payloads(ordered, actor_id)
+        # Reads are what the agent actually zoomed into — always keep them; cap
+        # the trailing search matches so multi-query answers don't sprawl into
+        # a dozen loosely-related badges.
+        reads = [r for r in ordered if r.get("record_kind") == "read"]
+        matches = [r for r in ordered if r.get("record_kind") != "read"]
+        capped = reads + matches[: max(0, 6 - len(reads))]
+        return self.strip_private_trajectory_payloads(capped, actor_id)
 
     OWNER_PROFILE_FILE = "USER.md"
     OWNER_INVESTIGATION_PROMPT = (
