@@ -59,6 +59,11 @@ final class AppModel: ObservableObject {
     @Published var chat: [ChatMsg] = []
     @Published var chatPending = false
     @Published var chatActivity = ""   // live tool line while streaming
+    // Named chat threads (Ask history). activeThreadKey is the current one.
+    @Published var chatThreads: [ChatClient.ChatThread] = []
+    @Published var activeThreadKey: String = ChatClient.threadPrefix
+    @Published var showChatList = false
+    @Published var loadingThread = false
     private var searchWork: DispatchWorkItem?
     private var streamTask: Task<Void, Never>?
     @Published var busyMessage: String?
@@ -678,7 +683,9 @@ final class AppModel: ObservableObject {
             var msg = chat[i]; mutate(&msg); chat[i] = msg
         }
 
-        streamTask = ChatClient(config: config).stream(q) { [weak self] event in
+        var client = ChatClient(config: config)
+        client.sessionKey = activeThreadKey
+        streamTask = client.stream(q) { [weak self] event in
             guard let self else { return }
             switch event {
             case .tool(let label):
@@ -695,6 +702,7 @@ final class AppModel: ObservableObject {
                     $0.toolCalls = reply.toolCalls
                     $0.streaming = false
                 }
+                self.loadChatThreads()  // refresh titles/preview after a turn
             case .failure(let error):
                 self.chatPending = false
                 self.chatActivity = ""
@@ -710,12 +718,42 @@ final class AppModel: ObservableObject {
         }
     }
 
+    // MARK: chat threads (Ask history)
+
+    func loadChatThreads() {
+        ChatClient(config: config).listThreads { [weak self] threads in
+            self?.chatThreads = threads
+        }
+    }
+
+    /// Start a fresh named chat. New threads get a unique key so they never
+    /// collide with an existing transcript.
     func newChat() {
         streamTask?.cancel()
         chat = []
         chatPending = false
         chatActivity = ""
-        ChatClient(config: config).resetSession()
+        showChatList = false
+        activeThreadKey = "\(ChatClient.threadPrefix)-\(UUID().uuidString.prefix(8).lowercased())"
+    }
+
+    /// Reopen a saved chat: load its transcript and continue in that thread.
+    func openChat(_ thread: ChatClient.ChatThread) {
+        guard thread.key != activeThreadKey || chat.isEmpty else { showChatList = false; return }
+        streamTask?.cancel()
+        chatPending = false
+        chatActivity = ""
+        showChatList = false
+        activeThreadKey = thread.key
+        chat = []
+        loadingThread = true
+        var client = ChatClient(config: config)
+        client.sessionKey = thread.key
+        client.loadHistory(thread.key) { [weak self] msgs in
+            guard let self, self.activeThreadKey == thread.key else { return }
+            self.chat = msgs
+            self.loadingThread = false
+        }
     }
 
     // ---- session drill-down -----------------------------------------------

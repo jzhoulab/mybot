@@ -35,7 +35,11 @@ struct ChatReply {
 /// (search stays fully local either way).
 struct ChatClient {
     let config: MybotConfig
-    static let sessionKey = "menuapp"
+    /// The active chat thread. Each named chat in the Ask list is its own
+    /// `menuapp-<id>` key; the server pins these (no idle rollover) so a
+    /// reopened chat continues in place.
+    var sessionKey: String = ChatClient.threadPrefix
+    static let threadPrefix = "menuapp"
 
     private var baseURL: URL {
         var comps = URLComponents(url: config.guiURL, resolvingAgainstBaseURL: false)!
@@ -54,8 +58,9 @@ struct ChatClient {
         request.httpBody = try? JSONSerialization.data(withJSONObject: [
             "user": config.ownerActorID,
             "actor_id": config.ownerActorID,
-            "session_key": Self.sessionKey,
+            "session_key": sessionKey,
             "message": message,
+            "pin_session": true,
             "use_trajectory_memory": true,
             "return_sources": true,
         ] as [String: Any])
@@ -130,7 +135,7 @@ struct ChatClient {
         request.timeoutInterval = 200
         request.httpBody = try? JSONSerialization.data(withJSONObject: [
             "user": config.ownerActorID, "actor_id": config.ownerActorID,
-            "session_key": Self.sessionKey, "message": message,
+            "session_key": sessionKey, "message": message, "pin_session": true,
             "use_trajectory_memory": true, "return_sources": true,
         ] as [String: Any])
 
@@ -188,7 +193,7 @@ struct ChatClient {
         return ChatReply(text: text, sources: sources, toolCalls: toolCalls)
     }
 
-    /// POST /sessions/reset — start a fresh conversation. Fire and forget.
+    /// POST /sessions/reset — clear a thread's transcript. Fire and forget.
     func resetSession() {
         var request = URLRequest(url: baseURL.appendingPathComponent("sessions/reset"))
         request.httpMethod = "POST"
@@ -196,9 +201,67 @@ struct ChatClient {
         request.timeoutInterval = 10
         request.httpBody = try? JSONSerialization.data(withJSONObject: [
             "user": config.ownerActorID,
-            "session_key": Self.sessionKey,
+            "session_key": sessionKey,
         ])
         URLSession.shared.dataTask(with: request).resume()
+    }
+
+    /// One stored chat thread, for the Ask chat list.
+    struct ChatThread: Identifiable, Hashable {
+        var id: String { key }
+        let key: String
+        let title: String
+        let preview: String
+        let updatedAt: String
+        let messageCount: Int
+    }
+
+    /// POST /sessions/list — enumerate the menu's saved chats, newest first.
+    func listThreads(completion: @escaping ([ChatThread]) -> Void) {
+        var request = URLRequest(url: baseURL.appendingPathComponent("sessions/list"))
+        request.httpMethod = "POST"
+        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        request.timeoutInterval = 10
+        request.httpBody = try? JSONSerialization.data(withJSONObject: [
+            "user": config.ownerActorID, "prefix": Self.threadPrefix,
+        ])
+        URLSession.shared.dataTask(with: request) { data, _, _ in
+            let obj = data.flatMap { try? JSONSerialization.jsonObject(with: $0) as? [String: Any] }
+            let rawThreads = (obj?["threads"] as? [[String: Any]]) ?? []
+            let threads = rawThreads.compactMap { t -> ChatThread? in
+                guard let key = t["session_key"] as? String else { return nil }
+                return ChatThread(
+                    key: key,
+                    title: (t["title"] as? String) ?? "New chat",
+                    preview: (t["preview"] as? String) ?? "",
+                    updatedAt: (t["updated_at"] as? String) ?? "",
+                    messageCount: (t["message_count"] as? Int) ?? 0)
+            }
+            DispatchQueue.main.async { completion(threads) }
+        }.resume()
+    }
+
+    /// POST /sessions/history — load a thread's messages (to reopen a chat).
+    func loadHistory(_ key: String, completion: @escaping ([ChatMsg]) -> Void) {
+        var request = URLRequest(url: baseURL.appendingPathComponent("sessions/history"))
+        request.httpMethod = "POST"
+        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        request.timeoutInterval = 12
+        request.httpBody = try? JSONSerialization.data(withJSONObject: [
+            "user": config.ownerActorID, "session_key": key, "limit": 200,
+        ])
+        URLSession.shared.dataTask(with: request) { data, _, _ in
+            let obj = data.flatMap { try? JSONSerialization.jsonObject(with: $0) as? [String: Any] }
+            let raw = (obj?["history"] as? [[String: Any]]) ?? []
+            let msgs: [ChatMsg] = raw.compactMap { m in
+                let role = (m["role"] as? String) ?? ""
+                guard role == "user" || role == "assistant" else { return nil }
+                var text = (m["content"] as? String) ?? ""
+                if let r = text.range(of: "\n\nRetrieval budget:") { text = String(text[..<r.lowerBound]) }
+                return ChatMsg(role: role, text: text)
+            }
+            DispatchQueue.main.async { completion(msgs) }
+        }.resume()
     }
 
     // MARK: owner identity (onboarding)

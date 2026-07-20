@@ -1348,10 +1348,114 @@ struct AskView: View {
 
     var body: some View {
         VStack(spacing: 0) {
+            threadBar
+            Divider().opacity(0.3)
+            ZStack(alignment: .top) {
+                chatScroll
+                if model.showChatList { chatListOverlay }
+            }
+            Divider().opacity(0.3)
+            inputBar   // at the bottom, per chatbot convention
+        }
+        .onAppear { focused = true; model.loadChatThreads() }
+    }
+
+    // Header: toggle the saved-chats list, and start a new chat.
+    private var threadBar: some View {
+        HStack(spacing: 8) {
+            Button { model.showChatList.toggle() } label: {
+                HStack(spacing: 5) {
+                    Image(systemName: "bubble.left.and.bubble.right.fill").font(.system(size: 10))
+                    Text(model.chatThreads.first(where: { $0.key == model.activeThreadKey })?.title ?? "New chat")
+                        .font(.system(size: 11.5, weight: .semibold)).lineLimit(1)
+                    Image(systemName: model.showChatList ? "chevron.up" : "chevron.down")
+                        .font(.system(size: 8, weight: .bold))
+                }
+                .foregroundStyle(.primary)
+                .padding(.vertical, 5).padding(.horizontal, 9)
+                .background(Capsule().fill(Color.primary.opacity(0.06)))
+                .contentShape(Rectangle())
+            }
+            .buttonStyle(.plain)
+            Spacer()
+            Button { model.newChat() } label: {
+                HStack(spacing: 4) {
+                    Image(systemName: "square.and.pencil").font(.system(size: 11))
+                    Text("New").font(.system(size: 11.5, weight: .semibold))
+                }
+                .foregroundStyle(Palette.accent)
+            }
+            .buttonStyle(.plain)
+            .help("Start a new chat")
+        }
+        .padding(.horizontal, 12).padding(.vertical, 8)
+    }
+
+    private var chatListOverlay: some View {
+        VStack(spacing: 0) {
+            if model.chatThreads.isEmpty {
+                Text("No saved chats yet").font(.system(size: 11))
+                    .foregroundStyle(.secondary).padding(.vertical, 18)
+            } else {
+                ScrollView {
+                    VStack(spacing: 2) {
+                        ForEach(model.chatThreads) { thread in
+                            Button { model.openChat(thread) } label: {
+                                HStack(spacing: 8) {
+                                    Image(systemName: thread.key == model.activeThreadKey
+                                          ? "bubble.left.fill" : "bubble.left")
+                                        .font(.system(size: 10)).foregroundStyle(Palette.accent)
+                                    VStack(alignment: .leading, spacing: 1) {
+                                        Text(thread.title).font(.system(size: 11.5, weight: .medium))
+                                            .lineLimit(1)
+                                        if !thread.preview.isEmpty {
+                                            Text(thread.preview).font(.system(size: 10))
+                                                .foregroundStyle(.secondary).lineLimit(1)
+                                        }
+                                    }
+                                    Spacer(minLength: 4)
+                                    Text(relativeDay(thread.updatedAt))
+                                        .font(.system(size: 9)).foregroundStyle(.secondary)
+                                }
+                                .padding(.vertical, 6).padding(.horizontal, 10)
+                                .background(RoundedRectangle(cornerRadius: 7, style: .continuous)
+                                    .fill(thread.key == model.activeThreadKey
+                                          ? Palette.accent.opacity(0.08) : Color.clear))
+                                .contentShape(Rectangle())
+                            }
+                            .buttonStyle(.plain)
+                        }
+                    }
+                    .padding(8)
+                }
+                .frame(maxHeight: 320)
+            }
+        }
+        .background(RoundedRectangle(cornerRadius: 10, style: .continuous)
+            .fill(Color(nsColor: .windowBackgroundColor))
+            .shadow(color: .black.opacity(0.18), radius: 10, y: 4))
+        .padding(.horizontal, 10).padding(.top, 4)
+    }
+
+    private func relativeDay(_ iso: String) -> String {
+        guard !iso.isEmpty else { return "" }
+        let fmt = ISO8601DateFormatter()
+        fmt.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
+        let date = fmt.date(from: iso) ?? ISO8601DateFormatter().date(from: iso)
+        guard let date else { return "" }
+        let rel = RelativeDateTimeFormatter(); rel.unitsStyle = .abbreviated
+        return rel.localizedString(for: date, relativeTo: Date())
+    }
+
+    private var chatScroll: some View {
+        VStack(spacing: 0) {
             ScrollViewReader { proxy in
                 ScrollView {
                     VStack(alignment: .leading, spacing: 10) {
-                        if model.chat.isEmpty && model.searchHits.isEmpty && !model.chatPending {
+                        if model.loadingThread {
+                            HStack { Spacer(); ProgressView().controlSize(.small); Spacer() }.padding(.top, 20)
+                        }
+                        if model.chat.isEmpty && model.searchHits.isEmpty && !model.chatPending && !model.loadingThread {
                             emptyHint
                         }
                         ForEach(model.chat) { msg in
@@ -1398,10 +1502,7 @@ struct AskView: View {
                     if model.chatPending { withAnimation { proxy.scrollTo("pending", anchor: .bottom) } }
                 }
             }
-            Divider().opacity(0.3)
-            inputBar   // at the bottom, per chatbot convention
         }
-        .onAppear { focused = true }
     }
 
     private var inputBar: some View {

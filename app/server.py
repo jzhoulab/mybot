@@ -746,6 +746,43 @@ class SessionStore:
             return messages
         return messages[-limit:]
 
+    def list_sessions(self, prefix: str, *, limit: int = 100) -> list[dict[str, Any]]:
+        """Enumerate stored chat threads whose logical key starts with `prefix`
+        (e.g. all of the menu's 'menuapp-…' chats), newest first. Each entry
+        carries a title (first user turn), a preview (last turn), the message
+        count, and updated_at — enough to render a chat list without loading
+        every transcript. Epoch suffixes (#eN) collapse to their logical key."""
+        slug_prefix = slugify(prefix)
+        threads: dict[str, dict[str, Any]] = {}
+        for path in self.sessions_dir.glob("*.jsonl"):
+            name = path.stem
+            if not (name == slug_prefix or name.startswith(slug_prefix)):
+                continue
+            logical = re.sub(r"#e\d+$", "", name)
+            messages = [e for e in self._iter_entries(name) if e.get("type") == "message"]
+            if not messages:
+                continue
+            first_user = next(
+                (str(m.get("content") or "") for m in messages if m.get("role") == "user"), ""
+            )
+            last = messages[-1]
+            updated_at = str(last.get("timestamp") or "")
+            existing = threads.get(logical)
+            if existing and existing["updated_at"] >= updated_at and updated_at:
+                existing["message_count"] += len(messages)
+                continue
+            merged_count = (existing["message_count"] if existing else 0) + len(messages)
+            threads[logical] = {
+                "session_key": logical,
+                "title": normalize_text(first_user, 80) or "New chat",
+                "preview": normalize_text(str(last.get("content") or ""), 120),
+                "last_role": str(last.get("role") or ""),
+                "message_count": merged_count,
+                "updated_at": updated_at,
+            }
+        ordered = sorted(threads.values(), key=lambda t: t["updated_at"], reverse=True)
+        return ordered[:limit]
+
     def archive_session(self, session_key: str) -> str | None:
         path = self.session_path(session_key)
         if not path.exists():
@@ -3496,6 +3533,9 @@ class ChatHandler(BaseHTTPRequestHandler):
         if self.path == "/sessions/history":
             self.handle_session_history(body)
             return
+        if self.path == "/sessions/list":
+            self.handle_session_list(body)
+            return
         if self.path == "/sessions/reset":
             self.handle_session_reset(body)
             return
@@ -3633,9 +3673,11 @@ class ChatHandler(BaseHTTPRequestHandler):
             new_session=False,
         )
         force_new = coerce_bool(body.get("new_session"))
-        if is_group:
+        if is_group or coerce_bool(body.get("pin_session")):
             # Channels are ongoing; don't roll them on idle — the recent-window
-            # filter below bounds context instead.
+            # filter below bounds context instead. Pinned sessions are explicit
+            # named chats (the menu's chat list): one key stays one thread, so a
+            # reopened chat continues in place instead of rolling to a new epoch.
             idle_seconds: float | None = None
         else:
             prev_active = sessions.peek_active_key(logical_key)
@@ -4540,6 +4582,15 @@ class ChatHandler(BaseHTTPRequestHandler):
                 "summary": self.server.state.sessions.get_session_summary(session_key),
             },
         )
+
+    def handle_session_list(self, body: dict[str, Any]) -> None:
+        prefix = normalize_text(str(body.get("prefix") or body.get("session_key") or ""), 128)
+        if not prefix:
+            self.respond_json(400, {"ok": False, "error": "prefix is required"})
+            return
+        limit = int(body.get("limit", 100))
+        threads = self.server.state.sessions.list_sessions(prefix, limit=limit)
+        self.respond_json(200, {"ok": True, "threads": threads})
 
     def handle_session_reset(self, body: dict[str, Any]) -> None:
         logical_key = safe_session_key(
