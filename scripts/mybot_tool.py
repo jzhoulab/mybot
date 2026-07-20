@@ -194,7 +194,9 @@ def write_budget_log(budget: dict[str, Any], payload: dict[str, Any], result: di
             record["sources"] = summaries
     query = payload.get("query")
     if isinstance(query, str) and query.strip():
-        record["query"] = query[:300]
+        # Generous cap: the UI shows the full call on demand, and a long SQL
+        # SELECT is exactly what the owner wants to inspect.
+        record["query"] = query[:4000]
     source_ref = payload.get("source_ref")
     if isinstance(source_ref, str) and source_ref.strip():
         record["source_ref"] = source_ref[:300]

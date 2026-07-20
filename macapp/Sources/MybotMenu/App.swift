@@ -1563,15 +1563,7 @@ struct ChatBubble: View {
 
             if showInternals {
                 ForEach(msg.toolCalls) { call in
-                    HStack(spacing: 5) {
-                        Image(systemName: "magnifyingglass").font(.system(size: 8.5))
-                        Text(call.query.isEmpty ? call.tool : "\(call.tool) · “\(call.query)”")
-                            .lineLimit(1)
-                        Spacer(minLength: 4)
-                        Text("\(call.results) hit\(call.results == 1 ? "" : "s") · \(String(format: "%.2fs", call.seconds))")
-                    }
-                    .font(.system(size: 10, design: .monospaced))
-                    .foregroundStyle(.secondary)
+                    ToolCallRow(call: call)
                 }
                 // Non-openable grounding (session summary, promoted notes) —
                 // the openable trajectories already show as badges above.
@@ -1606,6 +1598,63 @@ struct ChatBubble: View {
 
 /// Minimal wrapping HStack — badges flow onto new lines when they run out of
 /// width. SwiftUI has no built-in equivalent that ships pre-Sonoma.
+/// One retrieval step. Collapsed shows a single-line summary; tap to reveal
+/// the full query/SQL (selectable, monospaced, wraps) plus a copy button.
+private struct ToolCallRow: View {
+    let call: ChatToolCall
+    @State private var expanded = false
+
+    private var hasQuery: Bool { !call.query.isEmpty }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 4) {
+            Button { if hasQuery { expanded.toggle() } } label: {
+                HStack(spacing: 5) {
+                    Image(systemName: call.tool.contains("sql") ? "tablecells" : "magnifyingglass")
+                        .font(.system(size: 8.5))
+                    Text(call.query.isEmpty ? call.tool : "\(call.tool) · “\(call.query)”")
+                        .lineLimit(1)
+                    Spacer(minLength: 4)
+                    Text("\(call.results) hit\(call.results == 1 ? "" : "s") · \(String(format: "%.2fs", call.seconds))")
+                    if hasQuery {
+                        Image(systemName: expanded ? "chevron.down" : "chevron.right")
+                            .font(.system(size: 7, weight: .semibold))
+                    }
+                }
+                .font(.system(size: 10, design: .monospaced))
+                .foregroundStyle(.secondary)
+                .contentShape(Rectangle())
+            }
+            .buttonStyle(.plain)
+
+            if expanded && hasQuery {
+                VStack(alignment: .leading, spacing: 4) {
+                    Text(call.query)
+                        .font(.system(size: 10, design: .monospaced))
+                        .textSelection(.enabled)
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                        .fixedSize(horizontal: false, vertical: true)
+                    HStack(spacing: 8) {
+                        Text("\(call.tool) · \(call.results) hit\(call.results == 1 ? "" : "s") · \(String(format: "%.2fs", call.seconds)) · ~\(call.tokens) tok")
+                            .font(.system(size: 9)).foregroundStyle(.secondary)
+                        Spacer()
+                        Button {
+                            NSPasteboard.general.clearContents()
+                            NSPasteboard.general.setString(call.query, forType: .string)
+                        } label: {
+                            Label("Copy", systemImage: "doc.on.doc").font(.system(size: 9))
+                        }
+                        .buttonStyle(.plain).foregroundStyle(Palette.accent)
+                    }
+                }
+                .padding(7)
+                .background(RoundedRectangle(cornerRadius: 6, style: .continuous)
+                    .fill(Color.primary.opacity(0.05)))
+            }
+        }
+    }
+}
+
 struct FlowLayout: Layout {
     var spacing: CGFloat = 6
 
