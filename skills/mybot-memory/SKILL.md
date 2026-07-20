@@ -52,6 +52,13 @@ Read-only SQL over the cleaned, included-only index. Tables:
 - `trajectory_chunks(id, source_ref, source_name, cwd, title, updated_at, event_start, event_end, text, metadata_json)`
 - FTS5 `trajectory_chunks_fts(title, cwd, text)`
 
+**Column types:** `updated_at` is the ISO timestamp and the ONLY date column —
+filter/sort time with it (`WHERE updated_at >= '2026-07-06'`, `ORDER BY
+updated_at DESC`). `event_start`/`event_end` are **integer event indices** within
+a session (0..total_events), **not** dates — never compare them to a date; feed
+them to `trajectory-read --around-event`. For a recent-window search use
+`--after/--before`.
+
 Your text-tool equivalents run **inside** the query:
 - `text REGEXP '...'` — case-insensitive grep
 - `regexp_extract(text, pattern[, group])` — grep -o / sed capture
