@@ -1282,11 +1282,7 @@ struct EventRow: View {
         VStack(alignment: align, spacing: 3) {
             Text(role.uppercased()).font(.system(size: 8.5, weight: .heavy)).tracking(0.5)
                 .foregroundStyle(tint)
-            // Render inline markdown (bold/italic/code/links) so conversation
-            // turns read like the chat view rather than raw asterisks.
-            Text(.init(event.text))
-                .font(.system(size: 12))
-                .textSelection(.enabled)
+            MarkdownText(text: event.text)
                 .frame(maxWidth: .infinity, alignment: .leading)
                 .padding(9)
                 .background(RoundedRectangle(cornerRadius: 10, style: .continuous)
@@ -1545,6 +1541,97 @@ struct AskView: View {
     }
 }
 
+/// Block-level markdown for chat text. SwiftUI's Text(.init(_:)) only parses
+/// inline marks (bold/italic/code/links); fenced code, headers, and bullets
+/// would show raw. Split into blocks and give those real layout.
+struct MarkdownText: View {
+    let text: String
+    var size: CGFloat = 12
+
+    private enum Block { case code(String), heading(String), bullet([String]), para(String) }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 6) {
+            ForEach(Array(Self.blocks(text).enumerated()), id: \.offset) { _, block in
+                switch block {
+                case .code(let code):
+                    ScrollView(.horizontal, showsIndicators: false) {
+                        Text(code)
+                            .font(.system(size: size - 1, design: .monospaced))
+                            .textSelection(.enabled)
+                            .padding(8)
+                    }
+                    .background(RoundedRectangle(cornerRadius: 6, style: .continuous)
+                        .fill(Color.primary.opacity(0.06)))
+                case .heading(let title):
+                    Text(.init(title)).font(.system(size: size + 1, weight: .bold))
+                        .textSelection(.enabled)
+                case .bullet(let items):
+                    VStack(alignment: .leading, spacing: 3) {
+                        ForEach(Array(items.enumerated()), id: \.offset) { _, item in
+                            HStack(alignment: .top, spacing: 6) {
+                                Text("•").font(.system(size: size)).foregroundStyle(.secondary)
+                                Text(.init(item)).font(.system(size: size)).textSelection(.enabled)
+                                    .frame(maxWidth: .infinity, alignment: .leading)
+                            }
+                        }
+                    }
+                case .para(let body):
+                    Text(.init(body)).font(.system(size: size)).textSelection(.enabled)
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                }
+            }
+        }
+    }
+
+    private static func blocks(_ text: String) -> [Block] {
+        var out: [Block] = []
+        var para: [String] = []
+        var bullets: [String] = []
+        var code: [String] = []
+        var inCode = false
+        func flushPara() {
+            if !para.isEmpty { out.append(.para(para.joined(separator: "\n"))); para = [] }
+        }
+        func flushBullets() {
+            if !bullets.isEmpty { out.append(.bullet(bullets)); bullets = [] }
+        }
+        for rawLine in text.components(separatedBy: "\n") {
+            let line = String(rawLine)
+            let trimmed = line.trimmingCharacters(in: .whitespaces)
+            if trimmed.hasPrefix("```") {
+                if inCode {
+                    out.append(.code(code.joined(separator: "\n"))); code = []
+                } else {
+                    flushPara(); flushBullets()
+                }
+                inCode.toggle()
+                continue
+            }
+            if inCode { code.append(line); continue }
+            if trimmed.hasPrefix("- ") || trimmed.hasPrefix("* ") {
+                flushPara()
+                bullets.append(String(trimmed.dropFirst(2)))
+                continue
+            }
+            if trimmed.hasPrefix("#") {
+                let title = trimmed.drop(while: { $0 == "#" }).trimmingCharacters(in: .whitespaces)
+                if !title.isEmpty {
+                    flushPara(); flushBullets()
+                    out.append(.heading(title))
+                    continue
+                }
+            }
+            if trimmed.isEmpty { flushPara(); flushBullets(); continue }
+            flushBullets()
+            para.append(line)
+        }
+        if inCode, !code.isEmpty { out.append(.code(code.joined(separator: "\n"))) }
+        flushPara(); flushBullets()
+        return out
+    }
+}
+
 struct ChatBubble: View {
     let msg: ChatMsg
     var onOpenSource: ((ChatSource) -> Void)? = nil
@@ -1583,9 +1670,9 @@ struct ChatBubble: View {
             VStack(alignment: .leading, spacing: 0) {
                 HStack(alignment: .top, spacing: 8) {
                     BotAvatar(mood: .happy).frame(width: 20, height: 20)
-                    Text(.init(msg.text.isEmpty && msg.streaming ? "…" : msg.text)
-                         + (msg.streaming && !msg.text.isEmpty ? .init(" ▍") : ""))
-                        .font(.system(size: 12)).textSelection(.enabled)
+                    MarkdownText(text: msg.text.isEmpty && msg.streaming
+                                 ? "…"
+                                 : msg.text + (msg.streaming ? " ▍" : ""))
                         .frame(maxWidth: .infinity, alignment: .leading)
                 }
                 if !openableSources.isEmpty {

@@ -25,9 +25,9 @@ mkdir -p "$HOME/.codex"
 BLOCK_FILE="$(mktemp)"
 cat > "$BLOCK_FILE" <<'BLOCK'
 <!-- BEGIN mybot-memory skill (managed) -->
-## mybot memory — search the user's own past coding sessions
-When the user asks about their OWN prior work — "have I done X before", "what was the config/command for Y", "did that job finish", "what did I decide about Z" — search their mybot memory (indexed past Claude Code + Codex sessions) instead of guessing. You are the driver. Requires the mybot server running (http://127.0.0.1:8788). Commands (owner id + URL preset):
-- `mybot trajectory-search -q "<query>" [--limit N] [--after YYYY-MM-DD] [--source codex|claude]` — hybrid search; hits carry source_ref, metadata.chunk_id, event_start.
+## Prior-work memory routing
+For questions about the user's prior work, use Codex's built-in memories and thread search/read tools first. Use mybot only when the request specifically concerns Claude Code trajectories. Mybot requires the server at http://127.0.0.1:8788. Commands (owner id + URL preset):
+- `mybot trajectory-search -q "<query>" [--limit N] [--after YYYY-MM-DD] --source claude` — hybrid search; hits carry source_ref, metadata.chunk_id, event_start.
 - `mybot sql -q "<SELECT …>"` — read-only SQL over trajectory_chunks(id,source_ref,source_name,cwd,title,updated_at,event_start,event_end,text,metadata_json) + FTS5, with text REGEXP, regexp_extract, json_extract, GROUP BY. updated_at is the ONLY date column (WHERE updated_at >= '2026-07-06'); event_start/event_end are integer event indices, NOT dates.
 - `mybot trajectory-read --source-ref <ref> [--chunk-id C | --around-event N]` — zoom to the exact spot; reports total_events (tail is freshest).
 Full guide: ~/Code/mybot/skills/mybot-memory/SKILL.md
