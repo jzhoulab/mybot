@@ -481,6 +481,44 @@ def discover_codex_workdir(path: str) -> tuple[str | None, str | None]:
     return session_id, workdir
 
 
+def peek_codex_session_meta(path: str) -> tuple[str | None, str | None, str]:
+    """Cheap pre-filter read: session id, workdir, and the `source` marker,
+    stopping as soon as they are known (session_meta is the first line).
+
+    Lets the scanner reject subagent/exec transcripts without parsing whole
+    files, so the recency window can be filled with sessions that will
+    actually be indexed. Returns source kind "subagent" for spawned agent
+    transcripts, else the raw source string (e.g. "exec"), else "".
+    """
+    session_id = None
+    workdir = None
+    source_kind = ""
+    seen_meta = False
+    with open(path) as handle:
+        for line in handle:
+            try:
+                entry = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            payload = entry.get("payload", {})
+            if not isinstance(payload, dict):
+                continue
+            if entry.get("type") == "session_meta":
+                seen_meta = True
+                session_id = payload.get("id") or session_id
+                source = payload.get("source")
+                if isinstance(source, dict):
+                    if "subagent" in source:
+                        source_kind = "subagent"
+                elif isinstance(source, str):
+                    source_kind = source
+            if payload.get("cwd"):
+                workdir = str(payload.get("cwd"))
+            if seen_meta and session_id and workdir:
+                break
+    return session_id, workdir, source_kind
+
+
 def discover_claude_metadata(path: str) -> tuple[str | None, str | None, list[str]]:
     session_id = os.path.basename(path).replace(".jsonl", "")
     fallback_workdir = decode_claude_project_slug(path)

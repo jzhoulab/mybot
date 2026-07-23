@@ -81,12 +81,15 @@ def parse_timestamp(raw: str) -> datetime | None:
 
 
 def recent_files(patterns: list[str], limit: int) -> list[str]:
+    """Newest-first source files. `limit <= 0` means no cap — callers that
+    filter as they scan use that to rank by recency over the files they can
+    actually use, rather than over raw files."""
     files: list[str] = []
     for pattern in patterns:
         files.extend(glob.glob(os.path.expanduser(pattern), recursive=True))
     files = [path for path in files if os.path.isfile(path)]
     files.sort(key=lambda path: os.path.getmtime(path), reverse=True)
-    return files[:limit]
+    return files if limit <= 0 else files[:limit]
 
 
 BOT_HANDLE_RE = re.compile(r"^[a-z0-9][a-z0-9._-]{1,19}$")

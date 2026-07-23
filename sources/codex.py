@@ -3,7 +3,7 @@ from __future__ import annotations
 import json
 import os
 
-from .access import TrajectoryAccessAccount, discover_codex_workdir
+from .access import TrajectoryAccessAccount, peek_codex_session_meta
 from .common import (
     append_turn,
     choose_title,
@@ -61,13 +61,34 @@ class CodexSourceAdapter(TrajectorySourceAdapter):
             os.path.join(self.base_dir, "sessions", "**", "*.jsonl"),
             os.path.join(self.base_dir, "archived_sessions", "*.jsonl"),
         ]
-        files = recent_files(patterns, max_files)
-        by_session: dict[str, NormalizedTrajectory] = {}
-
-        for path in files:
-            _, discovered_cwd = discover_codex_workdir(path)
+        # Fill the recency window with files that can actually be indexed.
+        # Codex writes far more subagent/exec transcripts than human sessions,
+        # so capping raw files starves genuine sessions out of the window (and
+        # would gut the index on a rebuild). Reject those cheaply from
+        # session_meta alone, then cap on what survives.
+        excludes_exec = self.account.is_origin_excluded("automated", "exec")
+        files: list[tuple[str, str | None]] = []
+        for path in recent_files(patterns, 0):
+            try:
+                _, discovered_cwd, source_kind = peek_codex_session_meta(path)
+            except OSError:
+                continue
+            if source_kind == "subagent":
+                continue
+            # `codex exec` is headless by definition; an agent-session marker
+            # on such a run maps to another automated cluster, so skipping
+            # before the full parse matches the policy outcome.
+            if source_kind == "exec" and excludes_exec:
+                continue
             if not self.account.include_workdir(discovered_cwd):
                 continue
+            files.append((path, discovered_cwd))
+            if max_files > 0 and len(files) >= max_files:
+                break
+
+        by_session: dict[str, NormalizedTrajectory] = {}
+
+        for path, discovered_cwd in files:
 
             first_ts = None
             last_ts = None
