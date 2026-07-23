@@ -489,8 +489,9 @@ def _summarize_tool_result(content: Any, *, is_error: bool = False) -> str:
             head = " · ".join(titles)
             return f"{hits}+ matches — {head}" if head else f"{hits}+ matches"
         budget_keys = (
-            "tool", "endpoint", "seconds", "tool_calls", "result_count", "timestamp",
-            "tokens_estimate", "input_tokens_estimate", "output_tokens_estimate",
+            "_budget", "tool", "endpoint", "seconds", "tool_calls", "result_count",
+            "timestamp", "tokens_estimate", "input_tokens_estimate",
+            "output_tokens_estimate", "retrieval_steps", "query", "source_ref",
         )
         for line in text.splitlines():
             stripped = line.strip().strip(",")
