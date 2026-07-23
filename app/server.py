@@ -469,10 +469,38 @@ def _summarize_tool_result(content: Any, *, is_error: bool = False) -> str:
         return "no output" if not is_error else "failed"
     if is_error:
         return f"error: {normalize_text(text, 120)}"
+    parsed: Any = None
     try:
         parsed = json.loads(text)
     except json.JSONDecodeError:
-        return normalize_text(text.splitlines()[0] if text else "", 120)
+        start = min((i for i in (text.find("{"), text.find("[")) if i >= 0), default=-1)
+        if start > 0:
+            try:
+                parsed = json.loads(text[start:])
+            except json.JSONDecodeError:
+                parsed = None
+    if parsed is None:
+        # Long tool output gets truncated by the CLI before we see it, so the
+        # JSON no longer parses. Count the record markers that survived rather
+        # than echoing a stray brace.
+        hits = len(re.findall(r'"source_ref"\s*:', text))
+        if hits:
+            titles = re.findall(r'"title"\s*:\s*"([^"]{1,70})"', text)[:2]
+            head = " · ".join(titles)
+            return f"{hits}+ matches — {head}" if head else f"{hits}+ matches"
+        budget_keys = (
+            "tool", "endpoint", "seconds", "tool_calls", "result_count", "timestamp",
+            "tokens_estimate", "input_tokens_estimate", "output_tokens_estimate",
+        )
+        for line in text.splitlines():
+            stripped = line.strip().strip(",")
+            if len(stripped) <= 3 or stripped in ("{", "}", "[", "]"):
+                continue
+            key = re.match(r'"([^"]+)"\s*:', stripped)
+            if key and key.group(1) in budget_keys:
+                continue  # our own per-call accounting, not the finding
+            return normalize_text(stripped, 120)
+        return "completed"
     if isinstance(parsed, dict):
         matches = parsed.get("matches")
         if isinstance(matches, list):
