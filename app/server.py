@@ -479,10 +479,10 @@ def _summarize_tool_result(content: Any, *, is_error: bool = False) -> str:
                 parsed = json.loads(text[start:])
             except json.JSONDecodeError:
                 parsed = None
-    if parsed is None:
-        # Long tool output gets truncated by the CLI before we see it, so the
-        # JSON no longer parses. Count the record markers that survived rather
-        # than echoing a stray brace.
+    def salvage() -> str:
+        """Long tool output gets truncated by the CLI before we see it, so the
+        payload can be a fragment. Count surviving record markers rather than
+        echoing a stray brace or our own per-call accounting."""
         hits = len(re.findall(r'"source_ref"\s*:', text))
         if hits:
             titles = re.findall(r'"title"\s*:\s*"([^"]{1,70})"', text)[:2]
@@ -491,17 +491,20 @@ def _summarize_tool_result(content: Any, *, is_error: bool = False) -> str:
         budget_keys = (
             "_budget", "tool", "endpoint", "seconds", "tool_calls", "result_count",
             "timestamp", "tokens_estimate", "input_tokens_estimate",
-            "output_tokens_estimate", "retrieval_steps", "query", "source_ref",
+            "output_tokens_estimate", "retrieval_steps", "query",
         )
         for line in text.splitlines():
-            stripped = line.strip().strip(",")
+            stripped = line.strip().strip(",").lstrip("{[").strip()
             if len(stripped) <= 3 or stripped in ("{", "}", "[", "]"):
                 continue
-            key = re.match(r'"([^"]+)"\s*:', stripped)
-            if key and key.group(1) in budget_keys:
-                continue  # our own per-call accounting, not the finding
+            key = re.match(r'"([^"]+)"\s*:\s*(.*)$', stripped)
+            if key and (key.group(1) in budget_keys or not key.group(2).strip(" {[")):
+                continue  # accounting, or a container opener carrying no value
             return normalize_text(stripped, 120)
         return "completed"
+
+    if parsed is None:
+        return salvage()
     if isinstance(parsed, dict):
         matches = parsed.get("matches")
         if isinstance(matches, list):
@@ -526,7 +529,7 @@ def _summarize_tool_result(content: Any, *, is_error: bool = False) -> str:
             return f"read{span}{f' — {title}' if title else ''}"
         if parsed.get("error"):
             return f"error: {normalize_text(str(parsed['error']), 110)}"
-    return normalize_text(text.splitlines()[0] if text else "", 120)
+    return salvage()
 
 
 @dataclass
