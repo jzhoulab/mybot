@@ -1387,11 +1387,32 @@ struct AskView: View {
         .padding(.horizontal, 12).padding(.vertical, 8)
     }
 
+    /// True while the current chat has no saved thread yet — nothing in the
+    /// list is the one you are in, so say so instead of leaving the list blank.
+    private var inUnsavedChat: Bool {
+        !model.chatThreads.contains { $0.key == model.activeThreadKey }
+    }
+
     private var chatListOverlay: some View {
         VStack(spacing: 0) {
+            if inUnsavedChat {
+                HStack(spacing: 8) {
+                    Image(systemName: "square.and.pencil")
+                        .font(.system(size: 10)).foregroundStyle(Palette.accent)
+                    Text(model.chat.isEmpty ? "New chat" : "New chat (unsaved)")
+                        .font(.system(size: 11.5, weight: .semibold))
+                    Spacer(minLength: 4)
+                    Text("current").font(.system(size: 9)).foregroundStyle(.secondary)
+                }
+                .padding(.vertical, 6).padding(.horizontal, 10)
+                .background(RoundedRectangle(cornerRadius: 7, style: .continuous)
+                    .fill(Palette.accent.opacity(0.08)))
+                .padding(.horizontal, 8).padding(.top, 8)
+            }
             if model.chatThreads.isEmpty {
                 Text("No saved chats yet").font(.system(size: 11))
-                    .foregroundStyle(.secondary).padding(.vertical, 18)
+                    .foregroundStyle(.secondary)
+                    .padding(.vertical, inUnsavedChat ? 10 : 18)
             } else {
                 ScrollView {
                     VStack(spacing: 2) {

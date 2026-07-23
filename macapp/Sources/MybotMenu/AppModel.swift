@@ -60,8 +60,11 @@ final class AppModel: ObservableObject {
     @Published var chatPending = false
     @Published var chatActivity = ""   // live tool line while streaming
     // Named chat threads (Ask history). activeThreadKey is the current one.
+    // It starts as a fresh key, never the bare prefix: that prefix is itself a
+    // real (legacy) thread, so defaulting to it highlighted an old conversation
+    // that was never loaded — and typing would silently append to it.
     @Published var chatThreads: [ChatClient.ChatThread] = []
-    @Published var activeThreadKey: String = ChatClient.threadPrefix
+    @Published var activeThreadKey: String = AppModel.freshThreadKey()
     @Published var showChatList = false
     @Published var loadingThread = false
     private var searchWork: DispatchWorkItem?
@@ -740,15 +743,20 @@ final class AppModel: ObservableObject {
         }
     }
 
-    /// Start a fresh named chat. New threads get a unique key so they never
-    /// collide with an existing transcript.
+    /// A unique key for an unsaved chat, so it never collides with an existing
+    /// transcript and no saved thread shows as selected until one is opened.
+    static func freshThreadKey() -> String {
+        "\(ChatClient.threadPrefix)-\(UUID().uuidString.prefix(8).lowercased())"
+    }
+
+    /// Start a fresh named chat.
     func newChat() {
         streamTask?.cancel()
         chat = []
         chatPending = false
         chatActivity = ""
         showChatList = false
-        activeThreadKey = "\(ChatClient.threadPrefix)-\(UUID().uuidString.prefix(8).lowercased())"
+        activeThreadKey = AppModel.freshThreadKey()
     }
 
     /// Reopen a saved chat: load its transcript and continue in that thread.
