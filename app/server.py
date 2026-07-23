@@ -456,6 +456,50 @@ def _describe_tool(block: dict[str, Any]) -> str:
     return f"Running {name}…"
 
 
+def _summarize_tool_result(content: Any, *, is_error: bool = False) -> str:
+    """One-line outcome for a finished tool call, streamed to the chat UI so
+    retrieval is visible as it happens instead of only after the answer."""
+    if isinstance(content, list):
+        parts = [str(b.get("text") or "") for b in content if isinstance(b, dict)]
+        text = "\n".join(part for part in parts if part)
+    else:
+        text = str(content or "")
+    text = text.strip()
+    if not text:
+        return "no output" if not is_error else "failed"
+    if is_error:
+        return f"error: {normalize_text(text, 120)}"
+    try:
+        parsed = json.loads(text)
+    except json.JSONDecodeError:
+        return normalize_text(text.splitlines()[0] if text else "", 120)
+    if isinstance(parsed, dict):
+        matches = parsed.get("matches")
+        if isinstance(matches, list):
+            if not matches:
+                return "no matches"
+            titles = [
+                str(m.get("title") or m.get("source_ref") or "").strip()
+                for m in matches[:2]
+                if isinstance(m, dict)
+            ]
+            head = " · ".join(t for t in titles if t)
+            label = f"{len(matches)} match{'' if len(matches) == 1 else 'es'}"
+            return f"{label} — {normalize_text(head, 90)}" if head else label
+        rows = parsed.get("rows")
+        if isinstance(rows, list):
+            return f"{len(rows)} row{'' if len(rows) == 1 else 's'}"
+        trajectory = parsed.get("trajectory")
+        if isinstance(trajectory, dict):
+            total = trajectory.get("total_events")
+            title = normalize_text(str(trajectory.get("title") or ""), 70)
+            span = f" of {total} events" if total else ""
+            return f"read{span}{f' — {title}' if title else ''}"
+        if parsed.get("error"):
+            return f"error: {normalize_text(str(parsed['error']), 110)}"
+    return normalize_text(text.splitlines()[0] if text else "", 120)
+
+
 @dataclass
 class AppConfig:
     host: str
@@ -1081,6 +1125,7 @@ class ProviderClient:
         result_text = ""
         usage: Any = None
         tool_blocks: dict[int, dict[str, Any]] = {}  # index -> {name, input_json}
+        tool_labels: dict[str, str] = {}  # tool_use_id -> label, to pair results
         break_before_text = False  # separate narration segments across tool calls
         for line in proc.stdout:
             line = line.strip()
@@ -1123,6 +1168,29 @@ class ProviderClient:
                     break_before_text = True
                     on_event({"kind": "tool",
                               "label": _describe_tool({"name": tb["name"], "input": parsed_input})})
+            elif etype == "assistant":
+                # Full tool_use blocks carry the id the matching result will
+                # reference; remember the label so the result can name itself.
+                for block in (evt.get("message", {}) or {}).get("content", []) or []:
+                    if isinstance(block, dict) and block.get("type") == "tool_use":
+                        tool_id = str(block.get("id") or "")
+                        if tool_id:
+                            tool_labels[tool_id] = _describe_tool(block)
+            elif etype == "user":
+                # Tool results come back as a synthetic user turn. Stream a
+                # compact outcome per call so the UI can show retrieval
+                # landing while the answer is still being composed.
+                for block in (evt.get("message", {}) or {}).get("content", []) or []:
+                    if not isinstance(block, dict) or block.get("type") != "tool_result":
+                        continue
+                    tool_id = str(block.get("tool_use_id") or "")
+                    is_error = bool(block.get("is_error"))
+                    on_event({
+                        "kind": "tool_result",
+                        "label": tool_labels.pop(tool_id, "Tool"),
+                        "summary": _summarize_tool_result(block.get("content"), is_error=is_error),
+                        "ok": not is_error,
+                    })
             elif etype == "result":
                 result_text = str(evt.get("result") or "")
                 usage = evt.get("usage")

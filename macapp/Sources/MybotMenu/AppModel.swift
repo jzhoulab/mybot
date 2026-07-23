@@ -690,6 +690,20 @@ final class AppModel: ObservableObject {
             switch event {
             case .tool(let label):
                 self.chatActivity = label
+                update { $0.liveSteps.append(LiveStep(label: label)) }
+            case .toolResult(let label, let summary, let ok):
+                self.chatActivity = ""
+                update {
+                    // Pair with the oldest still-pending step; fall back to
+                    // appending when the call event never arrived.
+                    if let i = $0.liveSteps.firstIndex(where: { !$0.done && $0.label == label })
+                        ?? $0.liveSteps.firstIndex(where: { !$0.done }) {
+                        $0.liveSteps[i].summary = summary
+                        $0.liveSteps[i].ok = ok
+                    } else {
+                        $0.liveSteps.append(LiveStep(label: label, summary: summary, ok: ok))
+                    }
+                }
             case .delta(let text):
                 self.chatActivity = ""
                 update { $0.text += text }

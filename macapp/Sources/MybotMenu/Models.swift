@@ -89,12 +89,24 @@ struct SearchHit: Identifiable, Hashable {
 
 /// One turn in the in-app chat with mybot. Assistant turns carry the
 /// internals (sources used + retrieval steps) that Discord replies hide.
+/// A retrieval step as it happens: the call, then its outcome once the tool
+/// returns. Shown live so the user sees evidence landing while the answer is
+/// still being written.
+struct LiveStep: Identifiable, Hashable {
+    let id = UUID()
+    var label: String
+    var summary: String = ""
+    var ok: Bool = true
+    var done: Bool { !summary.isEmpty }
+}
+
 struct ChatMsg: Identifiable, Hashable {
     let id = UUID()
     let role: String   // "user" | "assistant" | "error"
     var text: String
     var sources: [ChatSource] = []
     var toolCalls: [ChatToolCall] = []
+    var liveSteps: [LiveStep] = []
     var streaming: Bool = false   // assistant bubble still receiving deltas
 }
 

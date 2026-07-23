@@ -1668,6 +1668,9 @@ struct ChatBubble: View {
             .id(msg.id)
         default:
             VStack(alignment: .leading, spacing: 0) {
+                if !msg.liveSteps.isEmpty {
+                    liveStepsView.padding(.bottom, 8)
+                }
                 HStack(alignment: .top, spacing: 8) {
                     BotAvatar(mood: .happy).frame(width: 20, height: 20)
                     MarkdownText(text: msg.text.isEmpty && msg.streaming
@@ -1735,6 +1738,43 @@ struct ChatBubble: View {
     }
 
     /// What mybot did behind the scenes: retrieval steps + grounding sources.
+    /// Retrieval as it happens: each call, then its outcome the moment the
+    /// tool returns — visible while the answer is still streaming.
+    private var liveStepsView: some View {
+        VStack(alignment: .leading, spacing: 4) {
+            ForEach(msg.liveSteps) { step in
+                HStack(alignment: .top, spacing: 6) {
+                    Group {
+                        if step.done {
+                            Image(systemName: step.ok ? "checkmark.circle.fill" : "exclamationmark.circle.fill")
+                                .foregroundStyle(step.ok ? Palette.good : Palette.warn)
+                        } else {
+                            Image(systemName: "circle.dotted").foregroundStyle(.secondary)
+                        }
+                    }
+                    .font(.system(size: 9))
+                    .padding(.top, 1)
+                    VStack(alignment: .leading, spacing: 1) {
+                        Text(step.label)
+                            .font(.system(size: 10, weight: .semibold))
+                            .foregroundStyle(.secondary)
+                        if step.done, !step.summary.isEmpty {
+                            Text(step.summary)
+                                .font(.system(size: 10))
+                                .foregroundStyle(step.ok ? Palette.good : Palette.warn)
+                                .textSelection(.enabled)
+                        }
+                    }
+                    Spacer(minLength: 0)
+                }
+            }
+        }
+        .padding(8)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .background(RoundedRectangle(cornerRadius: 8, style: .continuous)
+            .fill(Color.primary.opacity(0.04)))
+    }
+
     private var internals: some View {
         VStack(alignment: .leading, spacing: 6) {
             Button { showInternals.toggle() } label: {
