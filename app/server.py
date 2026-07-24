@@ -498,10 +498,14 @@ def _tool_result_hits(content: Any) -> list[dict[str, str]]:
 
     if not hits:
         # Truncated output: the objects before the cut are still intact, so
-        # pull each source_ref and the title that shares its object window.
-        for m in re.finditer(r'"source_ref"\s*:\s*"([^"]+)"', text):
+        # pull each source_ref and the title in its object. Keys are sorted, so
+        # title trails source_ref (past a possibly-long text_preview) but before
+        # the next record — bound the window to the next source_ref.
+        refs = list(re.finditer(r'"source_ref"\s*:\s*"([^"]+)"', text))
+        for i, m in enumerate(refs):
             ref = m.group(1)
-            window = text[m.end():m.end() + 300]
+            end = refs[i + 1].start() if i + 1 < len(refs) else len(text)
+            window = text[m.end():end]
             title_m = re.search(r'"title"\s*:\s*"([^"]{0,90})"', window)
             add(ref, "", title_m.group(1) if title_m else "")
             if len(hits) >= 6:
