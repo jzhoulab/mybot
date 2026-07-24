@@ -271,7 +271,17 @@ struct ChatClient {
                 guard role == "user" || role == "assistant" else { return nil }
                 var text = (m["content"] as? String) ?? ""
                 if let r = text.range(of: "\n\nRetrieval budget:") { text = String(text[..<r.lowerBound]) }
-                return ChatMsg(role: role, text: text)
+                // Rehydrate the retrieval the turn did: meta carries the same
+                // retrieval_budget + sources the streamed `done` event does, so
+                // a reopened chat shows its tool calls and grounding again.
+                let meta = m["meta"] as? [String: Any] ?? [:]
+                let reply = Self.reply(from: [
+                    "text": text,
+                    "sources": meta["sources"] ?? [],
+                    "retrieval_budget": meta["retrieval_budget"] ?? [],
+                ])
+                return ChatMsg(role: role, text: text,
+                               sources: reply.sources, toolCalls: reply.toolCalls)
             }
             DispatchQueue.main.async { completion(msgs) }
         }.resume()
