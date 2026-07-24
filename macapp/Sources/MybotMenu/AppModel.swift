@@ -694,7 +694,7 @@ final class AppModel: ObservableObject {
             case .tool(let label):
                 self.chatActivity = label
                 update { $0.liveSteps.append(LiveStep(label: label)) }
-            case .toolResult(let label, let summary, let ok):
+            case .toolResult(let label, let summary, let ok, let hits):
                 self.chatActivity = ""
                 update {
                     // Pair with the oldest still-pending step; fall back to
@@ -703,8 +703,9 @@ final class AppModel: ObservableObject {
                         ?? $0.liveSteps.firstIndex(where: { !$0.done }) {
                         $0.liveSteps[i].summary = summary
                         $0.liveSteps[i].ok = ok
+                        $0.liveSteps[i].hits = hits
                     } else {
-                        $0.liveSteps.append(LiveStep(label: label, summary: summary, ok: ok))
+                        $0.liveSteps.append(LiveStep(label: label, summary: summary, ok: ok, hits: hits))
                     }
                 }
             case .delta(let text):

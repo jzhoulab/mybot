@@ -1775,7 +1775,7 @@ struct ChatBubble: View {
                     }
                     .font(.system(size: 9))
                     .padding(.top, 1)
-                    VStack(alignment: .leading, spacing: 1) {
+                    VStack(alignment: .leading, spacing: 3) {
                         Text(step.label)
                             .font(.system(size: 10, weight: .semibold))
                             .foregroundStyle(.secondary)
@@ -1784,6 +1784,14 @@ struct ChatBubble: View {
                                 .font(.system(size: 10))
                                 .foregroundStyle(step.ok ? Palette.good : Palette.warn)
                                 .textSelection(.enabled)
+                        }
+                        // Trajectories this call surfaced, openable the moment
+                        // they land — before the answer is composed.
+                        if !step.hits.isEmpty {
+                            FlowLayout(spacing: 4) {
+                                ForEach(step.hits) { hit in liveHitPill(hit) }
+                            }
+                            .padding(.top, 1)
                         }
                     }
                     Spacer(minLength: 0)
@@ -1794,6 +1802,30 @@ struct ChatBubble: View {
         .frame(maxWidth: .infinity, alignment: .leading)
         .background(RoundedRectangle(cornerRadius: 8, style: .continuous)
             .fill(Color.primary.opacity(0.04)))
+    }
+
+    /// A compact openable pill for a trajectory surfaced live by a tool call.
+    private func liveHitPill(_ hit: ChatSource) -> some View {
+        Button { if hit.isOpenable { onOpenSource?(hit) } } label: {
+            HStack(spacing: 4) {
+                SourceTag(source: hit.sourceName)
+                Text(hit.title.isEmpty ? hit.ref : hit.title)
+                    .font(.system(size: 10, weight: .medium))
+                    .lineLimit(1).truncationMode(.middle)
+                if hit.isOpenable {
+                    Image(systemName: "arrow.up.right.square")
+                        .font(.system(size: 8, weight: .semibold))
+                        .foregroundStyle(Palette.accent)
+                }
+            }
+            .padding(.vertical, 3).padding(.horizontal, 6)
+            .background(RoundedRectangle(cornerRadius: 6, style: .continuous)
+                .fill(Palette.accent.opacity(0.09)))
+            .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
+        .disabled(!hit.isOpenable)
+        .help(hit.isOpenable ? "Open \(hit.ref)" : hit.ref)
     }
 
     private var internals: some View {
@@ -1911,7 +1943,10 @@ struct FlowLayout: Layout {
         let maxWidth = proposal.width ?? .infinity
         var x: CGFloat = 0, y: CGFloat = 0, rowHeight: CGFloat = 0, maxRowWidth: CGFloat = 0
         for view in subviews {
-            let size = view.sizeThatFits(.unspecified)
+            var size = view.sizeThatFits(.unspecified)
+            // A single subview wider than the row (e.g. a long title pill) must
+            // shrink to the row, not overflow it — clamp so it truncates.
+            size.width = min(size.width, maxWidth)
             if x > 0 && x + size.width > maxWidth {
                 y += rowHeight + spacing
                 x = 0; rowHeight = 0
@@ -1927,12 +1962,14 @@ struct FlowLayout: Layout {
         let maxWidth = bounds.width
         var x: CGFloat = 0, y: CGFloat = 0, rowHeight: CGFloat = 0
         for view in subviews {
-            let size = view.sizeThatFits(.unspecified)
+            var size = view.sizeThatFits(.unspecified)
+            size.width = min(size.width, maxWidth)
             if x > 0 && x + size.width > maxWidth {
                 y += rowHeight + spacing
                 x = 0; rowHeight = 0
             }
-            view.place(at: CGPoint(x: bounds.minX + x, y: bounds.minY + y), proposal: ProposedViewSize(size))
+            view.place(at: CGPoint(x: bounds.minX + x, y: bounds.minY + y),
+                       proposal: ProposedViewSize(width: size.width, height: size.height))
             x += size.width + spacing
             rowHeight = max(rowHeight, size.height)
         }

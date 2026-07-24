@@ -119,7 +119,7 @@ struct ChatClient {
     /// Streamed events from POST /chat/stream.
     enum StreamEvent {
         case tool(String)          // live activity, e.g. "Searching memory: fable"
-        case toolResult(label: String, summary: String, ok: Bool)  // that call landed
+        case toolResult(label: String, summary: String, ok: Bool, hits: [ChatSource])  // that call landed
         case delta(String)         // answer text chunk
         case done(ChatReply)       // final: full text + sources + tool calls
         case failure(String)
@@ -157,9 +157,17 @@ struct ChatClient {
                     switch kind {
                     case "tool":   send(.tool((obj["label"] as? String) ?? "Working…"))
                     case "tool_result":
+                        let hits = ((obj["hits"] as? [[String: Any]]) ?? []).map { h in
+                            ChatSource(ref: (h["source_ref"] as? String) ?? "",
+                                       sourceName: (h["source_name"] as? String) ?? "",
+                                       kind: "chunk",
+                                       title: (h["title"] as? String) ?? "",
+                                       score: nil)
+                        }
                         send(.toolResult(label: (obj["label"] as? String) ?? "Tool",
                                          summary: (obj["summary"] as? String) ?? "",
-                                         ok: (obj["ok"] as? Bool) ?? true))
+                                         ok: (obj["ok"] as? Bool) ?? true,
+                                         hits: hits))
                     case "delta":  send(.delta((obj["text"] as? String) ?? ""))
                     case "error":  send(.failure((obj["error"] as? String) ?? "error"))
                     case "done":   send(.done(Self.reply(from: obj)))

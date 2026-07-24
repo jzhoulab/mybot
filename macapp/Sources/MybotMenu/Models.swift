@@ -97,6 +97,7 @@ struct LiveStep: Identifiable, Hashable {
     var label: String
     var summary: String = ""
     var ok: Bool = true
+    var hits: [ChatSource] = []   // openable trajectories this call surfaced
     var done: Bool { !summary.isEmpty }
 }
 

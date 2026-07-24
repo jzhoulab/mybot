@@ -456,6 +456,59 @@ def _describe_tool(block: dict[str, Any]) -> str:
     return f"Running {name}…"
 
 
+def _tool_result_hits(content: Any) -> list[dict[str, str]]:
+    """Openable trajectories a retrieval call surfaced, so the UI can show them
+    the moment the tool returns instead of only in the final answer. Best-effort
+    over possibly-truncated output; deduped, capped."""
+    if isinstance(content, list):
+        text = "\n".join(str(b.get("text") or "") for b in content if isinstance(b, dict))
+    else:
+        text = str(content or "")
+    text = text.strip()
+    if not text:
+        return []
+    parsed: Any = None
+    for candidate in (text, text[min((i for i in (text.find("{"), text.find("[")) if i >= 0), default=0):]):
+        try:
+            parsed = json.loads(candidate)
+            break
+        except json.JSONDecodeError:
+            continue
+    records: list[dict[str, Any]] = []
+    if isinstance(parsed, dict):
+        if isinstance(parsed.get("matches"), list):
+            records = [m for m in parsed["matches"] if isinstance(m, dict)]
+        elif isinstance(parsed.get("trajectory"), dict):
+            records = [parsed["trajectory"]]
+    hits: list[dict[str, str]] = []
+    seen: set[str] = set()
+
+    def add(ref: str, source: str, title: str) -> None:
+        ref = ref.strip()
+        if not ref or ref in seen:
+            return
+        seen.add(ref)
+        source = (source or (ref.split(":", 1)[0] if ":" in ref else "")).strip()
+        hits.append({"source_ref": ref, "source_name": source, "title": normalize_text(title, 90)})
+
+    for rec in records:
+        add(str(rec.get("source_ref") or ""), str(rec.get("source_name") or ""), str(rec.get("title") or ""))
+        if len(hits) >= 6:
+            return hits
+
+    if not hits:
+        # Truncated output: the objects before the cut are still intact, so
+        # pull each source_ref and the title that shares its object window.
+        for m in re.finditer(r'"source_ref"\s*:\s*"([^"]+)"', text):
+            ref = m.group(1)
+            window = text[m.end():m.end() + 300]
+            title_m = re.search(r'"title"\s*:\s*"([^"]{0,90})"', window)
+            add(ref, "", title_m.group(1) if title_m else "")
+            if len(hits) >= 6:
+                break
+    return hits
+
+
 def _summarize_tool_result(content: Any, *, is_error: bool = False) -> str:
     """One-line outcome for a finished tool call, streamed to the chat UI so
     retrieval is visible as it happens instead of only after the answer."""
@@ -1222,6 +1275,7 @@ class ProviderClient:
                         "label": tool_labels.pop(tool_id, "Tool"),
                         "summary": _summarize_tool_result(block.get("content"), is_error=is_error),
                         "ok": not is_error,
+                        "hits": [] if is_error else _tool_result_hits(block.get("content")),
                     })
             elif etype == "result":
                 result_text = str(evt.get("result") or "")
