@@ -48,21 +48,14 @@ transcripts — this makes it queryable, without the human latency.
 
 ## Related projects
 
-Other tools built around the same problem — working alongside agents rather than
-around them. **None of them integrate with mybot today**; they are listed because
-they may be useful next to it, not because they plug into it.
+From the same author, built around the same conviction — that humans and agents
+work best in shared spaces:
 
 | Project | What it is |
 |---|---|
 | [nebula-notebook](https://github.com/jzhoulab/nebula-notebook) | An agent-native notebook — you and your AI work in the same cells |
 | [hop](https://github.com/jzthree/hop) | Terminal access for humans and agents: browser terminals plus an MCP server for creating, driving, and auditing agent sessions |
 | [burrow](https://github.com/jzthree/burrow) | A macOS menu-bar manager for SSH tunnels and userspace VPN gateways, for reaching the machines work runs on |
-
-The one point of contact is incidental: if an orchestrator launches Claude Code
-or Codex on a machine mybot already watches, those transcripts get indexed like
-any other, and mybot recognizes the
-[agent-session marker](docs/agent-session-convention.md) a launcher can prepend
-so such runs are classified as automated rather than as your own work.
 
 ## Quickstart
 
@@ -223,17 +216,11 @@ answers. It does not edit files, commit, or run commands on your behalf, and the
 answering agent's shell is sandboxed to a scratch workspace with networking
 restricted to localhost.
 
-That boundary is deliberate rather than unfinished. Read-only *with* tool use is
-already enough to answer almost anything about your own history — the agent can
-search, follow a lead, reopen the exact session, and cite it — while keeping the
-blast radius of pointing a bot at your entire archive bounded. It is also what
-makes sharing the bot with teammates a reasonable thing to do.
-
-Letting mybot actually *do* work in a thread, the way a collaborative assistant
-in Slack does, is a plausible direction. It is not built, and it does not belong
-on the machine that holds your keys and your history — that would want a
-sandboxed server with its own credentials. Treat the current scope as the
-supported one.
+That boundary is deliberate. Read-only *with* tool use is already enough to
+answer almost anything about your own history — the agent can search, follow a
+lead, reopen the exact session, and cite it — while keeping the blast radius of
+pointing a bot at your entire archive bounded. It is also what makes sharing the
+bot with a team a reasonable thing to do.
 
 ## Using it as a team
 
