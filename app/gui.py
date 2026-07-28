@@ -286,7 +286,7 @@ GUI_HTML = """<!doctype html>
         <div style="padding:0 16px 16px">
           <h2 style="margin-top:6px">Retrieval probe</h2>
           <div class="query-row">
-            <input type="text" id="q" placeholder="e.g. current cluster SU allocation status" autocomplete="off">
+            <input type="text" id="q" placeholder="e.g. what did we decide about the auth refactor?" autocomplete="off">
             <select id="q-mode">
               <option value="hybrid">hybrid</option>
               <option value="exact">exact / lexical</option>

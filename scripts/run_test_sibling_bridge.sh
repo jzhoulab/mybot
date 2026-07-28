@@ -1,8 +1,8 @@
 #!/bin/zsh
 # Test-only: run a SECOND Discord bridge (a stand-in teammate bot) against the
 # already-running mybot server, so the bot<->bot relay can be exercised end to
-# end with two bots in one shared server. It shares Alex's server/index — we're
-# testing the relay TRANSPORT, not a second person's memory.
+# end with two bots in one shared server. It shares the primary instance's
+# server/index — we're testing the relay TRANSPORT, not a second person's memory.
 #
 # Prereqs:
 #   1. Create a second Discord bot (see `python scripts/mybot_admin.py connect
@@ -27,7 +27,7 @@ set -a
 source "$ROOT_DIR/.discord2.env"
 set +a
 
-: "${PRIMARY_BOT_ID:=000000000000000000}"   # mybot#8481
+: "${PRIMARY_BOT_ID:?set PRIMARY_BOT_ID to the primary bot's Discord user id}"
 export MYBOT_SIBLING_BOT_IDS="$PRIMARY_BOT_ID"
 export DISCORD_SET_GUILD_NICKNAME=false
 export CHATBOT_BASE_URL="${CHATBOT_BASE_URL:-http://127.0.0.1:8788}"

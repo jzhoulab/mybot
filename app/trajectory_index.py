@@ -42,7 +42,7 @@ from sources.trajectory_lookup import (
 DEFAULT_CHUNK_CHARS = 4800
 DEFAULT_CHUNK_OVERLAP_CHARS = 800
 # Command output (tool_result) and the commands themselves (actions) carry the
-# live infrastructure state — SU balances, disk usage, job status — that prose
+# live infrastructure state — quotas, disk usage, job status — that prose
 # turns only paraphrase. They must be searchable, not dropped at index time.
 SEARCHABLE_EVENT_ROLES = {"user", "assistant", "tool_result", "actions"}
 # Half-life (days) for the recency boost applied at ranking time.
@@ -56,7 +56,7 @@ RECENCY_INTENT_RE = re.compile(
 VECTOR_BATCH_SIZE = 32
 # Chunks that quote this assistant's own machinery — test queries typed while
 # building mybot, mybot source read into tool output, retrieval traces — echo
-# whatever entities the code uses as examples ("cluster", "showusage", a balance
+# whatever entities the code uses as examples (a host name, a status command, a balance
 # line) and would otherwise outrank the session holding the real data. The
 # penalty keys off the chunk BODY, not the session title: a genuine data chunk
 # inside a mybot-titled session must escape it, and an echo chunk inside an

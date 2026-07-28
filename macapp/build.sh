@@ -5,7 +5,7 @@ set -euo pipefail
 cd "$(dirname "$0")"
 
 APP_NAME="mybot"
-BUNDLE_ID="com.example.mybot.menu"
+BUNDLE_ID="${BUNDLE_ID:-com.example.mybot.menu}"
 CONFIG="${1:-release}"
 
 # Stamp the bundle with the source commit so the app (and deploy.sh) can tell

@@ -3,14 +3,15 @@ requires = ["setuptools>=68", "wheel"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "shared-memory-chatbot"
+name = "mybot"
 version = "0.1.0"
-description = "Lightweight shared-memory chatbot with Discord transport and manual trajectory sync."
+description = "A private, local memory layer over your Claude Code and Codex session history."
 readme = "README.md"
 requires-python = ">=3.11"
 dependencies = [
   "discord.py>=2.7.0",
   "sentence-transformers>=5.1.0",
+  "slack_bolt>=1.18.0",
 ]
 license = { file = "LICENSE" }
 

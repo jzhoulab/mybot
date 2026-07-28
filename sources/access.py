@@ -240,7 +240,7 @@ class TrajectoryAccessConfig:
     version: int
     sources: dict[str, list[TrajectoryAccessAccount]]
     # Dirs (or parents of dirs) that tools use as dedicated agent-chat
-    # workspaces (e.g. ~/.mytool/agent). Sessions there stay indexed and
+    # workspaces (e.g. ~/.mytool/worktrees). Sessions there stay indexed and
     # searchable, but never flag as new projects needing owner review.
     agent_workspace_roots: list[str] = field(default_factory=list)
 

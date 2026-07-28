@@ -47,11 +47,22 @@ struct MybotConfig {
         )
     }
 
+    /// Where the checkout lives. `MYBOT_HOME` wins; otherwise try the usual
+    /// spots, confirming each by looking for the admin script. The installed
+    /// app sits in /Applications, so it can't infer the repo from its own path.
     static func repoRoot() -> URL {
         if let home = ProcessInfo.processInfo.environment["MYBOT_HOME"], !home.isEmpty {
             return URL(fileURLWithPath: (home as NSString).expandingTildeInPath)
         }
-        return URL(fileURLWithPath: "/Users/you/Code/mybot")
+        let home = FileManager.default.homeDirectoryForCurrentUser
+        let candidates = ["Code/mybot", "src/mybot", "dev/mybot", "mybot"]
+            .map { home.appendingPathComponent($0) }
+        for candidate in candidates where FileManager.default.fileExists(
+            atPath: candidate.appendingPathComponent("scripts/mybot_admin.py").path
+        ) {
+            return candidate
+        }
+        return candidates[0]
     }
 
     /// Commit the running binary was built from (stamped by macapp/build.sh).

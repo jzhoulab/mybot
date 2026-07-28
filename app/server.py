@@ -318,6 +318,28 @@ def sort_trajectory_sources(sources: list[dict[str, Any]], *, query: str, limit:
     return ranked[:limit] if limit is not None else ranked
 
 
+def load_query_hints() -> list[tuple[str, str]]:
+    """Per-deployment query expansions for jargon a general model can't guess.
+
+    Set TRAJECTORY_QUERY_HINTS to `keyword=extra search terms` pairs separated
+    by `;`. A query mentioning the keyword also gets searched with the extra
+    terms appended, which is how you teach retrieval that your cluster's
+    "balance" questions are phrased "insufficient allocation, no new jobs".
+
+        TRAJECTORY_QUERY_HINTS="proddb=replica lag failover;billing=invoice dunning"
+    """
+    hints: list[tuple[str, str]] = []
+    for entry in os.environ.get("TRAJECTORY_QUERY_HINTS", "").split(";"):
+        keyword, _, expansion = entry.partition("=")
+        keyword, expansion = keyword.strip().lower(), expansion.strip()
+        if keyword and expansion:
+            hints.append((keyword, expansion))
+    return hints
+
+
+QUERY_HINTS = load_query_hints()
+
+
 def trajectory_query_variants(query: str) -> list[str]:
     variants: list[str] = []
 
@@ -357,11 +379,10 @@ def trajectory_query_variants(query: str) -> list[str]:
         add(f"latest current status progress {focused}")
     if "allocation" in lowered or "allocations" in lowered:
         add(f"{focused} allocation balance remaining current balance insufficient balance out of allocation")
-        if "cluster" in lowered:
-            add("Cluster allocation current balance insufficient balance out of allocation no new jobs")
-    if "platform2" in lowered and ("migration" in lowered or "progress" in lowered or "status" in lowered):
-        add(f"{focused} Platform2 migration running works validated only platform")
-        add("Platform2 migration progress only platform training queued running")
+    for keyword, expansion in QUERY_HINTS:
+        if keyword in lowered:
+            add(f"{focused} {expansion}")
+            add(expansion)
     return variants[:8]
 
 
@@ -2508,9 +2529,9 @@ class AppState:
             "AI coding sessions (Claude Code and Codex trajectories on their machine). The user's "
             "request may be vague or use shorthand. Using the request, the conversation context, "
             "and the titles of sessions found so far, propose concrete search queries that would "
-            "locate the specific evidence. Prefer concrete entities: project names, hostnames "
-            "(e.g. cluster, platform2), tool or command names (showusage, sbatch, squeue), identifiers "
-            "(allocation or job codes), and file names. Expand shorthand into likely full terms. "
+            "locate the specific evidence. Prefer concrete entities: project, service, and host "
+            "names, tool or command names, identifiers such as job or ticket codes, and file "
+            "names. Expand shorthand into likely full terms. "
             "Do not repeat queries already tried. "
             f"Output ONLY a JSON array of {max_queries} or fewer short query strings, nothing else."
         )

@@ -1,0 +1,27 @@
+{
+  "_comment": [
+    "Retrieval regression cases for scripts/demo_agentic_retrieval.py.",
+    "Copy to demo_queries.local.json (untracked) and replace these with",
+    "questions about your own sessions. Pick questions you already know the",
+    "answer to, phrased the way you would actually ask them — vague, partial",
+    "recall is the interesting case. Get the expected source_ref by searching",
+    "for the session first: POST /trajectory/search."
+  ],
+  "cases": [
+    {
+      "name": "retry_backoff",
+      "query": "why did we drop the retry backoff and what did we keep as the ceiling?",
+      "expected": "codex:00000000-0000-0000-0000-000000000000"
+    },
+    {
+      "name": "auth_refactor",
+      "query": "what did we decide about moving session validation out of the middleware?",
+      "expected": "claude:00000000-0000-0000-0000-000000000000"
+    },
+    {
+      "name": "flaky_test",
+      "query": "how did we finally fix the test that only failed in CI?",
+      "expected": "codex:00000000-0000-0000-0000-000000000000"
+    }
+  ]
+}

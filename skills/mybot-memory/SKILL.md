@@ -75,9 +75,9 @@ results are capped).
 - **Be relentless and grounded.** Dig with these until the answer rests on real
   evidence, then say what's certain vs. not — with **dates** for time-sensitive
   values.
-- **Live numbers hide in command output.** Balances, quotas, job states,
+- **Live numbers hide in command output.** Versions, quotas, job states,
   benchmark results were usually printed by a past command — hunt for the literal
-  line (`mybot sql -q "SELECT text FROM trajectory_chunks WHERE text LIKE '%Current Balance%' ORDER BY updated_at DESC LIMIT 3"`)
+  line (`mybot sql -q "SELECT text FROM trajectory_chunks WHERE text LIKE '%p95 latency%' ORDER BY updated_at DESC LIMIT 3"`)
   before concluding there's no record.
 - **Find, then zoom.** Search or SQL to locate the session/chunk, then
   `trajectory-read` the exact window for full context rather than trusting a
@@ -91,16 +91,16 @@ results are capped).
 
 Recall a past decision:
 ```
-mybot trajectory-search -q "why we chose baseline-model over the baseline" --limit 5
-mybot trajectory-read --source-ref "codex:019e…" --chunk-id 637926 -q "baseline-model baseline"
+mybot trajectory-search -q "why we chose the streaming parser over the batch one" --limit 5
+mybot trajectory-read --source-ref "codex:019e…" --chunk-id 637926 -q "streaming parser tradeoff"
 ```
 
 Enumerate + aggregate:
 ```
-mybot sql -q "SELECT source_name, substr(updated_at,1,7) AS month, COUNT(DISTINCT source_ref) AS sessions FROM trajectory_chunks WHERE text REGEXP 'platform2' GROUP BY 1,2 ORDER BY 2 DESC"
+mybot sql -q "SELECT source_name, substr(updated_at,1,7) AS month, COUNT(DISTINCT source_ref) AS sessions FROM trajectory_chunks WHERE text REGEXP 'deploy' GROUP BY 1,2 ORDER BY 2 DESC"
 ```
 
 Find a literal value with its date:
 ```
-mybot sql -q "SELECT substr(updated_at,1,10) AS day, regexp_extract(text,'Current Balance:? [0-9,]+ ?SUs?') AS bal FROM trajectory_chunks WHERE text REGEXP 'Current Balance' ORDER BY updated_at DESC LIMIT 8"
+mybot sql -q "SELECT substr(updated_at,1,10) AS day, regexp_extract(text,'p95 latency:? [0-9.]+ ?ms') AS p95 FROM trajectory_chunks WHERE text REGEXP 'p95 latency' ORDER BY updated_at DESC LIMIT 8"
 ```

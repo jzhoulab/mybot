@@ -61,7 +61,7 @@ TRAJECTORY_INTENT_RE = re.compile(
     re.IGNORECASE,
 )
 MYBOT_CODEX_WORKSPACE_FRAGMENT = "/.local/share/mybot-codex-workspace"
-# tool_result carries command output — the live data (SU balances, disk usage,
+# tool_result carries command output — the live data (quotas, disk usage,
 # job status) that prose only paraphrases — so it is searchable evidence, not
 # noise to be skipped when scoring sessions or building read transcripts.
 SEARCHABLE_EVENT_ROLES = {"user", "assistant", "tool_result"}
@@ -723,7 +723,7 @@ def event_snippets_for_query(
                 break
 
     # Reserve a slot for the strongest command-output (tool_result/actions)
-    # match: live data such as SU balances and disk usage lives there and must
+    # match: live data such as quotas and disk usage lives there and must
     # not be crowded out by prose turns that merely discuss it.
     strong_secondary = bool(secondary_scored) and secondary_scored[0][0] >= 60.0
     primary_budget = limit

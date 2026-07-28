@@ -3,11 +3,11 @@
 ## Problem
 
 When a tool launches an AI coding agent (Claude Code, Codex) with **no human at
-the keyboard** — an orchestrator like the `hop` dispatcher spawning worker agents
+the keyboard** — an orchestrator spawning worker agents
 in git worktrees — the resulting session is, by every field the CLIs record,
 **indistinguishable from a human session**:
 
-| field          | human session | agentctl-launched agent |
+| field          | human session | launched agent |
 |----------------|---------------|--------------------|
 | `entrypoint`   | `cli`         | `cli`              |
 | `promptSource` | `typed`       | `typed`            |
@@ -17,7 +17,7 @@ in git worktrees — the resulting session is, by every field the CLIs record,
 
 The CLI genuinely cannot tell that the "typed" prompt was injected by a program.
 So mybot mis-indexed these agent runs as the owner's own interactive work,
-polluting retrieval (e.g. hop worker runs showing up as if the user did them).
+polluting retrieval — worker runs showed up as if the user did them.
 
 ## Convention
 
@@ -35,18 +35,18 @@ line to the agent's initial prompt**:
 
 Attributes:
 
-- `launcher` — free-form tool name, e.g. `hop`. For provenance/debugging.
+- `launcher` — free-form tool name, e.g. `agentctl`. For provenance/debugging.
 - `origin` — the automated cluster this session belongs to. Use `orchestrated`
   for dispatcher-launched worker agents (default if omitted). Other recognized
   clusters: `subagent`, `sdk`, `exec`, `no-user-turns`.
 
-### Example (agentctl)
+### Example
 
-When hop launches a worker agent, the first prompt it sends becomes:
+When a dispatcher launches a worker agent, the first prompt it sends becomes:
 
 ```
-<!-- agent-session: launcher=hop origin=orchestrated -->
-Bug fix in the file ./hop (a ~10k-line Node script; you are in a git worktree…)
+<!-- agent-session: launcher=agentctl origin=orchestrated -->
+Fix the failing test in ./src/parser.ts (you are in a git worktree…)
 ```
 
 ## How mybot uses it

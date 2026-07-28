@@ -1,6 +1,0 @@
-{
-  "backend": "claude_cli",
-  "model": "opus",
-  "thinking": "xhigh",
-  "preset": "claude:opus:xhigh"
-}

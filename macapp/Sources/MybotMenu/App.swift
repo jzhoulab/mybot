@@ -109,7 +109,7 @@ private func chipLabel(_ text: String, _ icon: String) -> some View {
     .foregroundStyle(.primary)
 }
 
-/// "You're Ada Lovelace, right?" — one-click confirm of the deduced identity,
+/// "You're <owner name>, right?" — one-click confirm of the deduced identity,
 /// with an inline correction field for when Sherlock got it wrong.
 private struct IdentityConfirmCard: View {
     @ObservedObject var model: AppModel
@@ -2025,37 +2025,37 @@ enum UIExporter {
             write(ContentView(model: AppModel.sample()).environment(\.colorScheme, scheme).background(bg), name)
 
             let busyModel = AppModel.sample()
-            busyModel.busyMessage = "Excluding 394 automated sessions…"
+            busyModel.busyMessage = "Excluding 42 automated sessions…"
             write(ContentView(model: busyModel).environment(\.colorScheme, scheme).background(bg),
                   name.replacingOccurrences(of: "ui-", with: "busy-"))
 
             let askModel = AppModel.sample()
             askModel.mode = .ask
             askModel.chat = [
-                ChatMsg(role: "user", text: "what did I do with fable recently?"),
+                ChatMsg(role: "user", text: "what did I do with the retry logic recently?"),
                 ChatMsg(role: "assistant",
-                        text: "You mostly worked on the **fable evaluation harness** — last week you fixed the scoring regression and re-ran the benchmark suite in `~/Code/demo-project`.",
+                        text: "You mostly worked on the **worker retry path** — last week you fixed the backoff regression and re-ran the load suite in `~/Code/payments-api`.",
                         sources: [
                             ChatSource(ref: "codex:0199aaa", sourceName: "codex", kind: "chunk",
-                                       title: "Fix fable scoring regression", score: 87),
+                                       title: "Fix retry backoff regression", score: 87),
                             ChatSource(ref: "claude:bb31c02", sourceName: "claude", kind: "session",
-                                       title: "fable benchmark sweep", score: 61),
+                                       title: "worker pool load sweep", score: 61),
                         ],
                         toolCalls: [
-                            ChatToolCall(tool: "memory-search", query: "fable recent work",
+                            ChatToolCall(tool: "memory-search", query: "retry recent work",
                                          seconds: 0.02, results: 5, tokens: 140),
-                            ChatToolCall(tool: "trajectory-search", query: "fable",
+                            ChatToolCall(tool: "trajectory-search", query: "retry backoff",
                                          seconds: 0.31, results: 3, tokens: 480),
                         ]),
             ]
             askModel.searchHits = [
-                SearchHit(ref: "codex:0199aaa", source: "codex", title: "Fix fable scoring regression",
-                          cwd: "/Users/you/Code/demo-project",
-                          snippet: "the fable scorer was double-counting partial matches … patched normalize step and re-ran",
+                SearchHit(ref: "codex:0199aaa", source: "codex", title: "Fix retry backoff regression",
+                          cwd: "/Users/you/Code/payments-api",
+                          snippet: "the backoff was double-counting queued attempts … patched the delay step and re-ran",
                           updatedAt: "2026-07-05T12:00:00Z"),
-                SearchHit(ref: "claude:bb31c02", source: "claude", title: "fable benchmark sweep",
-                          cwd: "/Users/you/Code/demo-project",
-                          snippet: "ran the full fable suite across 3 model configs … results in results/2026-07-01",
+                SearchHit(ref: "claude:bb31c02", source: "claude", title: "worker pool load sweep",
+                          cwd: "/Users/you/Code/payments-api",
+                          snippet: "ran the full load suite across 3 worker configs … results in results/2026-07-01",
                           updatedAt: "2026-07-01T09:00:00Z"),
             ]
             write(ContentView(model: askModel).environment(\.colorScheme, scheme).background(bg),
@@ -2065,9 +2065,9 @@ enum UIExporter {
             write(VStack(alignment: .leading, spacing: 10) {
                 ForEach(askModel.chat) { msg in ChatBubble(msg: msg, startExpanded: true) }
                 ChatBubble(msg: ChatMsg(role: "assistant",
-                    text: "You mostly worked on the fable evaluation harness", streaming: true))
+                    text: "You mostly worked on the worker retry path", streaming: true))
                 HStack(spacing: 7) { ProgressView().controlSize(.small)
-                    Text("Searching memory: fable recent work").font(.system(size: 11)).foregroundStyle(.secondary) }
+                    Text("Searching memory: retry recent work").font(.system(size: 11)).foregroundStyle(.secondary) }
                 ChatBubble(msg: ChatMsg(role: "error", text: "chat server is not running — start it with run_discord_chatbot.sh"))
                 Text("MEMORY MATCHES").font(.system(size: 10, weight: .heavy)).tracking(0.6)
                     .foregroundStyle(.secondary)
@@ -2086,7 +2086,7 @@ enum UIExporter {
             write(rows, name.replacingOccurrences(of: "ui-", with: "rows-"))
 
             let sampleSessions = [
-                Session(ref: "codex:a1", sessionId: "3f9c2a7b8e01", title: "Fix cluster SU allocation lookup", updatedAt: "2026-07-06T08:00:00Z", chunks: 42),
+                Session(ref: "codex:a1", sessionId: "3f9c2a7b8e01", title: "Fix cache invalidation in the indexer", updatedAt: "2026-07-06T08:00:00Z", chunks: 42),
                 Session(ref: "codex:a2", sessionId: "77d1e0a4bb2f", title: "", updatedAt: "2026-07-05T14:00:00Z", chunks: 18, origin: "automated"),
                 Session(ref: "codex:a3", sessionId: "c40b9915ee77", title: "Refactor trajectory index embeddings", updatedAt: "2026-07-04T11:00:00Z", chunks: 65),
             ]
@@ -2100,17 +2100,17 @@ enum UIExporter {
             let detailModel = AppModel.sample()
             detailModel.sessions = sampleSessions
             let detail = SessionDetail(model: detailModel,
-                                       project: Project(source: "codex", cwd: "/Users/you/Code/demoapp",
+                                       project: Project(source: "codex", cwd: "/Users/you/Code/payments-api",
                                                         sessions: 3, chunks: 125, updatedAt: "2026-07-06T08:00:00Z", included: true))
                 .frame(width: 480, height: 360).environment(\.colorScheme, scheme).background(bg)
             write(detail, name.replacingOccurrences(of: "ui-", with: "detail-"))
 
             let events = [
-                TrajectoryEvent(kind: "user", tool: "", text: "can you read README.md and tell me the best model for variant-effect prediction?"),
-                TrajectoryEvent(kind: "thinking", tool: "", text: "The user wants me to read README.md and find the best model. Let me search for it first."),
-                TrajectoryEvent(kind: "tool_use", tool: "Glob", text: "{\n  \"pattern\": \"**/README.md\"\n}"),
-                TrajectoryEvent(kind: "tool_result", tool: "result", text: "Found: /Users/you/Code/demoapp/README.md"),
-                TrajectoryEvent(kind: "assistant", tool: "", text: "The best model for variant-effect prediction was the fine-tuned baseline-model variant — it beat the baseline by 12% AUROC."),
+                TrajectoryEvent(kind: "user", tool: "", text: "can you read CONTRIBUTING.md and tell me the release command?"),
+                TrajectoryEvent(kind: "thinking", tool: "", text: "The user wants me to read CONTRIBUTING.md and find the release command. Let me search for it first."),
+                TrajectoryEvent(kind: "tool_use", tool: "Glob", text: "{\n  \"pattern\": \"**/CONTRIBUTING.md\"\n}"),
+                TrajectoryEvent(kind: "tool_result", tool: "result", text: "Found: /Users/you/Code/payments-api/CONTRIBUTING.md"),
+                TrajectoryEvent(kind: "assistant", tool: "", text: "The release command is `make release` — it was changed from `npm publish` last month."),
             ]
             let traj = VStack(spacing: 8) {
                 ForEach(events) { EventRow(event: $0) }

@@ -1,462 +1,409 @@
-# Shared Memory Chatbot
+<p align="center">
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="docs/assets/hero-dark.png">
+    <source media="(prefers-color-scheme: light)" srcset="docs/assets/hero-light.png">
+    <img src="docs/assets/hero-dark.png" alt="mybot — a private memory layer for your AI coding sessions" width="900">
+  </picture>
+</p>
 
-This project is a lightweight multi-user chatbot stack built from the useful structural ideas behind OpenClaw, but it runs independently:
+<p align="center">
+  <img src="https://img.shields.io/badge/python-3.11%2B-3776ab" alt="Python 3.11+">
+  <img src="https://img.shields.io/badge/macOS-14%2B%20(menu%20app)-000000" alt="macOS 14+ for the menu app">
+  <img src="https://img.shields.io/badge/network-localhost%20only-4ade80" alt="Localhost only">
+  <img src="https://img.shields.io/badge/license-MIT-blue" alt="MIT license">
+</p>
 
-1. one shared HTTP chat server
-2. one Discord bot transport
-3. local JSONL chat sessions
-4. local SQLite semantic memory
-5. manual per-user trajectory sync into shared private memory
+---
 
-The intended v1 deployment is a **single bot and single server** running on one teammate’s always-on machine, reachable only on a private path such as Tailscale, LAN, or an SSH tunnel.
+Every Claude Code and Codex session you have ever run is already sitting on your
+disk as JSONL — thousands of conversations, commands, and command outputs that
+are effectively write-only. You cannot grep your way back to "what did we decide
+about the retry backoff, and why," because the answer is spread across a
+transcript you no longer remember the name of.
 
-## Layout
+mybot indexes those transcripts locally, then puts a search agent in front of
+them. Ask a question in plain language and it searches, refines its own queries,
+reopens the sessions that look relevant, and answers with dates and links back
+to the exact transcript window it used. Nothing leaves your machine: the index,
+the embeddings, and the model calls to your local CLI all stay local.
 
-- `app/`
-  - `server.py`: shared HTTP server
-  - `semantic_memory.py`: SQLite semantic memory with embeddings and import upserts
-  - `auth.py`: sync-token auth
-  - `discord_bridge.py`: Discord transport
-- `client/`
-  - `sync_trajectories.py`: local manual sync CLI
-- `sources/`
-  - registry-backed local trajectory adapters
-  - `codex` and `claude` are first-class in v1
-- `profiles/default/`
-  - prompt and persona files for the current bot
-- `scripts/backup_state.sh`
-  - host-side backup snapshot script
-- `config/sync_tokens.example.json`
-  - example sync-token mapping file
-- `.env.example`
-  - shared server/runtime environment template
-- `.discord.env.example`
-  - Discord transport environment template
-- `pyproject.toml`
-  - minimal project metadata for packaging and installs
+**Questions it is built to answer**
 
-The top-level files `standalone_agent_backbone.py` and `discord_bridge.py` are compatibility entrypoints that call into `app/`.
+- *"Have I hit this error before?"* — and what actually fixed it.
+- *"What was the config we settled on for the staging deploy?"* — with the date.
+- *"Did that migration finish, or did I abandon it halfway?"*
+- *"What did I decide about the schema, and what was the reasoning I rejected?"*
 
-## Memory model
+## Quickstart
 
-There are three memory layers:
-
-- session hot context
-  - rolling session summary
-  - latest detailed turns preserved in full
-- private semantic memory
-  - per-user promoted notes
-  - per-user imported trajectories
-- shared team memory
-  - only explicitly promoted shared notes
-
-Retrieval is private-first:
-
-- normal chat searches only the requesting user’s private memory
-- `shared` mode searches only shared memory
-- `target_user` mode searches only the named user’s private memory
-
-Trajectory import granularity is mixed:
-
-- every source session creates one `session` record
-- only recent sessions create extra `chunk` records
-- recent means the newest 20 sessions per source
-- each recent session creates up to 4 chunk records
-
-Embeddings are local:
-
-- `sentence-transformers/all-MiniLM-L6-v2`
-
-Storage is local to the host machine:
-
-- transcripts: `state/sessions/*.jsonl`
-- semantic memory: `state/semantic_memory.sqlite3`
-- trajectory memory index: `state/trajectory_memory.json`
-- prompt files: `profiles/default/*.md`
-
-## Install
+Requires Python 3.11+, and at least one of [Claude Code](https://claude.com/claude-code)
+or Codex CLI with existing session history. The first index of a large history
+takes a while and lands in the hundreds of MB to a few GB — see
+[Footprint](#footprint-and-background-behavior).
 
 ```bash
-python3 -m venv .venv
-. .venv/bin/activate
-python3 -m pip install -U pip
-python3 -m pip install -r requirements.txt
+git clone https://github.com/jzhoulab/mybot.git ~/Code/mybot && cd ~/Code/mybot
+python3 -m venv .venv && . .venv/bin/activate
+python3 -m pip install -U pip && python3 -m pip install -r requirements.txt
 cp .env.example .env
-cp .discord.env.example .discord.env
 ```
 
-`.discord.env` is needed only for the Discord bridge. `.env` holds shared server/runtime settings and is sourced automatically by `run_discord_chatbot.sh` when present.
+Then edit `.env`. The three things that matter on a first run:
 
-## Model backend
+| Setting | What to put |
+|---|---|
+| `MODEL_BACKEND` | `claude_cli`, `codex_cli`, or `openai_compatible` — plus that backend's vars ([details](#model-backends)) |
+| `MEMORY_IMPORTED_OWNER_ID` | Any stable string for solo use; your Discord/Slack user id if you run a bridge |
+| `TRAJECTORY_ACCESS_CONFIG_PATH`<br>`TRAJECTORY_INDEX_DB_PATH` | Absolute paths, so the server works when launched from anywhere |
 
-For local Codex auth:
-
-```bash
-export MODEL_BACKEND="codex_cli"
-export CODEX_COMMAND="/Applications/Codex.app/Contents/Resources/codex"
-export CODEX_PERMISSION_PROFILE="mybot_restricted"
-export CODEX_NETWORK_ACCESS="true"
-export CODEX_IGNORE_USER_CONFIG="true"
-export CODEX_DISABLE_BACKEND_RESUME="true"
-export CODEX_EPHEMERAL="true"
-# optional:
-# export MODEL_NAME="gpt-5.4"
-# export CODEX_CWD="/absolute/path/to/Code/mybot-runtime/default"
-# export MYBOT_TOOL_PYTHON="/usr/bin/python3"
-```
-
-`CODEX_PERMISSION_PROFILE` enables a restricted Codex permission profile for agentic tool routing. The subprocess runs from an isolated runtime directory outside the mybot repo and can read the generated read-only mybot tool wrapper, but it is not granted repo-wide read access. Raw `~/.codex`, `~/.claude`, mybot config, and mybot state are denied so trajectory visibility is enforced by mybot's access layer.
-Use a Codex CLI build with permission-profile support; on macOS the bundled desktop binary above is preferred over older `codex` binaries on `PATH`.
-
-For an OpenAI-compatible backend:
+Choose what mybot is allowed to read, then start it:
 
 ```bash
-export MODEL_BACKEND="openai_compatible"
-export MODEL_BASE_URL="https://api.openai.com/v1"
-export MODEL_API_KEY="your-key"
-export MODEL_NAME="gpt-4.1-mini"
-```
-
-## Server config
-
-Important environment variables:
-
-```bash
-export TRAJECTORY_SOURCES="codex,claude"
-export TRAJECTORY_ACCESS_CONFIG_PATH="/absolute/path/to/config/access.json"
-export MEMORY_IMPORTED_OWNER_ID="000000000000000000"
-export EMBEDDING_MODEL_NAME="sentence-transformers/all-MiniLM-L6-v2"
-export TRAJECTORY_MAX_FILES_PER_TOOL="1000"
-export TRAJECTORY_INVESTIGATION_MODE="auto"
-export TRAJECTORY_SEARCH_LIMIT="5"
-export TRAJECTORY_EVIDENCE_LIMIT="2"
-export TRAJECTORY_EVIDENCE_CHARS="18000"
-export TRAJECTORY_INDEX_AUTOBUILD="true"
-export TRAJECTORY_INDEX_AUTOBUILD_VECTORS="false"
-export TRAJECTORY_INDEX_AUTOBUILD_MIN_INTERVAL_SECONDS="300"
-export TRAJECTORY_INDEX_BACKGROUND_REFRESH_SECONDS="300"
-export TRAJECTORY_INDEX_REFRESH_MAX_SESSIONS="0"
-export HISTORY_MAX_MESSAGES="24"
-export SESSION_TAIL_PAIRS="12"
-export COMPACTION_TRIGGER_MESSAGES="40"
-export COMPACTION_TRIGGER_CHARS="16000"
-export MEMORY_MATCH_LIMIT="5"
-export SYNC_TOKENS_PATH="/absolute/path/to/config/sync_tokens.json"
-```
-
-`SYNC_TOKENS_PATH` is used only for the sync endpoints. Normal chat and Discord reply handling continue working even if sync auth is not configured yet.
-
-## Trajectory access setup
-
-The bot only imports registered trajectory sources. In v1 those sources are:
-
-- Codex trajectory JSONL under configured Codex roots such as `~/.codex`
-- Claude Code project JSONL under configured Claude roots such as `~/.claude/projects`
-
-Access is permissive by default for enabled roots. Each root can use `visibility_mode: "blacklist"` to allow everything except exclusions, or `visibility_mode: "whitelist"` to allow only included workdirs/classes.
-
-Create or edit the local access config with the setup TUI:
-
-```bash
-python -m client.setup_access
-```
-
-The TUI writes `config/access.json` by default. This file is gitignored because it describes local root paths and access choices.
-
-Example config:
-
-```bash
-cp config/access.example.json config/access.json
-```
-
-If you have multiple Codex or Claude roots, add them in the TUI and explicitly enable the roots mybot may scan. For each enabled root, choose blacklist or whitelist mode. Workdir filters can be path fragments, full paths, or visibility classes.
-
-For Codex, `codex_no_project` matches sessions that appear to come from Chats rather than a project workspace. In the current data this means empty workdirs, `/Users/you`, or generated `/Users/you/Documents/Codex/...` workdirs. `codex_project` matches the remaining Codex workdirs.
-
-For Claude trajectories, the TUI also shows detected `entrypoint` values. Programmatic SDK calls usually show up as `sdk-cli`, while interactive sessions are usually `cli`, `claude-desktop`, or older files with no entrypoint. Add `sdk-cli` to `excluded_entrypoints` if you want mybot to ignore app-generated Claude invocations while keeping interactive Claude Code sessions.
-
-## Sync token config
-
-Copy the example file and fill in one token record per teammate:
-
-```bash
-cp config/sync_tokens.example.json config/sync_tokens.json
-```
-
-Each record binds one bearer token hash to one Discord `actor_id`.
-
-To generate a token hash:
-
-```bash
-python3 - <<'PY'
-import hashlib
-token = "paste-a-real-secret-token-here"
-print(hashlib.sha256(token.encode("utf-8")).hexdigest())
-PY
-```
-
-Then place that hash in `config/sync_tokens.json`.
-
-## Start the shared server
-
-```bash
+python -m client.setup_access            # interactive; --init-default to accept everything
 python3 standalone_agent_backbone.py --host 127.0.0.1 --port 8788
 ```
 
-Important endpoints:
-
-- `POST /chat`
-- `POST /memory/rebuild`
-- `POST /memory/search`
-- `POST /trajectory/search`
-- `POST /trajectory/read`
-- `POST /trajectory/index/rebuild`
-- `POST /trajectory/index/embed`
-- `POST /trajectory/index/stats`
-- `POST /memory/promote`
-- `POST /memory/import-batch`
-- `POST /memory/sync-status`
-- `POST /sessions/history`
-- `POST /sessions/reset`
-- `GET /health`
-- `GET /gui`
-
-### Local GUI
-
-Open the local dashboard while the server is running:
+The first start indexes your history and, in the background, works out who you
+are from your own transcripts. When it settles:
 
 ```bash
-open http://127.0.0.1:8788/gui
+curl -s http://127.0.0.1:8788/health
+open http://127.0.0.1:8788/gui          # scope, footprint, and a retrieval probe
 ```
 
-The dashboard shows the indexed trajectory pool, active visibility policy, runtime hardening status, recently indexed trajectories, recent retrieval activity, and whether raw trajectory files are newer than the searchable index.
-
-### `/chat`
-
-Request fields:
-
-- `actor_id`
-- `user`
-- `session_key`
-- `message`
-- `memory_scope`
-  - `private`
-  - `shared`
-  - `target_user`
-- `target_user_id` when `memory_scope=target_user`
-- `return_sources`
-
-Response fields include:
-
-- `memory_scope_used`
-- `session_summary_used`
-- `sources`
-
-When `TRAJECTORY_INVESTIGATION_MODE=auto`, chat requests can automatically promote likely trajectory candidates into a `Full Trajectory Evidence` prompt section. The automatic path uses the reduced trajectory chunk index when available, falls back to the semantic DB plus lexical/proximity candidate search, then reopens only the top allowed trajectory files for parsed evidence.
-
-With `AGENTIC_TOOL_ROUTING=true`, chat requests expose a generated read-only tool wrapper in the isolated runtime directory to the Codex agent and let the agent decide whether memory or trajectory lookup is needed. The server passes the actor and memory scope through environment variables so tool calls use the same access policy as direct API calls.
-
-Trajectory investigation modes:
-
-- `auto`: default; use full-read evidence when a query looks trajectory-related or memory retrieval finds trajectory candidates
-- `off`: disable automatic full-read evidence
-- `full_scan`: slower comparison mode; scan allowed trajectory files directly
-
-### `/trajectory/search`
-
-Search allowed local trajectories without answering through the model:
+Index refresh writes keyword search immediately and fills in embeddings
+gradually. To force the rest:
 
 ```bash
-curl -sS http://127.0.0.1:8788/trajectory/search \
-  -H 'Content-Type: application/json' \
-  -d '{
-    "query": "figure compression",
-    "actor_id": "000000000000000000",
-    "limit": 5
-  }'
+python scripts/mybot_admin.py maintenance --action embed   # repeat until missing_embeddings is 0
 ```
 
-The fast path uses an agentic multi-step retrieval loop: it searches the persistent reduced trajectory chunk index, semantic memory, lexical memory, and local parsed candidates; then it tries focused query variants and title/path refinements when recall looks trajectory-related or ambiguous. Set `"return_trace": true` to inspect the retrieval steps. Set `"full_scan": true` to force slower full parsed-file search instead of the fast candidate path.
+## The four ways to reach it
 
-### `/trajectory/index/rebuild`
+| Surface | Start it with | Good for |
+|---|---|---|
+| **Web dashboard** | already running at `/gui` | Seeing what is indexed, tuning scope, probing retrieval and its scores |
+| **macOS menu bar** | `./macapp/build.sh release && open macapp/.dist/mybot.app` | Day-to-day asking, browsing transcripts, per-project include/exclude |
+| **Agent skill** | `sh skills/mybot-memory/install.sh` | Letting your *other* Claude Code and Codex sessions query your history mid-task |
+| **Discord / Slack** | `python scripts/mybot_admin.py connect discord` then `./run_discord_chatbot.sh` | Asking from your phone, and letting teammates ask |
 
-Rebuild the persistent reduced trajectory chunk index from the currently allowed Codex and Claude trajectory roots:
+The menu-bar app reads the index SQLite directly, so browsing and search still
+work with the server stopped. Set `MYBOT_HOME` if your checkout is not at
+`~/Code/mybot`. It needs macOS 14+.
+
+The Discord and Slack bridges take `!team`, `!ask @user`, `!remember`,
+`!remember-shared`, `!sources`, `!iam`, and `!new`. The launchers supervise:
+they start the server if it is not healthy, restart the bridge with exponential
+backoff, and hold a single-instance lock.
+
+## How retrieval works
+
+```mermaid
+flowchart LR
+  A["~/.codex/sessions<br>~/.claude/projects"] -->|"incremental refresh"| B["trajectory_index.sqlite3<br>chunks + FTS5 + vectors"]
+  B --> C{"agentic search"}
+  C -->|"weak recall"| D["query planner<br>proposes better queries"]
+  D --> C
+  C -->|"good candidates"| E["reopen transcripts<br>windowed read"]
+  E --> F["answer with dates<br>+ source links"]
+```
+
+**Indexing.** Transcripts are cleaned and split into ~4800-character chunks with
+800 characters of overlap, stored in SQLite with an FTS5 index over title, cwd,
+and text, plus float32 embeddings from a local
+`sentence-transformers/all-MiniLM-L6-v2`. Refresh is incremental: unchanged
+sessions are left alone, changed ones are re-chunked, and sessions that fall out
+of your visibility rules are deleted from the index.
+
+**Search** is hybrid by default. FTS5 handles phrases and identifiers, with a
+literal/proximity fallback for identifier-shaped queries; vectors then rerank
+that bounded candidate set rather than scanning everything. Scores get a
+recency bonus weighted much harder when the question implies "currently", and
+each session is capped at two chunks so one long session cannot crowd out the
+rest.
+
+**The agentic loop** is what makes vague questions work. A first pass searches
+the chunk index, semantic memory, and lexical memory. If recall looks weak,
+heuristic query variants go next; if it is *still* weak, a cheap model tier
+proposes precise queries and iterates, bounded by a hard wall-clock budget
+(`TRAJECTORY_SEARCH_TIME_BUDGET_SECONDS`, default 25s) and an early stop once a
+round stops improving the top score. Entities discovered along the way are
+folded into the query used to extract evidence, which is how command output that
+the original phrasing would never have matched still gets found.
+
+**Answering.** The top candidates get reopened for a windowed read, budgeted to
+`TRAJECTORY_EVIDENCE_CHARS`, and passed to the model as explicit evidence. With
+`AGENTIC_TOOL_ROUTING=true` (default) the answering agent instead gets a
+read-only retrieval CLI in an isolated runtime directory and decides for itself
+when to search — every tool call carrying the same actor and scope, so it cannot
+see more than the asker is allowed to see.
+
+Pass `"return_trace": true` to `/trajectory/search` to see every stage, or use
+the retrieval probe in `/gui` to watch ranking decisions directly.
+
+## What mybot can see
+
+This is the part worth configuring carefully, because the index is built from
+everything you have ever typed at a coding agent.
+
+Visibility lives in `config/access.json` (gitignored — it describes your local
+paths). Write it with `python -m client.setup_access`, or edit scope live from
+`/gui` and the menu app. Each source root is independently:
+
+- **enabled or not** — a root you never enable is never read.
+- **blacklist or whitelist** (`visibility_mode`) — allow everything except
+  exclusions, or only what you list.
+- filtered by **workdir** (path fragments, full paths, or path components) and by
+  **workdir class** (`codex_project`, `codex_no_project`, `empty_workdir`, …).
+- filtered by **Claude entrypoint** — e.g. exclude `sdk-cli` to drop
+  programmatic invocations while keeping sessions you actually typed.
+- filtered by **origin** — `exclude_automated`, or per-cluster via
+  `excluded_origin_details` (`subagent`, `sdk`, `exec`, `no-user-turns`,
+  `orchestrated`), so agent-launched runs do not read as your own work.
+
+Three tiers result:
+
+| Tier | Indexed? | Who can retrieve it |
+|---|---|---|
+| Excluded | No — and already-indexed chunks are purged when policy changes | Nobody |
+| Visible | Yes | Whoever the bot serves |
+| **Owner-private** (`private_workdirs`, `private_workdir_classes`) | Yes | Only the owner, guest access on or off |
+
+The owner-private tier is enforced against *live* policy on every request rather
+than a stamp from index time, so tightening `config/access.json` takes effect
+immediately. `private_workdirs` matches an exact cwd — a prefix rule for your
+home directory would swallow every project under it.
+
+Two things to know before pointing a bridge at a shared channel. `/trajectory/sql`
+is **owner-only outright**, because raw SQL cannot be row-filtered the way
+search results can. And whoever the channel allowlist admits can read whatever
+the bot can read — gate with `DISCORD_ALLOWED_CHANNEL_IDS` and the scope
+controls, and set `GUEST_OWNER_ACCESS=false` if teammates should not reach your
+trajectory history at all.
+
+Everything binds to `127.0.0.1`. Only the two sync endpoints take a bearer
+token; the rest are protected by the loopback bind plus per-actor policy checks.
+Do not expose the port directly — put it behind a private path such as
+Tailscale, a LAN-only interface, or an SSH tunnel.
+
+## Using it as a team
+
+Each person runs their own instance over their own history. The bot acts as its
+owner's representative, so a teammate can ask "what did Alex do with the nightly
+training run?" in Discord or Slack without interrupting Alex — bounded by the
+visibility rules above. Bots auto-name themselves `<owner-handle>-mybot` per
+server so a team's instances stay distinguishable.
+
+Guests get their own private memory (`!remember`) and shared team notes
+(`!remember-shared`), and mybot keeps a light person registry (display name,
+first and last seen, recent topics) so it can greet a returning teammate with
+context instead of starting cold. In group channels one session is shared per
+channel, with each turn attributed by display name, and non-addressed messages
+in explicitly listed channels are recorded without a reply so "what did Sam say
+about the rollback?" is answerable later.
+
+See [docs/multi-user.md](docs/multi-user.md) for session routing, idle rollover,
+and the per-platform actor-id caveat. Cross-bot relay is receiver-side only so
+far — treat it as experimental.
+
+## Model backends
+
+`MODEL_BACKEND` picks one of three. Both CLI backends stream, which is what
+drives the live tool-call pills in the menu app.
+
+| Backend | Uses | Key vars |
+|---|---|---|
+| `claude_cli` | your local Claude Code CLI and its auth | `CLAUDE_COMMAND`, `CLAUDE_MODEL` (default `opus`), `CLAUDE_THINKING`, `CLAUDE_BASH_SANDBOX` |
+| `codex_cli` | your local Codex CLI and its auth | `CODEX_COMMAND`, `CODEX_MODEL`, `CODEX_REASONING_EFFORT`, `CODEX_PERMISSION_PROFILE` |
+| `openai_compatible` | any HTTP endpoint | `MODEL_BASE_URL`, `MODEL_API_KEY`, `MODEL_NAME`, `MODEL_API_STYLE` |
+
+Switch backend, model, or thinking depth at runtime — the menu app writes
+`state/model_config.json`, which the server rereads per request with no restart.
+`/health` reports what is actually in effect.
+
+Both CLI backends are sandboxed per invocation. mybot runs Codex with
+`--ignore-user-config`, so your `~/.codex/config.toml` does **not** apply and the
+model and reasoning effort must be set here. The agent's own shell gets home
+denied except its runtime workspace, and networking restricted to localhost, so
+trajectory visibility is decided by mybot's access layer rather than by what the
+agent could read off disk.
+
+<details>
+<summary><b>Configuration reference</b></summary>
+
+Full annotated list in [`.env.example`](.env.example). The settings you are
+most likely to touch:
+
+**Retrieval**
+
+| Variable | Default | Effect |
+|---|---|---|
+| `TRAJECTORY_SOURCES` | `codex,claude` | Which adapters are active |
+| `TRAJECTORY_INVESTIGATION_MODE` | `auto` | `auto` \| `off` \| `full_scan` (slow comparison mode) |
+| `TRAJECTORY_SEARCH_LIMIT` | `5` | Candidates carried forward |
+| `TRAJECTORY_EVIDENCE_LIMIT` / `_CHARS` | `2` / `18000` | How many sessions get reopened, and the total character budget |
+| `TRAJECTORY_QUERY_PLANNER` | `true` | Let the model propose better queries when recall is weak |
+| `TRAJECTORY_SEARCH_TIME_BUDGET_SECONDS` | `25` | Hard cap on one agentic search |
+| `MYBOT_TOOL_TOTAL_BUDGET_SECONDS` | `90` | Total retrieval time across all tool calls in one turn |
+| `TRAJECTORY_QUERY_HINTS` | — | `keyword=extra terms` pairs to teach retrieval your own jargon |
+| `AGENTIC_TOOL_ROUTING` | `true` | Give the answering agent a retrieval CLI instead of pre-fetching |
+
+**Index**
+
+| Variable | Default | Effect |
+|---|---|---|
+| `TRAJECTORY_INDEX_CHUNK_CHARS` / `_OVERLAP_CHARS` | `4800` / `800` | Chunk geometry |
+| `TRAJECTORY_INDEX_AUTOBUILD` | `true` | Refresh when raw files are newer than the index |
+| `TRAJECTORY_INDEX_AUTOBUILD_VECTORS` | `false` | Embed during refresh; leaving it off keeps refresh fast |
+| `TRAJECTORY_INDEX_BACKGROUND_REFRESH_SECONDS` | `300` | Keep the index warm between questions |
+| `TRAJECTORY_INDEX_PAUSE_ON_BATTERY` | `true` | Skip unattended indexing on battery |
+| `EMBEDDING_MODEL_NAME` | `sentence-transformers/all-MiniLM-L6-v2` | Local embedding model |
+
+**Sessions and context**
+
+| Variable | Default | Effect |
+|---|---|---|
+| `HISTORY_MAX_MESSAGES` / `SESSION_TAIL_PAIRS` | `24` / `12` | How much conversation stays verbatim |
+| `COMPACTION_TRIGGER_MESSAGES` / `_CHARS` | `40` / `16000` | When a session compacts into a rolling summary |
+| `SESSION_IDLE_ROLLOVER_SECONDS` | `6h` | Idle gap before a fresh session with a carry-forward line |
+| `GUEST_OWNER_ACCESS` | `true` | Whether guests may query the owner's trajectories |
+
+</details>
+
+<details>
+<summary><b>HTTP API</b></summary>
+
+All POST bodies are JSON. Only `/memory/import-batch` and `/memory/sync-status`
+require `Authorization: Bearer <token>`.
+
+**Ask**
+
+| Endpoint | Purpose |
+|---|---|
+| `POST /chat` | One turn: retrieve, assemble the prompt, answer, persist the turn and its sources |
+| `POST /chat/stream` | Same, as SSE — streams tool activity and text, then a final `done` event |
+
+`/chat` takes `actor_id`, `user`, `session_key`, `message`, `memory_scope`
+(`private` \| `shared` \| `target_user`), `target_user_id`, and `return_sources`;
+it returns `memory_scope_used`, `session_summary_used`, and `sources`.
+
+**Search and read**
+
+| Endpoint | Purpose |
+|---|---|
+| `POST /trajectory/search` | Agentic search with no answer generated. Supports `limit`, `after`/`before`, `source`, `return_trace`, `full_scan` |
+| `POST /trajectory/read` | Read a parsed trajectory by `source_ref`, windowed by `chunk_id` / `around_event`, bounded by `max_chars` |
+| `POST /trajectory/sql` | **Owner-only.** Read-only `SELECT` over the chunk index, with `REGEXP` helpers injected |
+| `POST /memory/search` | Search promoted notes by scope |
+| `GET /memory` | Dump the overview index and semantic-memory stats |
+
+**Index maintenance**
+
+| Endpoint | Purpose |
+|---|---|
+| `POST /trajectory/index/rebuild` | Full rebuild from allowed roots |
+| `POST /trajectory/index/embed` | Backfill embeddings in batches |
+| `POST /trajectory/index/stats` | Chunk, session, and embedding counts; freshness; footprint |
+| `POST /memory/rebuild` | Rebuild the semantic/overview memory index |
+
+**Sessions, people, and owner**
+
+| Endpoint | Purpose |
+|---|---|
+| `POST /sessions/history` \| `/sessions/list` \| `/sessions/reset` | Load a transcript, list threads under a key prefix, archive and start fresh |
+| `POST /sessions/observe` | Record a non-addressed channel message as an attributed turn — no model call, no reply |
+| `POST /memory/promote` | Store a private or shared note |
+| `POST /owner/identity` | `get` / `set` / `investigate` the owner identity (`set` is owner-only) |
+| `POST /owner/profile` | Get, regenerate, or save `profiles/default/USER.md` |
+
+**Dashboard and health**
+
+| Endpoint | Purpose |
+|---|---|
+| `GET /gui` \| `GET /gui/state` | The dashboard, and the JSON behind it |
+| `POST /gui/query` \| `/gui/scope` \| `/gui/maintenance` | Retrieval probe; read or change visibility; kick off maintenance |
+| `GET /health` | Liveness, effective backend/model/thinking, bot name, index and battery status |
+
+**Multi-machine sync** (optional; distinct from local indexing)
+
+| Endpoint | Purpose |
+|---|---|
+| `POST /memory/import-batch` | Idempotent upload of normalized records from a remote client |
+| `POST /memory/sync-status` | Server-side view of what an actor has synced per source |
+
+Set up tokens by copying `config/sync_tokens.example.json` to
+`config/sync_tokens.json` — one record per person, binding a sha256 token hash
+to an actor id:
 
 ```bash
-curl -sS http://127.0.0.1:8788/trajectory/index/rebuild \
-  -H 'Content-Type: application/json' \
-  -d '{
-    "actor_id": "000000000000000000",
-    "include_vectors": false
-  }'
+python3 -c 'import hashlib,getpass; print(hashlib.sha256(getpass.getpass("token: ").encode()).hexdigest())'
 ```
 
-The index stores reduced conversation chunks, not raw arbitrary filesystem content. Exact search uses SQLite FTS phrase/token search plus literal/proximity fallback for identifier-like queries. Hybrid search reranks bounded FTS candidates with vectors when chunk embeddings exist, and full vector search uses an in-process cache instead of reparsing every embedding on each query.
+Then push from the other machine with
+`python -m client.sync_trajectories sync --server http://host:8788 --actor-id <id> --sources codex,claude --token <token>`.
 
-With `TRAJECTORY_INDEX_AUTOBUILD=true`, startup and trajectory lookup refresh the reduced chunk index when raw trajectory files are newer than the index. Refresh is incremental: unchanged sessions are left alone, hidden or removed sessions are deleted, and only changed sessions are re-chunked. `TRAJECTORY_INDEX_AUTOBUILD_VECTORS=false` keeps that refresh fast by rebuilding exact/FTS chunks without embedding every chunk. `TRAJECTORY_INDEX_AUTOBUILD_MIN_INTERVAL_SECONDS` throttles repeated refreshes during active sessions, and `TRAJECTORY_INDEX_BACKGROUND_REFRESH_SECONDS` keeps the index warm even before the next user asks a trajectory question.
+</details>
 
-### `/trajectory/index/embed`
+## Footprint and background behavior
 
-Backfill vector embeddings for existing reduced chunks in small batches:
+The chunk index is the big artifact — expect hundreds of MB to several GB
+depending on how much history you have, with embeddings roughly five times
+smaller than the text. `/gui` reports the live footprint and flags when raw
+transcripts are newer than the index. `POST /trajectory/index/stats` gives the
+same numbers as JSON.
 
-```bash
-curl -sS http://127.0.0.1:8788/trajectory/index/embed \
-  -H 'Content-Type: application/json' \
-  -d '{
-    "actor_id": "000000000000000000",
-    "limit": 256
-  }'
+Two behaviors surprise people:
+
+- **Unattended indexing pauses on battery** (`TRAJECTORY_INDEX_PAUSE_ON_BATTERY`,
+  default on) so mybot does not quietly drain a laptop. Searches you initiate
+  still refresh on demand. `/health` reports
+  `index_refresh_paused_on_battery`.
+- **Autobuild refresh skips embeddings** by default so it stays fast. Keyword
+  search is immediately current; vector search lags until you backfill with
+  `maintenance --action embed`.
+
+Snapshot the databases, transcripts, and token config with
+`./scripts/backup_state.sh` (set `BACKUP_DIR` to relocate the archive).
+
+If you develop against a running install, `./scripts/deploy.sh` pushes, rebuilds
+and reinstalls the menu app, restarts the server and bridge, refreshes the agent
+skill, and prints a drift report so the copies cannot silently diverge.
+
+## Troubleshooting
+
+| Symptom | Likely cause |
+|---|---|
+| Private-scope search returns nothing | `MEMORY_IMPORTED_OWNER_ID` does not match the `actor_id` your client sends |
+| Menu app shows no data | Checkout is not at `~/Code/mybot` and `MYBOT_HOME` is unset |
+| Vector search misses obvious hits | Embeddings not backfilled yet — check `missing_embeddings` in index stats |
+| Index looks stale and will not catch up | On battery, with `TRAJECTORY_INDEX_PAUSE_ON_BATTERY` on |
+| Codex ignores your configured model | Expected — mybot passes `--ignore-user-config`; set `CODEX_MODEL` in `.env` |
+| Bot silent in a guild channel | Enable **Message Content Intent** in the Discord Developer Portal, and check `DISCORD_ALLOWED_CHANNEL_IDS` |
+| Sync endpoints return 503 | `config/sync_tokens.json` not configured — everything else works without it |
+
+## Repo layout
+
+```
+app/          server, bridges, dashboard, semantic memory, chunk index
+sources/      trajectory adapters (codex, claude), access policy, origin classification
+client/       access-setup TUI, remote sync CLI
+scripts/      admin CLI, agent retrieval tool, deploy, backup
+skills/       the skill that lets other coding agents query mybot
+macapp/       macOS menu-bar app (SwiftUI)
+profiles/     prompt and persona files
+config/       access and sync-token examples
+docs/         multi-user model, agent-session convention
+state/        local runtime data — gitignored, never leaves the machine
 ```
 
-This is useful after rebuilding with `"include_vectors": false`; repeat it until `missing_embeddings` from `/trajectory/index/stats` reaches `0`.
+Top-level `standalone_agent_backbone.py`, `discord_bridge.py`, and
+`slack_bridge.py` are thin entrypoints into `app/`.
 
-### `/trajectory/index/stats`
+Further reading: [docs/multi-user.md](docs/multi-user.md) for the multi-instance
+model, and [docs/agent-session-convention.md](docs/agent-session-convention.md)
+for the one-line marker that lets any orchestrator tell mybot "a program typed
+this, not a human."
 
-Inspect the current chunk index:
+## License
 
-```bash
-curl -sS http://127.0.0.1:8788/trajectory/index/stats \
-  -H 'Content-Type: application/json' \
-  -d '{"actor_id": "000000000000000000"}'
-```
-
-### `/trajectory/read`
-
-Read a parsed trajectory by `source_ref`, bounded by `max_chars`:
-
-```bash
-curl -sS http://127.0.0.1:8788/trajectory/read \
-  -H 'Content-Type: application/json' \
-  -d '{
-    "source_ref": "codex:example-session-id",
-    "actor_id": "000000000000000000",
-    "query": "figure compression",
-    "max_chars": 12000
-  }'
-```
-
-### `/memory/import-batch`
-
-This endpoint requires `Authorization: Bearer <token>`.
-
-Example:
-
-```bash
-curl -sS http://127.0.0.1:8788/memory/import-batch \
-  -H 'Content-Type: application/json' \
-  -H 'Authorization: Bearer your-real-sync-token' \
-  -d '{
-    "actor_id": "000000000000000000",
-    "client_id": "alice-macbook",
-    "batch_id": "alice-codex-20260508",
-    "source_name": "codex",
-    "items": []
-  }'
-```
-
-### `/memory/sync-status`
-
-This endpoint also requires the bearer token:
-
-```bash
-curl -sS http://127.0.0.1:8788/memory/sync-status \
-  -H 'Content-Type: application/json' \
-  -H 'Authorization: Bearer your-real-sync-token' \
-  -d '{
-    "actor_id": "000000000000000000",
-    "sources": ["codex", "claude"]
-  }'
-```
-
-## Manual local sync
-
-Run this on each teammate’s own machine:
-
-```bash
-python -m client.sync_trajectories sync \
-  --server http://private-host:8788 \
-  --actor-id 000000000000000000 \
-  --sources codex,claude \
-  --token your-real-sync-token
-```
-
-Check current server-side sync status:
-
-```bash
-python -m client.sync_trajectories status \
-  --server http://private-host:8788 \
-  --actor-id 000000000000000000 \
-  --sources codex,claude \
-  --token your-real-sync-token
-```
-
-Manual sync behavior:
-
-- reads local trajectories through the registered source adapters
-- uploads full normalized transcript text plus summaries and metadata
-- creates one session record for every discovered session
-- creates chunk records only for recent sessions
-- is idempotent via `unique_key` plus `content_hash`
-- does not upload embeddings; the server computes them
-
-## Discord
-
-Use `.discord.env` for local Discord + server settings, then launch:
-
-```bash
-chmod +x run_discord_chatbot.sh
-./run_discord_chatbot.sh
-```
-
-The launcher is supervised by default:
-
-- Discord.py reconnects after ordinary Discord/network interruptions.
-- If the Discord bridge process exits, `run_discord_chatbot.sh` restarts it with exponential backoff.
-- If the local chat server dies or fails health checks, the launcher starts it again.
-- A local lock under `state/run/mybot.lock` prevents accidental duplicate bridge instances.
-
-Launcher knobs:
-
-```bash
-START_LOCAL_CHAT_SERVER=true
-SUPERVISE_DISCORD_BRIDGE=true
-MYBOT_SINGLE_INSTANCE=true
-MYBOT_RESTART_DELAY_SECONDS=5
-MYBOT_MAX_RESTART_DELAY_SECONDS=60
-MYBOT_SERVER_START_TIMEOUT_SECONDS=30
-MYBOT_SERVER_HEALTH_INTERVAL_SECONDS=15
-```
-
-Current Discord behavior:
-
-- plain messages in the dedicated auto-reply channel use `private` memory scope
-- `!team <question>` uses shared memory only
-- `!ask @user <question>` uses the mentioned user’s private memory only
-- `!remember <note>` stores a private note
-- `!remember-shared <note>` stores a shared note
-- `!sources` shows the last assistant reply’s grounding sources
-- `!new` resets the current session
-- `/chat` and `/new` still exist as slash-command fallbacks
-
-The bridge coalesces rapid follow-up chat messages for the same user/session before sending them to the model. Set `DISCORD_MESSAGE_COALESCE_SECONDS` to tune the quiet period. Messages that arrive while a model call is already in flight are serialized into the next response instead of racing the same session history.
-
-If you want direct message-content chat in guild channels, enable **Message Content Intent** for the bot in the Discord Developer Portal.
-
-## Backup
-
-Create a host-side snapshot of the SQLite DB, session JSONL files, and sync-token config:
-
-```bash
-chmod +x scripts/backup_state.sh
-./scripts/backup_state.sh
-```
-
-Set `BACKUP_DIR` if you want the archive written somewhere else.
-
-## Notes
-
-- Imported trajectories are always private by owner unless promoted to shared memory.
-- `/memory/import-batch` and `/memory/sync-status` are the only endpoints that require sync-token auth.
-- The system stores the actual retrieved memory records used for each answer in assistant-message metadata so `!sources` can explain grounding later.
-- Runtime state and secrets should stay out of git: `state/`, `.env`, `.discord.env`, `config/sync_tokens.json`, backups, and logs are gitignored.
-- The tracked prompt/profile source of truth is `profiles/default/`. The older `workspace/` fallback has been removed.
+MIT — see [LICENSE](LICENSE).

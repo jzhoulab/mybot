@@ -292,22 +292,22 @@ final class AppModel: ObservableObject {
         }
         model.projects = [
             proj("codex", "/Users/you/Code/mybot", 333, 6540, true),
-            proj("claude", "/Users/you/Code/demoapp-pipeline", 41, 980, true),
+            proj("claude", "/Users/you/Code/payments-api", 41, 980, true),
             proj("codex", "/Users/you/Code/batch-jobs", 22, 410, true),
             proj("claude", "/Users/you/Research/side-project", 15, 300, false),
             proj("codex", "/Users/you/scratch/throwaway-experiment", 3, 44, false),
         ]
         var health = Health()
-        health.totalChunks = 43_331
-        health.embeddedChunks = 43_331
-        health.indexBytes = 1_150_000_000
-        health.memoryBytes = 64_000_000
-        health.projectCount = 79
+        health.totalChunks = 12_000
+        health.embeddedChunks = 12_000
+        health.indexBytes = 250_000_000
+        health.memoryBytes = 24_000_000
+        health.projectCount = 12
         health.latestIndexedAt = ISO8601DateFormatter().string(from: Date().addingTimeInterval(-140))
         model.health = health
         model.newProjects = [NewProject(source: "codex", cwd: "/Users/you/Code/newapp", sessions: 4)]
         model.ownerName = "Ada Lovelace"
-        model.ownerAliases = ["alice", "alice"]
+        model.ownerAliases = ["alovelace", "ada"]
         model.ownerConfirmed = true
         model.discordConfigured = true
         model.slackConfigured = false

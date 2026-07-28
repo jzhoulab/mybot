@@ -1,0 +1,305 @@
+<!doctype html>
+<!--
+  Source for the README hero banner. Regenerate both variants with:
+
+    CHROME="/Applications/Google Chrome.app/Contents/MacOS/Google Chrome"
+    "$CHROME" --headless --disable-gpu --hide-scrollbars --force-color-profile=srgb \
+      --window-size=1280,560 --force-device-scale-factor=1.5 \
+      --screenshot=docs/assets/hero-dark.png  "file://$PWD/docs/assets/hero.html"
+    "$CHROME" --headless --disable-gpu --hide-scrollbars --force-color-profile=srgb \
+      --window-size=1280,560 --force-device-scale-factor=1.5 \
+      --screenshot=docs/assets/hero-light.png "file://$PWD/docs/assets/hero.html?theme=light"
+
+  Colors track the dashboard tokens in app/gui.py, so the two stay in sync.
+-->
+<html>
+<head>
+<meta charset="utf-8">
+<style>
+  :root {
+    --bg: #0b1017;
+    --bg2: #0e131c;
+    --panel: #161d2b;
+    --panel2: #1b2434;
+    --text: #e6ecf5;
+    --muted: #93a1b5;
+    --faint: #6b7a90;
+    --line: #26303f;
+    --line2: #33415a;
+    --accent: #7aa2ff;
+    --accent-deep: #4f7dff;
+    --good: #4ade80;
+    --grid: rgba(122,162,255,.055);
+    --glow: rgba(122,162,255,.20);
+    --glow2: rgba(74,222,128,.055);
+    --chip-bg: rgba(122,162,255,.10);
+    --chip-line: rgba(122,162,255,.26);
+    --card-shadow: 0 24px 60px rgba(0,0,0,.55), 0 2px 8px rgba(0,0,0,.4);
+    --ghost: #131a26;
+    --ghost-line: #202a3a;
+    --bubble-user: #223050;
+    --bubble-user-line: #2f4270;
+  }
+  html[data-theme="light"] {
+    --bg: #eef2f8;
+    --bg2: #f7f9fc;
+    --panel: #ffffff;
+    --panel2: #f7f9fc;
+    --text: #131c2e;
+    --muted: #5a6a80;
+    --faint: #8494a8;
+    --line: #e2e8f0;
+    --line2: #cbd5e1;
+    --accent: #3257d1;
+    --accent-deep: #2545b8;
+    --good: #157347;
+    --grid: rgba(50,87,209,.05);
+    --glow: rgba(50,87,209,.13);
+    --glow2: rgba(21,115,71,.07);
+    --chip-bg: rgba(50,87,209,.07);
+    --chip-line: rgba(50,87,209,.20);
+    --card-shadow: 0 20px 48px rgba(19,28,46,.14), 0 2px 6px rgba(19,28,46,.07);
+    --ghost: #fdfefe;
+    --ghost-line: #e6ecf4;
+    --bubble-user: #e7edfb;
+    --bubble-user-line: #ccd9f5;
+  }
+
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+
+  body {
+    width: 1280px; height: 560px;
+    font-family: -apple-system, "SF Pro Text", "Helvetica Neue", Arial, sans-serif;
+    -webkit-font-smoothing: antialiased;
+    color: var(--text);
+    overflow: hidden;
+  }
+
+  .stage {
+    position: relative;
+    width: 1280px; height: 560px;
+    background:
+      radial-gradient(900px 420px at 86% 8%, var(--glow), transparent 62%),
+      radial-gradient(620px 380px at 4% 96%, var(--glow2), transparent 66%),
+      linear-gradient(158deg, var(--bg2) 0%, var(--bg) 100%);
+    overflow: hidden;
+  }
+  .stage::before {
+    content: "";
+    position: absolute; inset: 0;
+    background-image:
+      linear-gradient(to right, var(--grid) 1px, transparent 1px),
+      linear-gradient(to bottom, var(--grid) 1px, transparent 1px);
+    background-size: 32px 32px;
+    -webkit-mask-image: radial-gradient(760px 500px at 30% 40%, #000 0%, transparent 78%);
+  }
+
+  .inner {
+    position: relative;
+    height: 100%;
+    display: grid;
+    grid-template-columns: 560px 1fr;
+    align-items: center;
+    gap: 40px;
+    padding: 0 60px;
+  }
+
+  /* ---------- left ---------- */
+  .mark-row { display: flex; align-items: center; gap: 14px; margin-bottom: 26px; }
+  .mark {
+    width: 46px; height: 46px; border-radius: 13px; flex: none;
+    background: linear-gradient(150deg, var(--accent) 0%, var(--accent-deep) 100%);
+    display: flex; align-items: center; justify-content: center;
+    box-shadow: 0 6px 18px rgba(79,125,255,.34), inset 0 1px 0 rgba(255,255,255,.28);
+  }
+  .eyebrow {
+    font-size: 11.5px; font-weight: 620; letter-spacing: .13em;
+    text-transform: uppercase; color: var(--muted);
+  }
+  .eyebrow b { color: var(--accent); font-weight: 700; }
+
+  h1 {
+    font-size: 78px; line-height: .96; letter-spacing: -.035em; font-weight: 700;
+    background: linear-gradient(178deg, var(--text) 26%, color-mix(in srgb, var(--text) 62%, var(--accent)) 100%);
+    -webkit-background-clip: text; -webkit-text-fill-color: transparent;
+  }
+  .tagline {
+    margin-top: 20px;
+    font-size: 25px; line-height: 1.34; letter-spacing: -.017em; font-weight: 560;
+    max-width: 500px;
+  }
+  .tagline em { font-style: normal; color: var(--accent); }
+  .sub {
+    margin-top: 16px;
+    font-size: 15.5px; line-height: 1.6; color: var(--muted);
+    max-width: 492px; letter-spacing: -.003em;
+  }
+  .chips { margin-top: 30px; display: flex; flex-wrap: wrap; gap: 9px; }
+  .chip {
+    font-size: 12.5px; font-weight: 560; letter-spacing: -.002em;
+    padding: 6.5px 12px; border-radius: 999px;
+    color: var(--accent);
+    background: var(--chip-bg);
+    border: 1px solid var(--chip-line);
+    display: flex; align-items: center; gap: 7px;
+  }
+  .chip svg { flex: none; }
+
+  /* ---------- right ---------- */
+  .right { position: relative; height: 430px; }
+
+  .ghost {
+    position: absolute; border-radius: 16px;
+    background: var(--ghost); border: 1px solid var(--ghost-line);
+  }
+  .g1 { inset: 42px -30px 104px 60px; opacity: .5; }
+  .g2 { inset: 60px -16px 80px 38px; opacity: .78; }
+
+  .card {
+    position: absolute; left: 0; right: 4px; top: 76px;
+    border-radius: 17px;
+    background: var(--panel);
+    border: 1px solid var(--line);
+    box-shadow: var(--card-shadow);
+    overflow: hidden;
+  }
+  .card-head {
+    display: flex; align-items: center; gap: 9px;
+    padding: 13px 16px;
+    border-bottom: 1px solid var(--line);
+    background: var(--panel2);
+  }
+  .dot { width: 9px; height: 9px; border-radius: 50%; flex: none; }
+  .card-title { font-size: 12.5px; font-weight: 640; letter-spacing: -.005em; }
+  .card-meta {
+    margin-left: auto; display: flex; align-items: center; gap: 6px;
+    font-size: 11px; font-weight: 560; color: var(--muted);
+    font-variant-numeric: tabular-nums;
+  }
+  .pulse { width: 7px; height: 7px; border-radius: 50%; background: var(--good); box-shadow: 0 0 0 3px color-mix(in srgb, var(--good) 18%, transparent); }
+
+  .body { padding: 16px 16px 18px; }
+  .row { display: flex; margin-bottom: 12px; }
+  .row.me { justify-content: flex-end; }
+  .bubble {
+    font-size: 13.5px; line-height: 1.5; letter-spacing: -.006em;
+    padding: 9px 13px; border-radius: 13px; max-width: 84%;
+  }
+  .bubble.me {
+    background: var(--bubble-user); border: 1px solid var(--bubble-user-line);
+    border-bottom-right-radius: 5px;
+  }
+  .bubble.bot {
+    background: var(--panel2); border: 1px solid var(--line);
+    border-bottom-left-radius: 5px; color: var(--text);
+  }
+  .bubble.bot b { font-weight: 640; }
+  .bubble.bot code {
+    font-family: "SF Mono", ui-monospace, Menlo, monospace;
+    font-size: 12px; padding: 1px 5px; border-radius: 5px;
+    background: var(--chip-bg); color: var(--accent);
+  }
+
+  .grounding { margin-top: 11px; padding-top: 11px; border-top: 1px dashed var(--line); }
+  .grounding-label {
+    font-size: 9.5px; font-weight: 680; letter-spacing: .1em; text-transform: uppercase;
+    color: var(--faint); margin-bottom: 8px;
+  }
+  .pills { display: flex; flex-wrap: wrap; gap: 6px; }
+  .pill {
+    font-family: "SF Mono", ui-monospace, Menlo, monospace;
+    font-size: 10.5px; letter-spacing: -.01em;
+    padding: 4.5px 9px; border-radius: 7px;
+    background: var(--chip-bg); border: 1px solid var(--chip-line);
+    color: var(--accent);
+    display: flex; align-items: center; gap: 6px;
+  }
+  .pill .src { opacity: .62; }
+</style>
+</head>
+<body>
+<div class="stage">
+  <div class="inner">
+
+    <div class="left">
+      <div class="mark-row">
+        <div class="mark">
+          <svg width="25" height="25" viewBox="0 0 24 24" fill="none">
+            <rect x="3.2" y="7" width="17.6" height="13" rx="4.4" stroke="#fff" stroke-width="1.85"/>
+            <path d="M12 7V3.4" stroke="#fff" stroke-width="1.85" stroke-linecap="round"/>
+            <circle cx="12" cy="2.5" r="1.5" fill="#fff"/>
+            <circle cx="8.9" cy="13.4" r="1.5" fill="#fff"/>
+            <circle cx="15.1" cy="13.4" r="1.5" fill="#fff"/>
+          </svg>
+        </div>
+        <div class="eyebrow">Local&#8209;first <b>&middot;</b> Self&#8209;hosted <b>&middot;</b> Your data stays home</div>
+      </div>
+
+      <h1>mybot</h1>
+
+      <div class="tagline">Your coding agents forget every session.<br><em>This one remembers all of them.</em></div>
+
+      <div class="sub">
+        A private memory layer over your Codex and Claude Code transcripts. It indexes
+        every session on your own machine, then answers questions about your work in
+        Discord, Slack, a web dashboard, or the menu bar.
+      </div>
+
+      <div class="chips">
+        <div class="chip">
+          <svg width="11" height="11" viewBox="0 0 12 12" fill="none"><path d="M2 6.2l2.6 2.6L10 3.4" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round"/></svg>
+          Codex + Claude Code
+        </div>
+        <div class="chip">
+          <svg width="11" height="11" viewBox="0 0 12 12" fill="none"><path d="M2 6.2l2.6 2.6L10 3.4" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round"/></svg>
+          Local embeddings
+        </div>
+        <div class="chip">
+          <svg width="11" height="11" viewBox="0 0 12 12" fill="none"><path d="M2 6.2l2.6 2.6L10 3.4" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round"/></svg>
+          Per&#8209;person access
+        </div>
+      </div>
+    </div>
+
+    <div class="right">
+      <div class="ghost g1"></div>
+      <div class="ghost g2"></div>
+
+      <div class="card">
+        <div class="card-head">
+          <div class="dot" style="background:#f87171"></div>
+          <div class="dot" style="background:#f0b360"></div>
+          <div class="dot" style="background:#4ade80"></div>
+          <div class="card-title" style="margin-left:5px">mybot</div>
+          <div class="card-meta"><span class="pulse"></span>1,284 sessions indexed</div>
+        </div>
+        <div class="body">
+          <div class="row me">
+            <div class="bubble me">why did we drop the retry backoff to 5s?</div>
+          </div>
+          <div class="row">
+            <div class="bubble bot">
+              You lowered it while debugging queue starvation in <b>payments&#8209;api</b> —
+              the 30s backoff meant a restarted worker sat idle through a whole
+              batch window. You kept <code>max_delay=60</code> as the ceiling.
+              <div class="grounding">
+                <div class="grounding-label">Grounded in</div>
+                <div class="pills">
+                  <div class="pill"><span class="src">codex</span> payments&#8209;api &middot; Mar 4</div>
+                  <div class="pill"><span class="src">claude</span> worker&#8209;pool &middot; Mar 6</div>
+                </div>
+              </div>
+            </div>
+          </div>
+        </div>
+      </div>
+    </div>
+
+  </div>
+</div>
+<script>
+  var t = new URLSearchParams(location.search).get('theme');
+  if (t === 'light') document.documentElement.dataset.theme = 'light';
+</script>
+</body>
+</html>

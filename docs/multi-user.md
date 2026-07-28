@@ -4,7 +4,7 @@ mybot is a **collaboration tool for any team** — a research lab, an engineerin
 startup. Each team member runs their **own** mybot instance over their own trajectories.
 The bot is its owner's **assistant and representative**: a plain, factual information
 source over the owner's work that lets teammates get answers about it quickly ("what did
-Alex do with the platform2 run?") without pinging the owner. Together the instances form a
+Alex do with the nightly training run?") without pinging the owner. Together the instances form a
 mesh where everyone can query everyone else's work through their bots. An instance has
 one *owner* and any number of *guests* (teammates talking to it over Discord — later
 Slack). Identity is transport-agnostic: every request carries an `actor_id` (Discord
@@ -117,7 +117,7 @@ which backs up first), and prints the next command. Non-interactive:
 
 Each teammate runs their own instance, so in a shared server they must be
 distinguishable. The convention is **`<owner-handle>-mybot`** (e.g.
-`alice-mybot`), derived from the discovered owner identity (shortest
+`alex-mybot`), derived from the discovered owner identity (shortest
 username-like alias, else a display-name slug). `/health` exposes `bot_name` /
 `bot_handle`; the Discord bridge auto-sets its per-guild nickname to it on ready
 (`DISCORD_SET_GUILD_NICKNAME`, needs the Change Nickname permission). Slack can't
