@@ -48,8 +48,8 @@ transcripts — this makes it queryable, without the human latency.
 
 ## Related projects
 
-From the same author, built around the same conviction — that humans and agents
-work best in shared spaces:
+Built around the same conviction — that humans and agents work best in shared
+spaces:
 
 | Project | What it is |
 |---|---|
