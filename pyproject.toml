@@ -3,7 +3,7 @@ requires = ["setuptools>=68", "wheel"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "mybot"
+name = "mybot-app"  # PyPI distribution name; "mybot" is squatted
 version = "0.1.0"
 description = "A private, local memory layer over your Claude Code and Codex session history."
 readme = "README.md"

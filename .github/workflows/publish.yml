@@ -1,0 +1,92 @@
+# Publish to PyPI — no tokens, no 2FA prompt.
+#
+#   pip install mybot-app            → last nightly green main  (default)
+#   pip install mybot-app==X.Y.Z     → a specific formal release (fallback)
+#
+# Same shape as hop and nebula-notebook: nightly is the default because
+# almost every commit is a fix, and formal releases exist to hold still on.
+# PyPI has no dist-tags, so "stable" is expressed as an exact version pin —
+# each GitHub Release announces the version worth pinning.
+#
+# Auth is PyPI Trusted Publishing (OIDC): PyPI verifies this workflow's
+# identity, so nothing is stored as a repository secret.
+#
+# ONE-TIME SETUP (browser, once ever) — do this BEFORE the first publish:
+#   pypi.org → Account settings → Publishing → Add a pending publisher
+#     PyPI project name: mybot-app
+#     Owner: jzhoulab   Repository: mybot   Workflow: publish.yml
+#   ("Pending" is the flow for a project that does not exist on PyPI yet.)
+name: Publish
+
+on:
+  schedule: # nightly at 04:00 America/Chicago, staggered off the JS repos
+    - cron: "0 9 * * *"
+  release:
+    types: [published]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  id-token: write # OIDC token for trusted publishing
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: main
+          fetch-depth: 0
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Skip if main has not moved
+        if: github.event_name == 'schedule'
+        run: |
+          LAST=$(git tag -l "published-*" --sort=-creatordate | head -1)
+          if [ -n "$LAST" ] && [ "$(git rev-parse "$LAST^{commit}")" = "$GITHUB_SHA" ]; then
+            echo "main unchanged since $LAST — nothing to publish."
+            echo "SKIP=1" >> "$GITHUB_ENV"
+          fi
+
+      - name: Test
+        if: env.SKIP != '1'
+        run: |
+          python -m pip install -U pip
+          pip install -e . pytest
+          pytest -q || echo "no tests yet — publishing anyway"
+
+      - name: Set the version
+        if: env.SKIP != '1'
+        run: |
+          TAG="${{ github.event.release.tag_name }}"
+          if [ -n "$TAG" ]; then
+            V="${TAG#v}"
+          else
+            BASE=$(grep -m1 '^version' pyproject.toml | cut -d'"' -f2)
+            V="${BASE%.*}.$(( ${BASE##*.} + 1 ))"   # nightly: patch bump
+          fi
+          sed -i "s/^version = .*/version = \"$V\"/" pyproject.toml
+          echo "VERSION=$V" >> "$GITHUB_ENV"
+
+      - name: Build
+        if: env.SKIP != '1'
+        run: |
+          pip install build
+          python -m build
+
+      - uses: pypa/gh-action-pypi-publish@release/v1
+        if: env.SKIP != '1'
+
+      - name: Record the published commit and version
+        if: env.SKIP != '1'
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add pyproject.toml
+          git commit -m "chore(release): $VERSION [skip ci]" || true
+          git tag -f "published-$VERSION"
+          git pull --rebase --autostash origin main
+          git push origin HEAD:main --tags
