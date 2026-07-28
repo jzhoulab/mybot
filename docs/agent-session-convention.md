@@ -3,9 +3,9 @@
 ## Problem
 
 When a tool launches an AI coding agent (Claude Code, Codex) with **no human at
-the keyboard** — an orchestrator spawning worker agents
-in git worktrees — the resulting session is, by every field the CLIs record,
-**indistinguishable from a human session**:
+the keyboard** — an orchestrator such as [hop](https://github.com/jzthree/hop)
+spawning worker agents in git worktrees — the resulting session is, by every
+field the CLIs record, **indistinguishable from a human session**:
 
 | field          | human session | launched agent |
 |----------------|---------------|--------------------|
@@ -35,7 +35,7 @@ line to the agent's initial prompt**:
 
 Attributes:
 
-- `launcher` — free-form tool name, e.g. `agentctl`. For provenance/debugging.
+- `launcher` — free-form tool name, e.g. `hop`. For provenance/debugging.
 - `origin` — the automated cluster this session belongs to. Use `orchestrated`
   for dispatcher-launched worker agents (default if omitted). Other recognized
   clusters: `subagent`, `sdk`, `exec`, `no-user-turns`.
@@ -45,7 +45,7 @@ Attributes:
 When a dispatcher launches a worker agent, the first prompt it sends becomes:
 
 ```
-<!-- agent-session: launcher=agentctl origin=orchestrated -->
+<!-- agent-session: launcher=hop origin=orchestrated -->
 Fix the failing test in ./src/parser.ts (you are in a git worktree…)
 ```
 

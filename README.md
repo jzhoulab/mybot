@@ -2,7 +2,7 @@
   <picture>
     <source media="(prefers-color-scheme: dark)" srcset="docs/assets/hero-dark.png">
     <source media="(prefers-color-scheme: light)" srcset="docs/assets/hero-light.png">
-    <img src="docs/assets/hero-dark.png" alt="mybot — a private memory layer for your AI coding sessions" width="900">
+    <img src="docs/assets/hero-dark.png" alt="mybot — the memory and bookkeeping layer between your coding agents and your team" width="900">
   </picture>
 </p>
 
@@ -15,24 +15,47 @@
 
 ---
 
-Every Claude Code and Codex session you have ever run is already sitting on your
-disk as JSONL — thousands of conversations, commands, and command outputs that
-are effectively write-only. You cannot grep your way back to "what did we decide
-about the retry backoff, and why," because the answer is spread across a
-transcript you no longer remember the name of.
+Claude Code and Codex each remember their own work — a project's conventions, a
+session's history. What neither reaches across is the boundary: another tool,
+another project, another machine, another person. That boundary is usually where
+the context you actually need is sitting.
 
-mybot indexes those transcripts locally, then puts a search agent in front of
-them. Ask a question in plain language and it searches, refines its own queries,
-reopens the sessions that look relevant, and answers with dates and links back
-to the exact transcript window it used. Nothing leaves your machine: the index,
-the embeddings, and the model calls to your local CLI all stay local.
+mybot is the memory and bookkeeping layer across those boundaries. It indexes
+every Claude Code and Codex transcript on your machine into a local searchable
+index, then puts a retrieval agent in front of it: ask in plain language and it
+searches, refines its own queries, reopens the sessions that look relevant, and
+answers with dates and links back to the exact transcript window it used.
+Nothing leaves your machine — the index, the embeddings, and the model calls to
+your local CLI all stay local.
+
+It is also built to be shared. Each person runs their own instance over their
+own history, and the bot answers on its owner's behalf, within limits its owner
+sets. So a teammate can ask what you decided and get a grounded answer in
+seconds rather than waiting for you to be at a keyboard. Getting a team onto the
+same page stops being blocked on human latency.
 
 **Questions it is built to answer**
 
 - *"Have I hit this error before?"* — and what actually fixed it.
 - *"What was the config we settled on for the staging deploy?"* — with the date.
 - *"Did that migration finish, or did I abandon it halfway?"*
-- *"What did I decide about the schema, and what was the reasoning I rejected?"*
+- *"@alex-mybot what did Alex decide about the schema?"* — asked by a teammate,
+  answered from Alex's own sessions, without interrupting Alex.
+
+## Where mybot fits
+
+mybot is one piece of a small set of tools for working alongside agents rather
+than around them:
+
+| Project | What it is |
+|---|---|
+| [nebula-notebook](https://github.com/jzhoulab/nebula-notebook) | An agent-native notebook — you and your AI work in the same cells |
+| [hop](https://github.com/jzthree/hop) | Terminal access for humans and agents: browser terminals plus an MCP server for creating, driving, and auditing agent sessions |
+| [burrow](https://github.com/jzthree/burrow) | A macOS menu-bar manager for SSH tunnels and userspace VPN gateways, for reaching the machines the work runs on |
+| **mybot** | The memory and bookkeeping layer connecting agents and people across all of those contexts |
+
+The other three give agents and humans places to work and ways to reach them.
+mybot is what remembers what happened there, and lets anyone on the team ask.
 
 ## Quickstart
 
@@ -186,13 +209,35 @@ token; the rest are protected by the loopback bind plus per-actor policy checks.
 Do not expose the port directly — put it behind a private path such as
 Tailscale, a LAN-only interface, or an SSH tunnel.
 
+## Read-only by design
+
+mybot reads. It searches, opens transcripts, runs read-only `SELECT`s, and
+answers. It does not edit files, commit, or run commands on your behalf, and the
+answering agent's shell is sandboxed to a scratch workspace with networking
+restricted to localhost.
+
+That boundary is deliberate rather than unfinished. Read-only *with* tool use is
+already enough to answer almost anything about your own history — the agent can
+search, follow a lead, reopen the exact session, and cite it — while keeping the
+blast radius of pointing a bot at your entire archive bounded. It is also what
+makes sharing the bot with teammates a reasonable thing to do.
+
+Letting mybot actually *do* work in a thread, the way a collaborative assistant
+in Slack does, is a plausible direction. It is not built, and it does not belong
+on the machine that holds your keys and your history — that would want a
+sandboxed server with its own credentials. Treat the current scope as the
+supported one.
+
 ## Using it as a team
 
-Each person runs their own instance over their own history. The bot acts as its
-owner's representative, so a teammate can ask "what did Alex do with the nightly
-training run?" in Discord or Slack without interrupting Alex — bounded by the
-visibility rules above. Bots auto-name themselves `<owner-handle>-mybot` per
-server so a team's instances stay distinguishable.
+This is a primary use, not an add-on. Each person runs their own instance over
+their own history, and the bot acts as its owner's representative: a teammate
+asks "what did Alex do with the nightly training run?" in Discord or Slack and
+gets an answer grounded in Alex's actual sessions, bounded by the visibility
+rules above, without Alex being online. The shared context a team normally
+rebuilds through standups and interruptions is already written down in everyone's
+transcripts — this makes it queryable. Bots auto-name themselves
+`<owner-handle>-mybot` per server so a team's instances stay distinguishable.
 
 Guests get their own private memory (`!remember`) and shared team notes
 (`!remember-shared`), and mybot keeps a light person registry (display name,

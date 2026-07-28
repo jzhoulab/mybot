@@ -32,8 +32,9 @@ AUTOMATED_CLAUDE_ENTRYPOINTS = {"sdk-cli", "sdk-py", "sdk-ts", "sdk", "headless"
 #     <!-- agent-session: launcher=<tool> origin=orchestrated -->
 #
 # `origin` maps to an automated cluster (default "orchestrated"); `launcher` is
-# free-form, your tool's name. See docs/agent-session-convention.md. mybot detects this
-# marker and both classifies the session automated AND strips it from indexed text.
+# free-form, the launcher's name (e.g. hop). See docs/agent-session-convention.md.
+# mybot detects this marker and both classifies the session automated AND strips
+# it from indexed text.
 AGENT_SESSION_MARKER_RE = re.compile(r"<!--\s*agent-session:\s*(.*?)\s*-->", re.IGNORECASE)
 
 

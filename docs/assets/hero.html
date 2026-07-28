@@ -232,17 +232,18 @@
             <circle cx="15.1" cy="13.4" r="1.5" fill="#fff"/>
           </svg>
         </div>
-        <div class="eyebrow">Local&#8209;first <b>&middot;</b> Self&#8209;hosted <b>&middot;</b> Your data stays home</div>
+        <div class="eyebrow">Local&#8209;first <b>&middot;</b> Read&#8209;only by design <b>&middot;</b> Shared with your team</div>
       </div>
 
       <h1>mybot</h1>
 
-      <div class="tagline">Your coding agents forget every session.<br><em>This one remembers all of them.</em></div>
+      <div class="tagline">Your agents remember their own work.<br><em>mybot connects all of it.</em></div>
 
       <div class="sub">
-        A private memory layer over your Codex and Claude Code transcripts. It indexes
-        every session on your own machine, then answers questions about your work in
-        Discord, Slack, a web dashboard, or the menu bar.
+        The memory and bookkeeping layer between your coding agents and your team. It
+        indexes every Claude Code and Codex session across your projects and machines,
+        then answers questions &mdash; yours or a teammate&rsquo;s &mdash; in Discord,
+        Slack, a dashboard, or the menu bar.
       </div>
 
       <div class="chips">
@@ -252,11 +253,11 @@
         </div>
         <div class="chip">
           <svg width="11" height="11" viewBox="0 0 12 12" fill="none"><path d="M2 6.2l2.6 2.6L10 3.4" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round"/></svg>
-          Local embeddings
+          Runs on your machine
         </div>
         <div class="chip">
           <svg width="11" height="11" viewBox="0 0 12 12" fill="none"><path d="M2 6.2l2.6 2.6L10 3.4" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round"/></svg>
-          Per&#8209;person access
+          Shared with your team
         </div>
       </div>
     </div>
@@ -270,18 +271,18 @@
           <div class="dot" style="background:#f87171"></div>
           <div class="dot" style="background:#f0b360"></div>
           <div class="dot" style="background:#4ade80"></div>
-          <div class="card-title" style="margin-left:5px">mybot</div>
+          <div class="card-title" style="margin-left:5px">alex&#8209;mybot</div>
           <div class="card-meta"><span class="pulse"></span>1,284 sessions indexed</div>
         </div>
         <div class="body">
           <div class="row me">
-            <div class="bubble me">why did we drop the retry backoff to 5s?</div>
+            <div class="bubble me">@alex&#8209;mybot why did we drop the retry backoff to 5s?</div>
           </div>
           <div class="row">
             <div class="bubble bot">
-              You lowered it while debugging queue starvation in <b>payments&#8209;api</b> —
+              Alex lowered it while debugging queue starvation in <b>payments&#8209;api</b> —
               the 30s backoff meant a restarted worker sat idle through a whole
-              batch window. You kept <code>max_delay=60</code> as the ceiling.
+              batch window. <code>max_delay=60</code> remained the ceiling.
               <div class="grounding">
                 <div class="grounding-label">Grounded in</div>
                 <div class="pills">

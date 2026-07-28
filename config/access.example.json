@@ -3,7 +3,7 @@
   "policy": {
     "mode": "per_root_visibility",
     "description": "Enabled roots use blacklist mode by default. Use visibility_mode=whitelist to allow only included workdirs/classes.",
-    "agent_workspace_roots_help": "Directories your tooling uses as scratch workspaces for agent chats (e.g. ~/.mytool/worktrees). Sessions there stay searchable but never prompt you to review them as new projects."
+    "agent_workspace_roots_help": "Directories your tooling uses as scratch workspaces for agent chats (e.g. ~/.nebula/agent, or a launcher's worktree dir). Sessions there stay searchable but never prompt you to review them as new projects."
   },
   "agent_workspace_roots": [],
   "sources": {
