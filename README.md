@@ -15,16 +15,18 @@
 
 ---
 
-Claude Code and Codex each remember their own work — a project's conventions, a
-session's history. What neither reaches across is the boundary: another tool,
-another project, another machine, another person. That boundary is usually where
-the context you actually need is sitting.
+Claude Code and Codex carry a little memory of their own: instruction files you
+keep per project, and the ability to resume a recent session. What neither does
+is retrieval — searching everything you have actually done, across both tools,
+every project, every machine, and every teammate, and answering with evidence.
+That is usually where the context you need is sitting.
 
-mybot is the memory and bookkeeping layer across those boundaries. It indexes
-every Claude Code and Codex transcript on your machine into a local searchable
-index, then puts a retrieval agent in front of it: ask in plain language and it
-searches, refines its own queries, reopens the sessions that look relevant, and
-answers with dates and links back to the exact transcript window it used.
+mybot fills that gap — the memory and bookkeeping layer between your coding
+agents and your team. It indexes every Claude Code and Codex transcript on your
+machine into a local searchable index, then puts an agent in front of it: ask in
+plain language and it searches, refines its own queries, reopens the sessions
+that look relevant, and answers with dates and links back to the exact
+transcript window it used.
 Nothing leaves your machine — the index, the embeddings, and the model calls to
 your local CLI all stay local.
 
@@ -42,20 +44,23 @@ same page stops being blocked on human latency.
 - *"@alex-mybot what did Alex decide about the schema?"* — asked by a teammate,
   answered from Alex's own sessions, without interrupting Alex.
 
-## Where mybot fits
+## Related projects
 
-mybot is one piece of a small set of tools for working alongside agents rather
-than around them:
+Other tools built around the same problem — working alongside agents rather than
+around them. **None of them integrate with mybot today**; they are listed because
+they may be useful next to it, not because they plug into it.
 
 | Project | What it is |
 |---|---|
 | [nebula-notebook](https://github.com/jzhoulab/nebula-notebook) | An agent-native notebook — you and your AI work in the same cells |
 | [hop](https://github.com/jzthree/hop) | Terminal access for humans and agents: browser terminals plus an MCP server for creating, driving, and auditing agent sessions |
-| [burrow](https://github.com/jzthree/burrow) | A macOS menu-bar manager for SSH tunnels and userspace VPN gateways, for reaching the machines the work runs on |
-| **mybot** | The memory and bookkeeping layer connecting agents and people across all of those contexts |
+| [burrow](https://github.com/jzthree/burrow) | A macOS menu-bar manager for SSH tunnels and userspace VPN gateways, for reaching the machines work runs on |
 
-The other three give agents and humans places to work and ways to reach them.
-mybot is what remembers what happened there, and lets anyone on the team ask.
+The one point of contact is incidental: if an orchestrator launches Claude Code
+or Codex on a machine mybot already watches, those transcripts get indexed like
+any other, and mybot recognizes the
+[agent-session marker](docs/agent-session-convention.md) a launcher can prepend
+so such runs are classified as automated rather than as your own work.
 
 ## Quickstart
 
