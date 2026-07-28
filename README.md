@@ -2,7 +2,7 @@
   <picture>
     <source media="(prefers-color-scheme: dark)" srcset="docs/assets/hero-dark.png">
     <source media="(prefers-color-scheme: light)" srcset="docs/assets/hero-light.png">
-    <img src="docs/assets/hero-dark.png" alt="mybot — the memory and bookkeeping layer between your coding agents and your team" width="900">
+    <img src="docs/assets/hero-dark.png" alt="mybot — every agent conversation unified, shared across your team" width="900">
   </picture>
 </p>
 
@@ -15,26 +15,28 @@
 
 ---
 
-Claude Code and Codex carry a little memory of their own: instruction files you
-keep per project, and the ability to resume a recent session. What neither does
-is retrieval — searching everything you have actually done, across both tools,
-every project, every machine, and every teammate, and answering with evidence.
-That is usually where the context you need is sitting.
+**mybot is the connectivity layer for coding agents: it unifies every
+conversation you have with them, and shares that across your team.**
 
-mybot fills that gap — the memory and bookkeeping layer between your coding
-agents and your team. It indexes every Claude Code and Codex transcript on your
-machine into a local searchable index, then puts an agent in front of it: ask in
+Work with agents is fragmented by construction — one transcript per session, per
+tool, per project, per machine, per person. Claude Code and Codex each carry a
+little memory of their own, in per-project instruction files and the ability to
+resume a recent session, but nothing joins those conversations together and
+nothing carries them to the person sitting next to you.
+
+mybot joins them. Every Claude Code and Codex conversation on your machine is
+indexed into one local, searchable memory, with an agent in front of it: ask in
 plain language and it searches, refines its own queries, reopens the sessions
 that look relevant, and answers with dates and links back to the exact
-transcript window it used.
-Nothing leaves your machine — the index, the embeddings, and the model calls to
-your local CLI all stay local.
+transcript window it used. Nothing leaves your machine — the index, the
+embeddings, and the model calls to your local CLI all stay local.
 
-It is also built to be shared. Each person runs their own instance over their
-own history, and the bot answers on its owner's behalf, within limits its owner
-sets. So a teammate can ask what you decided and get a grounded answer in
-seconds rather than waiting for you to be at a keyboard. Getting a team onto the
-same page stops being blocked on human latency.
+Then it shares. Each person runs their own instance over their own history, and
+the bot answers on its owner's behalf within limits the owner sets, so a
+teammate asks what you decided and gets a grounded answer in seconds instead of
+waiting for you to be at a keyboard. The context a team normally rebuilds
+through standups and interruptions is already written down in everyone's
+transcripts — this makes it queryable, without the human latency.
 
 **Questions it is built to answer**
 
