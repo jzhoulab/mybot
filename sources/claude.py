@@ -41,18 +41,30 @@ class ClaudeSourceAdapter(TrajectorySourceAdapter):
 
     def discover_sessions(self, max_files: int = 200) -> list[NormalizedTrajectory]:
         patterns = [os.path.join(self.base_dir, "*", "*.jsonl")]
-        files = recent_files(patterns, max_files)
-        sessions: list[NormalizedTrajectory] = []
-
-        for path in files:
+        # Fill the recency window with files that can actually be indexed.
+        # Capping raw files first lets excluded transcripts crowd allowed
+        # sessions out of the window — e.g. hundreds of autocomplete scratch
+        # sessions under /private/var/folders pushed real, weeks-old sessions
+        # past the cap so they were never scanned. The policy check only reads
+        # each file's head, so filter first, then cap on what survives.
+        files: list[tuple[str, str | None, list[str]]] = []
+        for path in recent_files(patterns, 0):
             if f"{os.sep}subagents{os.sep}" in path:
                 continue  # spawned-subagent transcript, never a user session
-            _, discovered_cwd, discovered_entrypoints = discover_claude_metadata(path)
+            try:
+                _, discovered_cwd, discovered_entrypoints = discover_claude_metadata(path)
+            except OSError:
+                continue
             if not self.account.include_workdir(discovered_cwd):
                 continue
             if not self.account.include_entrypoints(discovered_entrypoints):
                 continue
+            files.append((path, discovered_cwd, discovered_entrypoints))
+            if max_files > 0 and len(files) >= max_files:
+                break
 
+        sessions: list[NormalizedTrajectory] = []
+        for path, discovered_cwd, discovered_entrypoints in files:
             first_ts = None
             last_ts = None
             slug = ""
