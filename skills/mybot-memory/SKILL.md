@@ -14,7 +14,8 @@ window you need, compose SQL, and iterate until the answer is grounded.
 
 **Prerequisite:** the local mybot server must be running (default
 `http://127.0.0.1:8788`). If commands report "chat server is not running", tell
-the user to start it (`./run_discord_chatbot.sh` in their mybot install) and stop.
+the user to start it (`./run_chatbot.sh` in their mybot install, or open the
+mybot menu app) and stop.
 
 All commands go through the `mybot` CLI (owner identity + server URL are preset):
 

@@ -83,8 +83,11 @@ Choose what mybot is allowed to read, then start it:
 
 ```bash
 python -m client.setup_access            # interactive; --init-default to accept everything
-python3 standalone_agent_backbone.py --host 127.0.0.1 --port 8788
+./run_chatbot.sh                         # or: python3 standalone_agent_backbone.py --host 127.0.0.1 --port 8788
 ```
+
+`run_chatbot.sh` keeps the server alive and, if you later connect Discord or
+Slack, brings that bridge up alongside it. Neither is required.
 
 The first start indexes your history and, in the background, works out who you
 are from your own transcripts. When it settles:
@@ -108,7 +111,7 @@ python scripts/mybot_admin.py maintenance --action embed   # repeat until missin
 | **Web dashboard** | already running at `/gui` | Seeing what is indexed, tuning scope, probing retrieval and its scores |
 | **macOS menu bar** | `./macapp/build.sh release && open macapp/.dist/mybot.app` | Day-to-day asking, browsing transcripts, per-project include/exclude |
 | **Agent skill** | `sh skills/mybot-memory/install.sh` | Letting your *other* Claude Code and Codex sessions query your history mid-task |
-| **Discord / Slack** | `python scripts/mybot_admin.py connect discord` then `./run_discord_chatbot.sh` | Asking from your phone, and letting teammates ask |
+| **Discord / Slack** | `python scripts/mybot_admin.py connect discord` (or `slack`), then `./run_chatbot.sh` | Asking from your phone, and letting teammates ask |
 
 The menu-bar app reads the index SQLite directly, so browsing and search still
 work with the server stopped. Set `MYBOT_HOME` if your checkout is not at

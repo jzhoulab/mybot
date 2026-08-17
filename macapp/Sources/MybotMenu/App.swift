@@ -2068,7 +2068,7 @@ enum UIExporter {
                     text: "You mostly worked on the worker retry path", streaming: true))
                 HStack(spacing: 7) { ProgressView().controlSize(.small)
                     Text("Searching memory: retry recent work").font(.system(size: 11)).foregroundStyle(.secondary) }
-                ChatBubble(msg: ChatMsg(role: "error", text: "chat server is not running — start it with run_discord_chatbot.sh"))
+                ChatBubble(msg: ChatMsg(role: "error", text: "chat server was not running — starting it now; ask again in a minute or two"))
                 Text("MEMORY MATCHES").font(.system(size: 10, weight: .heavy)).tracking(0.6)
                     .foregroundStyle(.secondary)
                 ForEach(askModel.searchHits) { hit in SearchHitRow(hit: hit) {} }

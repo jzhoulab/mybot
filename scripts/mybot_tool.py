@@ -64,6 +64,12 @@ def post_json(base_url: str, path: str, payload: dict[str, Any]) -> dict[str, An
         reason = getattr(exc, "reason", None)
         denied = (isinstance(reason, OSError) and reason.errno == 1) or "not permitted" in str(exc).lower()
         if not (proxy and denied):
+            refused = isinstance(reason, ConnectionRefusedError) or "refused" in str(exc).lower()
+            if refused:
+                raise SystemExit(
+                    f"chat server is not running at {base_url} — start it with ./run_chatbot.sh "
+                    "in your mybot checkout (or open the mybot menu app)"
+                ) from exc
             raise SystemExit(f"Connection failed: {exc}") from exc
         raw = post_via_proxy(proxy, request)
     try:

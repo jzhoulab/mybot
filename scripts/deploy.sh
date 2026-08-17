@@ -3,7 +3,7 @@
 #   repo (main)  ->  GitHub (origin/main)
 #                ->  installed menu app        (/Applications, or ~/Applications
 #                                               for a non-admin account)
-#                ->  running services          (server + Discord bridge restarted)
+#                ->  running services          (server + chat bridge restarted)
 #                ->  agent skill               (~/.local/bin/mybot, ~/.claude/skills)
 # Run after committing. Flags: --no-push (skip GitHub), --no-services (leave
 # server/bridge alone), --allow-dirty (build from a dirty tree, stamped -dirty).
@@ -66,19 +66,23 @@ ditto macapp/.dist/mybot.app "$APP_DEST"
 open "$APP_DEST"
 echo "  menu app running from $APP_DEST"
 
-# 4) Restart server + Discord bridge on the new code
+# 4) Restart server (+ Discord/Slack bridge, if configured) on the new code.
+# run_chatbot.sh picks the supervisor: Discord, Slack, or server-only.
 if $SERVICES; then
-  step "Restarting mybot server + Discord bridge"
+  step "Restarting mybot server + chat bridge"
   pkill -f "$ROOT/discord_bridge.py" 2>/dev/null || true
+  pkill -f "$ROOT/slack_bridge.py" 2>/dev/null || true
   pkill -f "$ROOT/standalone_agent_backbone.py" 2>/dev/null || true
   pkill -f "$ROOT/run_discord_chatbot.sh" 2>/dev/null || true
+  pkill -f "$ROOT/run_slack_chatbot.sh" 2>/dev/null || true
+  pkill -f "$ROOT/run_chatbot.sh" 2>/dev/null || true
   for _ in {1..20}; do
-    pgrep -f "$ROOT/(discord_bridge.py|standalone_agent_backbone.py)" >/dev/null 2>&1 || break
+    pgrep -f "$ROOT/(discord_bridge.py|slack_bridge.py|standalone_agent_backbone.py)" >/dev/null 2>&1 || break
     sleep 0.5
   done
-  rm -rf "$ROOT/state/run/mybot.lock"
+  rm -rf "$ROOT/state/run/mybot.lock" "$ROOT/state/run/mybot-slack.lock" "$ROOT/state/run/mybot-server.lock"
   # Model + index load can outlast the launcher's default 30s health window.
-  MYBOT_SERVER_START_TIMEOUT_SECONDS=180 nohup "$ROOT/run_discord_chatbot.sh" \
+  MYBOT_SERVER_START_TIMEOUT_SECONDS=180 nohup "$ROOT/run_chatbot.sh" \
     >> "$ROOT/state/run/mybot-launcher.log" 2>&1 &
   disown
   HEALTH_URL="http://127.0.0.1:8788/health"

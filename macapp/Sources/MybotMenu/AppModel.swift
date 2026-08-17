@@ -212,12 +212,21 @@ final class AppModel: ObservableObject {
 
     // MARK: local server
 
+    /// The launcher the app spawns. It is chat-platform neutral: it runs the
+    /// chat server alone, or hands off to the Discord/Slack supervisor when one
+    /// of those is configured. Discord is never a prerequisite for the app.
+    static let launcherScript = "run_chatbot.sh"
     private var serverStartAttempted = false
+    private var lastServerStart: Date?
+    /// How long a fresh start may take before another attempt is reasonable —
+    /// index + model load can outlast a minute on a big history.
+    private let serverStartGrace: TimeInterval = 180
 
-    /// Start the chat server + Discord bridge when the app comes up and finds
-    /// them down. The launcher is single-instance, so racing a manually
-    /// started copy is harmless. One attempt per app run — if the owner shuts
-    /// the server down on purpose, the app doesn't fight them.
+    /// Start the chat server (plus any configured bridge) when the app comes up
+    /// and finds it down. The launcher is single-instance, so racing a manually
+    /// started copy is harmless. One attempt per app run at launch — if the
+    /// owner shuts the server down on purpose, the app doesn't fight them.
+    /// Asking a question is the signal to bring it back; see `handleServerDown`.
     func ensureServerRunning() {
         guard !serverStartAttempted else { return }
         guard var parts = URLComponents(url: config.guiURL, resolvingAgainstBaseURL: false) else { return }
@@ -231,18 +240,34 @@ final class AppModel: ObservableObject {
         }.resume()
     }
 
-    private func startLocalServer() {
-        guard !serverStartAttempted else { return }
+    /// A chat attempt could not reach the server. Kick the launcher unless a
+    /// start is already in flight, and return the bubble text to show.
+    func handleServerDown() -> String {
+        if let started = lastServerStart, Date().timeIntervalSince(started) < serverStartGrace {
+            return "chat server is still starting (index and model load take a minute or two) — ask again shortly"
+        }
+        if startLocalServer(force: true) {
+            return "chat server was not running — starting it now; ask again in a minute or two"
+        }
+        return "chat server is not running — start it with ./\(Self.launcherScript) in your mybot checkout"
+    }
+
+    @discardableResult
+    private func startLocalServer(force: Bool = false) -> Bool {
+        guard force || !serverStartAttempted else { return false }
+        let script = config.repoRoot.appendingPathComponent(Self.launcherScript).path
+        guard FileManager.default.fileExists(atPath: script) else { return false }
         serverStartAttempted = true
-        let script = config.repoRoot.appendingPathComponent("run_discord_chatbot.sh").path
+        lastServerStart = Date()
         let log = config.repoRoot.appendingPathComponent("state/run/mybot-launcher.log").path
         let process = Process()
         process.executableURL = URL(fileURLWithPath: "/bin/zsh")
         process.arguments = [
             "-c",
-            "MYBOT_SERVER_START_TIMEOUT_SECONDS=180 nohup '\(script)' >> '\(log)' 2>&1 &",
+            "mkdir -p \"$(dirname '\(log)')\"; MYBOT_SERVER_START_TIMEOUT_SECONDS=180 nohup /bin/zsh '\(script)' >> '\(log)' 2>&1 &",
         ]
-        try? process.run()
+        do { try process.run() } catch { return false }
+        return true
     }
 
     // MARK: connections
@@ -724,10 +749,13 @@ final class AppModel: ObservableObject {
             case .failure(let error):
                 self.chatPending = false
                 self.chatActivity = ""
+                // A refused connection means the server is down: start it and
+                // say so, rather than pointing at a platform-specific script.
+                let text = error == ChatClient.serverDownMessage ? self.handleServerDown() : error
                 // Replace the empty streaming bubble with an error bubble.
                 if let i = self.chat.firstIndex(where: { $0.id == assistantId }) {
                     if self.chat[i].text.isEmpty {
-                        self.chat[i] = ChatMsg(role: "error", text: error)
+                        self.chat[i] = ChatMsg(role: "error", text: text)
                     } else {
                         update { $0.streaming = false }
                     }

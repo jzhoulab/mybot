@@ -40,6 +40,9 @@ struct ChatClient {
     /// reopened chat continues in place.
     var sessionKey: String = ChatClient.threadPrefix
     static let threadPrefix = "menuapp"
+    /// Failure text for a refused connection. AppModel matches on it to start
+    /// the launcher and show a friendlier line; nothing here names a platform.
+    static let serverDownMessage = "chat server is not running"
 
     private var baseURL: URL {
         var comps = URLComponents(url: config.guiURL, resolvingAgainstBaseURL: false)!
@@ -68,7 +71,7 @@ struct ChatClient {
         URLSession.shared.dataTask(with: request) { data, _, error in
             if let error {
                 let hint = (error as? URLError)?.code == .cannotConnectToHost
-                    ? "chat server is not running — start it with run_discord_chatbot.sh"
+                    ? ChatClient.serverDownMessage
                     : error.localizedDescription
                 completion(.failure(NSError(domain: "mybot", code: 1,
                                             userInfo: [NSLocalizedDescriptionKey: hint])))
@@ -177,7 +180,7 @@ struct ChatClient {
             } catch {
                 if !Task.isCancelled {
                     let hint = (error as? URLError)?.code == .cannotConnectToHost
-                        ? "chat server is not running — start it with run_discord_chatbot.sh"
+                        ? ChatClient.serverDownMessage
                         : error.localizedDescription
                     send(.failure(hint))
                 }
