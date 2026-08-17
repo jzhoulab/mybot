@@ -28,6 +28,7 @@ from app.auth import SyncAuthStore
 from app.gui import GUI_HTML, build_gui_state
 from app.logging_setup import get_logger
 from app.semantic_memory import SemanticMemoryStore, VALID_MEMORY_SCOPES, parse_tags
+from app.prompt_history import PromptHistoryStore
 from app.trajectory_index import TrajectoryChunkIndex
 from sources.access import (
     default_config_path,
@@ -1657,6 +1658,10 @@ class AppState:
             chunk_chars=config.trajectory_index_chunk_chars,
             overlap_chars=config.trajectory_index_overlap_chars,
         )
+        # Durable "what did I ask, when, where" layer: the CLIs' typed-prompt
+        # logs outlive their transcripts, so this answers even when a session
+        # file was cleaned up. Same DB as the chunk index so SQL reaches it.
+        self.prompt_history = PromptHistoryStore(config.trajectory_index_db_path)
         self.access_config = load_access_config()
         self.memory_index: dict[str, Any] | None = None
         self.trajectory_index_maintenance_lock = threading.Lock()
@@ -1723,6 +1728,13 @@ class AppState:
         self.trajectory_lookup.clear()
         return result
 
+    def prompt_history_hits(self, query: str, *, limit: int = 6, after: str = "", before: str = "", source_name: str = "") -> list[dict[str, Any]]:
+        try:
+            return self.prompt_history.search(query, limit=limit, after=after, before=before, source_name=source_name)
+        except Exception as exc:  # pragma: no cover - never let the side index break a turn
+            log.warning("prompt history search failed: %s", exc)
+            return []
+
     def refresh_trajectory_chunk_index(self, *, include_vectors: bool = False) -> dict[str, Any]:
         result = self.trajectory_chunk_index.refresh_changed(
             include_vectors=include_vectors,
@@ -1731,7 +1743,47 @@ class AppState:
         )
         if result.get("sessions_updated") or result.get("sessions_removed"):
             self.trajectory_lookup.clear()
+        result["prompt_history"] = self.refresh_prompt_history()
         return result
+
+    def prompt_history_paths(self) -> dict[str, list[str]]:
+        """Each enabled source root's typed-prompt log: `<base_dir>/history.jsonl`
+        (Codex: ~/.codex/history.jsonl) or its parent's (Claude: base_dir is
+        ~/.claude/projects, the log is ~/.claude/history.jsonl)."""
+        out: dict[str, list[str]] = {}
+        for source_name in self.config.trajectory_sources:
+            seen: list[str] = []
+            for account in self.access_config.accounts_for_source(source_name):
+                if not getattr(account, "enabled", True):
+                    continue
+                base = os.path.expanduser(str(getattr(account, "expanded_base_dir", "") or account.base_dir))
+                for candidate in (
+                    os.path.join(base, "history.jsonl"),
+                    os.path.join(os.path.dirname(base.rstrip(os.sep)), "history.jsonl"),
+                ):
+                    if os.path.isfile(candidate) and candidate not in seen:
+                        seen.append(candidate)
+            if seen:
+                out[source_name] = seen
+        return out
+
+    def refresh_prompt_history(self) -> dict[str, Any]:
+        try:
+            try:
+                policy_path = default_config_path()
+                policy_key = (
+                    hashlib.sha1(policy_path.read_bytes()).hexdigest()[:12] if policy_path.exists() else ""
+                )
+            except OSError:
+                policy_key = ""
+            return self.prompt_history.refresh(
+                history_paths=self.prompt_history_paths(),
+                is_allowed=self._session_allowed_by_policy,
+                policy_key=policy_key,
+            )
+        except Exception as exc:  # pragma: no cover - best-effort side index
+            log.warning("prompt history refresh failed: %s", exc)
+            return {"error": str(exc)}
 
     def backfill_trajectory_chunk_vectors(self, *, limit: int = 256) -> dict[str, Any]:
         return self.trajectory_chunk_index.backfill_vectors(limit=limit)
@@ -3432,7 +3484,12 @@ class AppState:
                 f"- `{tool_command} sql -q \"<SELECT …>\" [--limit N]` — exact/enumeration SQL over the "
                 "cleaned, included-only index: `trajectory_chunks(id, source_ref, source_name, cwd, title, "
                 "updated_at, event_start, event_end, text, metadata_json)` and FTS5 "
-                "`trajectory_chunks_fts(title, cwd, text)`. COLUMN TYPES MATTER: `updated_at` is the ISO "
+                "`trajectory_chunks_fts(title, cwd, text)`; plus `prompt_history(id, source_name, "
+                "session_id, ts, cwd, text)` — every prompt the owner ever typed (Claude Code and Codex), "
+                "with ISO `ts` and the project dir, and FTS5 `prompt_history_fts(text, cwd)`. Prompt "
+                "history is DURABLE: it survives after a transcript is deleted or was never indexed, "
+                "so it places work in time and names the session (`source_name:session_id` = source_ref) "
+                "even when trajectory_chunks has nothing. COLUMN TYPES MATTER: `updated_at` is the ISO "
                 "timestamp — the ONLY date column; filter/sort time with it (`WHERE updated_at >= '2026-07-06'`, "
                 "`ORDER BY updated_at DESC`). `event_start`/`event_end` are INTEGER event indices within a "
                 "session (0..total_events), NOT dates — never compare them to a date. For a date window on "
@@ -3480,6 +3537,23 @@ class AppState:
                         f"{normalize_text(hit['title'], 100)} ({normalize_text(hit['cwd'], 80)})"
                     )
                 sections.append("\n".join(hit_lines))
+            prompt_hits = self.prompt_history_hits(query, limit=6)
+            if prompt_hits:
+                prompt_lines = [
+                    "## Prompt History Hits",
+                    "Prompts the asker actually typed that match their words (durable log; it "
+                    "survives even when the session transcript is gone). Each names the session, "
+                    "the day, and the project dir — use them to place the work in time, then "
+                    "trajectory-search/read that session_ref, or query `prompt_history` via SQL "
+                    "for the surrounding prompts. If the transcript is missing, say so and answer "
+                    "from what the prompts and any indexed chunks establish.",
+                ]
+                for hit in prompt_hits:
+                    prompt_lines.append(
+                        f"- [{hit['source_name']}][{hit['ts'][:10]}] {hit['source_ref']} "
+                        f"({normalize_text(hit['cwd'], 60)}) — {normalize_text(hit['text'], 220)}"
+                    )
+                sections.append("\n".join(prompt_lines))
         elif use_memory and trajectory_allowed:
             sections.append(f"## Trajectory Memory Overview\n{self.trajectory_overview()}")
             sections.append(f"## Recent Trajectory Catalog\n{self.recent_trajectory_catalog()}")
@@ -4306,6 +4380,9 @@ class ChatHandler(BaseHTTPRequestHandler):
                     "ok": True,
                     "mode": "full_scan",
                     "matches": matches,
+                    "prompt_history": self.server.state.prompt_history_hits(
+                        query, limit=8, after=after, before=before, source_name=source_filter
+                    ),
                 },
             )
             return
@@ -4327,6 +4404,11 @@ class ChatHandler(BaseHTTPRequestHandler):
         if compact:
             matches = [compact_trajectory_match(match) for match in matches]
         response = {"ok": True, "mode": "agentic_candidate", "matches": matches}
+        # Typed-prompt matches ride along: they survive transcript deletion and
+        # pin work to a day + session even when no chunk matched.
+        response["prompt_history"] = self.server.state.prompt_history_hits(
+            query, limit=8, after=after, before=before, source_name=source_filter
+        )
         if after or before or source_filter:
             response["filters"] = {
                 key: value
@@ -4994,7 +5076,11 @@ def main() -> None:
     refresh = state.ensure_trajectory_chunk_index_current()
     if refresh.get("rebuilt"):
         print("Refreshed stale trajectory chunk index before startup")
+    state.refresh_prompt_history()
     state.start_trajectory_index_background_refresh()
+    # Decode the embedding matrix off the request path: the first semantic
+    # search otherwise pays tens of seconds out of the agent's retrieval budget.
+    state.trajectory_chunk_index.warm_vector_cache_async()
     state.maybe_start_identity_onboarding()
     server = StandaloneServer((config.host, config.port), ChatHandler, state)
     print(f"Listening on http://{config.host}:{config.port}")

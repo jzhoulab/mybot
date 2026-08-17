@@ -52,6 +52,11 @@ mybot sql -q "<SELECT …>" [--limit N]
 Read-only SQL over the cleaned, included-only index. Tables:
 - `trajectory_chunks(id, source_ref, source_name, cwd, title, updated_at, event_start, event_end, text, metadata_json)`
 - FTS5 `trajectory_chunks_fts(title, cwd, text)`
+- `prompt_history(id, source_name, session_id, ts, cwd, text)` — every prompt the user
+  typed (Claude Code + Codex) with ISO `ts` and project dir; FTS5
+  `prompt_history_fts(text, cwd)`. Durable: it survives transcript deletion, so it
+  places work in time and names the session (`source_name:session_id`) even when
+  `trajectory_chunks` has nothing. `trajectory-search` also returns `prompt_history` hits.
 
 **Column types:** `updated_at` is the ISO timestamp and the ONLY date column —
 filter/sort time with it (`WHERE updated_at >= '2026-07-06'`, `ORDER BY
