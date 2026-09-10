@@ -236,32 +236,138 @@ def spent_seconds() -> float:
     return total
 
 
-def total_budget_seconds() -> float:
+def base_budget_seconds() -> float:
     try:
         return float(os.environ.get("MYBOT_TOOL_TOTAL_BUDGET_SECONDS", "90"))
     except ValueError:
         return 90.0
 
 
+def max_budget_seconds() -> float:
+    """Ceiling the budget can be extended to (owner-configurable). The default
+    leaves room for genuinely hard questions without allowing runaway loops."""
+    try:
+        return float(os.environ.get("MYBOT_TOOL_MAX_BUDGET_SECONDS", "600"))
+    except ValueError:
+        return 600.0
+
+
+def granted_extension_seconds() -> float:
+    """Extra seconds granted for THIS request via `budget --extend` (recorded
+    in the budget log so extensions are visible in the reply's summary)."""
+    log_path = os.environ.get("MYBOT_TOOL_BUDGET_LOG", "").strip()
+    if not log_path or not os.path.exists(log_path):
+        return 0.0
+    total = 0.0
+    try:
+        with open(log_path, encoding="utf-8") as handle:
+            for line in handle:
+                try:
+                    total += float(json.loads(line).get("extension_seconds") or 0)
+                except (json.JSONDecodeError, TypeError, ValueError):
+                    continue
+    except OSError:
+        return 0.0
+    return total
+
+
+def total_budget_seconds() -> float:
+    return min(max_budget_seconds(), base_budget_seconds() + granted_extension_seconds())
+
+
+def budget_status() -> dict[str, Any]:
+    budget = total_budget_seconds()
+    spent = spent_seconds()
+    return {
+        "budget_seconds": round(budget, 1),
+        "base_budget_seconds": round(base_budget_seconds(), 1),
+        "extension_seconds_granted": round(granted_extension_seconds(), 1),
+        "max_budget_seconds": round(max_budget_seconds(), 1),
+        "spent_seconds": round(spent, 1),
+        "remaining_seconds": round(max(0.0, budget - spent), 1),
+    }
+
+
+def extend_budget(seconds: float, reason: str) -> dict[str, Any]:
+    """Grant extra retrieval seconds for this request. The 90s default is a
+    soft pacing limit, not a wall: the agent may deliberately extend when the
+    question warrants deeper digging, and the owner sees every extension (with
+    its reason) in the reply's budget summary. MYBOT_TOOL_MAX_BUDGET_SECONDS
+    is the hard ceiling the owner controls."""
+    log_path = os.environ.get("MYBOT_TOOL_BUDGET_LOG", "").strip()
+    if not log_path:
+        return {
+            "ok": True,
+            "note": "No budget tracking for this invocation (no budget log); searches are not time-limited here.",
+            **budget_status(),
+        }
+    reason = " ".join((reason or "").split())[:300]
+    if not reason:
+        return {"ok": False, "error": "A --reason is required: say what still needs digging and why it is worth more time."}
+    seconds = max(0.0, float(seconds))
+    headroom = max(0.0, max_budget_seconds() - total_budget_seconds())
+    granted = min(seconds, headroom)
+    if granted <= 0:
+        return {
+            "ok": False,
+            "error": (
+                "Budget ceiling reached — no further extensions. Answer with the evidence "
+                "already retrieved; note what remained unverified."
+            ),
+            **budget_status(),
+        }
+    record = {
+        "tool": "budget-extend",
+        "seconds": 0.0,
+        "extension_seconds": round(granted, 1),
+        "reason": reason,
+        "requested_seconds": round(seconds, 1),
+    }
+    try:
+        directory = os.path.dirname(log_path)
+        if directory:
+            os.makedirs(directory, exist_ok=True)
+        with open(log_path, "a", encoding="utf-8") as handle:
+            handle.write(json.dumps(record, sort_keys=True, ensure_ascii=False) + "\n")
+    except OSError as exc:
+        return {"ok": False, "error": f"could not record extension: {exc}"}
+    status = budget_status()
+    status.update({"ok": True, "granted_seconds": round(granted, 1), "reason": reason})
+    if granted < seconds:
+        status["note"] = "Granted less than requested: the owner-set ceiling caps the total."
+    return status
+
+
 def enforce_total_budget(command: str) -> None:
-    """Stop runaway search loops: after the per-request budget is spent, tell
-    the model to answer with the evidence it already has instead of searching
-    again. Reads stay allowed — using found evidence is the goal."""
+    """Pace search loops: after the per-request budget is spent, searches stop
+    until the agent either answers with the evidence it has or deliberately
+    extends the budget (visible to the owner). Reads stay allowed — using
+    found evidence is the goal."""
     if command not in ("memory-search", "trajectory-search", "sql"):
         return
     budget = total_budget_seconds()
     spent = spent_seconds()
     if spent <= budget:
         return
+    if budget >= max_budget_seconds():
+        hint = (
+            "The budget ceiling is reached — no further extensions. Answer the user now "
+            "using the evidence already retrieved; say what remained unverified."
+        )
+    else:
+        hint = (
+            "Default action: answer the user now using the evidence already retrieved "
+            "(if nothing relevant was found, say the memory has no grounded record). "
+            "ONLY IF the question clearly warrants deeper digging and you have a "
+            "specific next lead, you may extend once: "
+            "`budget --extend <seconds> --reason \"<the specific lead>\"` — the owner "
+            "sees every extension and its reason in the reply."
+        )
     print_json({
         "ok": False,
         "budget_exhausted": True,
-        "error": (
-            f"Retrieval budget exhausted ({spent:.0f}s spent of {budget:.0f}s). "
-            "Do NOT search again. Answer the user now using the evidence already "
-            "retrieved; if nothing relevant was found, say the memory has no "
-            "grounded record of it."
-        ),
+        "error": f"Retrieval budget exhausted ({spent:.0f}s spent of {budget:.0f}s). {hint}",
+        **budget_status(),
     })
     raise SystemExit(0)
 
@@ -332,7 +438,22 @@ def main() -> int:
 
     subparsers.add_parser("trajectory-stats", help="Inspect trajectory index stats")
 
+    budget_parser = subparsers.add_parser(
+        "budget", help="Show the retrieval budget for this request, or extend it (--extend N --reason ...)"
+    )
+    budget_parser.add_argument("--extend", type=float, default=0.0, help="Extra seconds to grant this request")
+    budget_parser.add_argument("--reason", default="", help="Why more retrieval time is warranted (shown to the owner)")
+
     args = parser.parse_args()
+
+    # Local-only command: no server call, no actor needed.
+    if args.command == "budget":
+        if args.extend > 0:
+            print_json(extend_budget(args.extend, args.reason))
+        else:
+            print_json({"ok": True, **budget_status()})
+        return 0
+
     payload = actor_payload(args)
 
     if args.command == "memory-search":

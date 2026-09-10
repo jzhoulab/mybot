@@ -108,8 +108,12 @@ def compact_count(value: int | float) -> str:
 
 
 def format_retrieval_budget_summary(budgets: list[dict[str, Any]]) -> str:
-    valid = [budget for budget in budgets if isinstance(budget, dict)]
-    if not valid:
+    records = [budget for budget in budgets if isinstance(budget, dict)]
+    # Budget extensions are decisions, not retrievals: surface them separately
+    # so the owner always sees when and why the agent took extra time.
+    extensions = [r for r in records if r.get("tool") == "budget-extend"]
+    valid = [r for r in records if r.get("tool") != "budget-extend"]
+    if not valid and not extensions:
         return ""
 
     total_calls = sum(int(budget.get("tool_calls") or 1) for budget in valid)
@@ -129,11 +133,16 @@ def format_retrieval_budget_summary(budgets: list[dict[str, Any]]) -> str:
     if len(valid) > 4:
         details.append(f"{len(valid) - 4} more")
 
-    return (
+    summary = (
         f"Retrieval budget: {total_calls} tool call{'s' if total_calls != 1 else ''}, "
         f"{total_seconds:.2f}s, ~{compact_count(total_tokens)} tokens estimated"
         + (f" ({'; '.join(details)})." if details else ".")
     )
+    for extension in extensions:
+        granted = float(extension.get("extension_seconds") or 0.0)
+        reason = normalize_text(str(extension.get("reason") or ""), 200)
+        summary += f"\nBudget extended +{granted:.0f}s by the agent" + (f": {reason}" if reason else ".")
+    return summary
 
 
 def append_retrieval_budget_summary(answer: str, budgets: list[dict[str, Any]]) -> str:
@@ -2995,6 +3004,7 @@ class AppState:
         memory_scope: str,
         target_user_id: str | None,
         retrieval_budget_log_path: str | None = None,
+        budget_seconds: float | None = None,
     ) -> dict[str, str]:
         env = {
             "MYBOT_TOOL_BASE_URL": f"http://{self.config.host}:{self.config.port}",
@@ -3005,7 +3015,20 @@ class AppState:
             env["MYBOT_TOOL_TARGET_USER_ID"] = target_user_id
         if retrieval_budget_log_path:
             env["MYBOT_TOOL_BUDGET_LOG"] = retrieval_budget_log_path
+        if budget_seconds is not None:
+            # Asker's per-request override of the default retrieval budget
+            # (clamped to the owner-set ceiling; the tool clamps again).
+            env["MYBOT_TOOL_TOTAL_BUDGET_SECONDS"] = str(
+                max(10.0, min(float(budget_seconds), self.retrieval_budget_ceiling()))
+            )
         return env
+
+    @staticmethod
+    def retrieval_budget_ceiling() -> float:
+        try:
+            return float(os.environ.get("MYBOT_TOOL_MAX_BUDGET_SECONDS", "600"))
+        except ValueError:
+            return 600.0
 
     def new_retrieval_budget_log_path(self) -> Path:
         if self.config.codex_permission_profile or self.config.codex_sandbox == "workspace-write":
@@ -3498,6 +3521,14 @@ class AppState:
                 "`regexp_count(text, pattern)`, SQLite JSON1 (`json_extract(metadata_json,'$.key')`), plus "
                 "GROUP BY/COUNT for aggregation. A row's `id` works as `--chunk-id` in trajectory-read to "
                 "pull full context around a SQL hit.\n"
+                f"- `{tool_command} budget` — your retrieval-time budget for THIS request (default 90s "
+                "across all searches; a per-request override may apply). It is a pacing default the "
+                "owner and you jointly control, not a wall: when a search reports budget_exhausted, "
+                "either answer from the evidence you have, or — if the question clearly warrants it "
+                "and you have a specific next lead — extend once with "
+                f"`{tool_command} budget --extend <seconds> --reason \"<the specific lead>\"`. "
+                "Every extension and its reason is shown to the owner in your reply's budget "
+                "summary, so extend deliberately, never to repeat a failed query.\n"
                 "Be relentlessly proactive: dig with these until the answer is grounded in real evidence, "
                 "then say what's certain vs not (with dates for time-sensitive values). Live numbers "
                 "(balances, quotas, job states) usually ARE recorded in past command output — hunt for the "
@@ -3999,11 +4030,19 @@ class ChatHandler(BaseHTTPRequestHandler):
             if use_memory and self.server.state.config.agentic_tool_routing
             else None
         )
+        budget_seconds: float | None = None
+        raw_budget = body.get("budget_seconds")
+        if raw_budget is not None:
+            try:
+                budget_seconds = float(raw_budget)
+            except (TypeError, ValueError):
+                budget_seconds = None
         tool_env = self.server.state.tool_env_for_request(
             actor_id=actor_id,
             memory_scope=memory_scope,
             target_user_id=target_user_id,
             retrieval_budget_log_path=str(retrieval_budget_log_path) if retrieval_budget_log_path else None,
+            budget_seconds=budget_seconds,
         )
         return {
             "message": message, "raw_message": raw_message, "user": user, "actor_id": actor_id,
