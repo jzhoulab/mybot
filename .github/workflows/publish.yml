@@ -12,10 +12,15 @@
 # identity, so nothing is stored as a repository secret.
 #
 # ONE-TIME SETUP (browser, once ever) — do this BEFORE the first publish:
-#   pypi.org → Account settings → Publishing → Add a pending publisher
-#     PyPI project name: mybot-app
-#     Owner: jzhoulab   Repository: mybot   Workflow: publish.yml
-#   ("Pending" is the flow for a project that does not exist on PyPI yet.)
+#   pypi.org → Account settings → Publishing → Add a pending publisher (GitHub)
+#     PyPI project name:  mybot-app
+#     Owner:              jzhoulab
+#     Repository name:    mybot
+#     Workflow name:      publish.yml
+#     Environment name:   pypi          (must match the job's `environment` below)
+#   ("Pending" is the flow for a project that does not exist on PyPI yet.
+#   Every field must match the OIDC claims this workflow sends, or the token
+#   exchange fails with `invalid-publisher`.)
 name: Publish
 
 on:
@@ -32,13 +37,19 @@ permissions:
 jobs:
   publish:
     runs-on: ubuntu-latest
+    # Sent as the OIDC `environment` claim; PyPI's publisher form recommends
+    # (and often records) one, and a publisher configured with an environment
+    # rejects tokens that lack it. Harmless when the publisher leaves it blank.
+    environment:
+      name: pypi
+      url: https://pypi.org/p/mybot-app
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
         with:
           ref: main
           fetch-depth: 0
 
-      - uses: actions/setup-python@v5
+      - uses: actions/setup-python@v6
         with:
           python-version: "3.11"
 
