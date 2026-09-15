@@ -23,9 +23,11 @@
 #   exchange fails with `invalid-publisher`.)
 name: Publish
 
+# Nightly publishing is OFF until the one-time PyPI setup above is done and
+# we actually want the package on PyPI. To turn it on, restore:
+#   schedule:
+#     - cron: "0 9 * * *"   # nightly at 04:00 America/Chicago
 on:
-  schedule: # nightly at 04:00 America/Chicago, staggered off the JS repos
-    - cron: "0 9 * * *"
   release:
     types: [published]
   workflow_dispatch:
