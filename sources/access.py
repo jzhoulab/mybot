@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import dataclasses
+
 import json
 import os
 from dataclasses import dataclass, field
@@ -115,6 +117,15 @@ class TrajectoryAccessAccount:
     @property
     def expanded_base_dir(self) -> str:
         return expand_path(self.base_dir)
+
+    def policy_cache_key(self) -> str:
+        """Fingerprint of every field that affects discovery filtering, so a
+        stat-keyed discovery cache is invalidated when the policy changes."""
+        import hashlib
+        import json as _json
+
+        payload = _json.dumps(dataclasses.asdict(self), sort_keys=True, default=str)
+        return hashlib.sha1(payload.encode("utf-8")).hexdigest()[:12]
 
     def scoped_session_id(self, raw_session_id: str) -> str:
         if self.name and self.name != "default":

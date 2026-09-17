@@ -175,3 +175,41 @@ def append_turn(turns: list[NormalizedTurn], role: str, text: str, timestamp: st
     if turns and turns[-1].role == role and turns[-1].text == cleaned:
         return
     turns.append(NormalizedTurn(role=role, text=cleaned, timestamp=timestamp))
+
+# ---- discovery cache ---------------------------------------------------------
+# Discovery re-runs every few minutes and used to re-parse EVERY transcript
+# (minutes of CPU, large transient allocations) even when nothing changed.
+# Parsed sessions are small (turn text is capped at 800 chars), so cache the
+# finished NormalizedTrajectory keyed by the file's identity+stat and reuse it
+# until the file changes. Policy filtering happens before/around the parse, so
+# a policy change must bypass the cache: callers pass a policy_key that folds
+# into the signature.
+_DISCOVERY_CACHE: dict[str, tuple[tuple[int, int, str], Any]] = {}
+_DISCOVERY_CACHE_MAX = 6000
+
+
+def discovery_cache_signature(path: str, policy_key: str = "") -> tuple[int, int, str] | None:
+    try:
+        stat = os.stat(path)
+    except OSError:
+        return None
+    return (int(stat.st_size), int(stat.st_mtime_ns), policy_key)
+
+
+def discovery_cache_get(path: str, signature: tuple[int, int, str] | None):
+    if signature is None:
+        return None
+    entry = _DISCOVERY_CACHE.get(path)
+    if entry is None or entry[0] != signature:
+        return None
+    return entry[1]
+
+
+def discovery_cache_put(path: str, signature: tuple[int, int, str] | None, session: Any) -> None:
+    if signature is None:
+        return
+    if len(_DISCOVERY_CACHE) >= _DISCOVERY_CACHE_MAX:
+        # Rare, unordered eviction is fine: the cache refills from disk.
+        for stale in list(_DISCOVERY_CACHE.keys())[: _DISCOVERY_CACHE_MAX // 10]:
+            _DISCOVERY_CACHE.pop(stale, None)
+    _DISCOVERY_CACHE[path] = (signature, session)

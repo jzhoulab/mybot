@@ -7,6 +7,9 @@ from .access import TrajectoryAccessAccount, discover_claude_metadata
 from .common import (
     append_turn,
     choose_title,
+    discovery_cache_get,
+    discovery_cache_put,
+    discovery_cache_signature,
     is_real_user_text,
     iter_bounded_jsonl_lines,
     make_detailed_summary,
@@ -47,10 +50,21 @@ class ClaudeSourceAdapter(TrajectorySourceAdapter):
         # sessions under /private/var/folders pushed real, weeks-old sessions
         # past the cap so they were never scanned. The policy check only reads
         # each file's head, so filter first, then cap on what survives.
+        policy_key = self.account.policy_cache_key()
         files: list[tuple[str, str | None, list[str]]] = []
+        sessions: list[NormalizedTrajectory] = []
+        kept = 0
         for path in recent_files(patterns, 0):
             if f"{os.sep}subagents{os.sep}" in path:
                 continue  # spawned-subagent transcript, never a user session
+            signature = discovery_cache_signature(path, policy_key)
+            cached = discovery_cache_get(path, signature)
+            if cached is not None:
+                sessions.append(cached)
+                kept += 1
+                if max_files > 0 and kept >= max_files:
+                    break
+                continue
             try:
                 _, discovered_cwd, discovered_entrypoints = discover_claude_metadata(path)
             except OSError:
@@ -60,10 +74,10 @@ class ClaudeSourceAdapter(TrajectorySourceAdapter):
             if not self.account.include_entrypoints(discovered_entrypoints):
                 continue
             files.append((path, discovered_cwd, discovered_entrypoints))
-            if max_files > 0 and len(files) >= max_files:
+            kept += 1
+            if max_files > 0 and kept >= max_files:
                 break
 
-        sessions: list[NormalizedTrajectory] = []
         for path, discovered_cwd, discovered_entrypoints in files:
             first_ts = None
             last_ts = None
@@ -161,8 +175,7 @@ class ClaudeSourceAdapter(TrajectorySourceAdapter):
             if self.account.is_origin_excluded(origin, origin_detail):
                 continue
             title = choose_title(slug, user_turns, "claude session")
-            sessions.append(
-                NormalizedTrajectory(
+            session = NormalizedTrajectory(
                     source_name=self.source_name(),
                     session_id=session_id,
                     title=title,
@@ -183,7 +196,8 @@ class ClaudeSourceAdapter(TrajectorySourceAdapter):
                         "human_turns": human_turns,
                     },
                 )
-            )
+            discovery_cache_put(path, discovery_cache_signature(path, policy_key), session)
+            sessions.append(session)
 
         self._sessions = sorted(sessions, key=lambda session: session.updated_at, reverse=True)
         return self._sessions
