@@ -797,22 +797,50 @@ def _is_under(candidate: str, root: str) -> bool:
         return False
 
 
+def _session_rows(conn: sqlite3.Connection, order_by: str, limit: int) -> list[dict[str, Any]]:
+    """Per-session aggregates for the GUI lists, in two steps: aggregate over
+    the covering catalog index (never touching row pages), then fetch the
+    title/cwd of only the sessions shown. Selecting `title` in the GROUP BY
+    itself read every row of the multi-GB chunk table on each page load."""
+    top = conn.execute(
+        f"""
+        SELECT source_ref, MAX(source_name) AS source_name,
+               COUNT(*) AS chunks, MAX(updated_at) AS updated_at
+        FROM trajectory_chunks
+        GROUP BY source_ref
+        ORDER BY {order_by} DESC
+        LIMIT ?
+        """,
+        (limit,),
+    ).fetchall()
+    rows: list[dict[str, Any]] = []
+    for row in top:
+        detail = conn.execute(
+            "SELECT title, cwd FROM trajectory_chunks WHERE source_ref = ? LIMIT 1",
+            (row["source_ref"],),
+        ).fetchone()
+        rows.append(
+            {
+                "source_name": row["source_name"],
+                "source_ref": row["source_ref"],
+                "title": detail["title"] if detail else "",
+                "cwd": detail["cwd"] if detail else "",
+                "chunks": row["chunks"],
+                "updated_at": row["updated_at"],
+            }
+        )
+    return rows
+
+
 def _recent_indexed_sessions(db_path: str, limit: int = 12) -> list[dict[str, Any]]:
     if not os.path.exists(db_path):
         return []
     with sqlite3.connect(db_path) as conn:
         conn.row_factory = sqlite3.Row
-        rows = conn.execute(
-            """
-            SELECT source_name, source_ref, title, cwd, MAX(updated_at) AS updated_at
-            FROM trajectory_chunks
-            GROUP BY source_ref
-            ORDER BY updated_at DESC
-            LIMIT ?
-            """,
-            (limit,),
-        ).fetchall()
-    return [dict(row) for row in rows]
+        return [
+            {key: row[key] for key in ("source_name", "source_ref", "title", "cwd", "updated_at")}
+            for row in _session_rows(conn, "updated_at", limit)
+        ]
 
 
 def _file_group_size(path: str) -> int:
@@ -882,18 +910,7 @@ def _largest_sessions(db_path: str, limit: int = 8) -> list[dict[str, Any]]:
         return []
     with sqlite3.connect(db_path) as conn:
         conn.row_factory = sqlite3.Row
-        rows = conn.execute(
-            """
-            SELECT source_name, source_ref, title, cwd,
-                   COUNT(*) AS chunks, MAX(updated_at) AS updated_at
-            FROM trajectory_chunks
-            GROUP BY source_ref
-            ORDER BY chunks DESC
-            LIMIT ?
-            """,
-            (limit,),
-        ).fetchall()
-    return [dict(row) for row in rows]
+        return _session_rows(conn, "chunks", limit)
 
 
 def _session_files(state_dir: str, limit: int = 80) -> list[str]:
