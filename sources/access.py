@@ -10,6 +10,9 @@ from typing import Any
 
 from .common import recent_files
 
+_INCLUDE_WORKDIR_MEMO: dict[tuple[str, str | None], bool] = {}
+_POLICY_KEY_MEMO: dict[str, str] = {}
+
 
 DEFAULT_BASE_DIRS = {
     "codex": "~/.codex",
@@ -125,7 +128,13 @@ class TrajectoryAccessAccount:
         import json as _json
 
         payload = _json.dumps(dataclasses.asdict(self), sort_keys=True, default=str)
-        return hashlib.sha1(payload.encode("utf-8")).hexdigest()[:12]
+        cached = _POLICY_KEY_MEMO.get(payload)
+        if cached is None:
+            cached = hashlib.sha1(payload.encode("utf-8")).hexdigest()[:12]
+            if len(_POLICY_KEY_MEMO) > 256:
+                _POLICY_KEY_MEMO.clear()
+            _POLICY_KEY_MEMO[payload] = cached
+        return cached
 
     def scoped_session_id(self, raw_session_id: str) -> str:
         if self.name and self.name != "default":
@@ -169,10 +178,22 @@ class TrajectoryAccessAccount:
         return bool(classes & included_classes) or self.workdir_matches_rules(workdir, self.included_workdirs)
 
     def include_workdir(self, workdir: str | None) -> bool:
+        # Pure function of (policy, workdir), called for every transcript on
+        # every discovery pass; thousands of files share a handful of cwds and
+        # each uncached check resolves several paths (realpath → many lstat).
+        key = (self.policy_cache_key(), workdir)
+        cached = _INCLUDE_WORKDIR_MEMO.get(key)
+        if cached is not None:
+            return cached
         mode = normalize_visibility_mode(self.visibility_mode)
         if mode == "whitelist":
-            return self.is_workdir_allowed(workdir) and not self.is_workdir_blocked(workdir)
-        return not self.is_workdir_blocked(workdir)
+            result = self.is_workdir_allowed(workdir) and not self.is_workdir_blocked(workdir)
+        else:
+            result = not self.is_workdir_blocked(workdir)
+        if len(_INCLUDE_WORKDIR_MEMO) > 20000:
+            _INCLUDE_WORKDIR_MEMO.clear()
+        _INCLUDE_WORKDIR_MEMO[key] = result
+        return result
 
     def is_workdir_private(self, workdir: str | None) -> bool:
         if not workdir:
@@ -530,7 +551,30 @@ def peek_codex_session_meta(path: str) -> tuple[str | None, str | None, str]:
     return session_id, workdir, source_kind
 
 
+_CLAUDE_HEAD_MEMO: dict[str, tuple[tuple[int, int], tuple[str | None, str | None, list[str]]]] = {}
+
+
 def discover_claude_metadata(path: str) -> tuple[str | None, str | None, list[str]]:
+    """Head-of-file (session_id, cwd, entrypoints), memoized by size+mtime:
+    discovery runs every few minutes over thousands of transcripts, most of
+    them unchanged (and many rejected by policy, so never session-cached)."""
+    try:
+        stat = os.stat(path)
+        key = (int(stat.st_size), int(stat.st_mtime_ns))
+    except OSError:
+        key = None
+    if key is not None:
+        cached = _CLAUDE_HEAD_MEMO.get(path)
+        if cached is not None and cached[0] == key:
+            session_id, workdir, entrypoints = cached[1]
+            return session_id, workdir, list(entrypoints)
+    result = _discover_claude_metadata_uncached(path)
+    if key is not None:
+        _CLAUDE_HEAD_MEMO[path] = (key, (result[0], result[1], list(result[2])))
+    return result
+
+
+def _discover_claude_metadata_uncached(path: str) -> tuple[str | None, str | None, list[str]]:
     session_id = os.path.basename(path).replace(".jsonl", "")
     fallback_workdir = decode_claude_project_slug(path)
     workdir = None
