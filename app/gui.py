@@ -864,11 +864,10 @@ def _footprint(state: "AppState") -> dict[str, Any]:
     try:
         with sqlite3.connect(db) as conn:
             conn.row_factory = sqlite3.Row
-            total = conn.execute("SELECT COUNT(*) FROM trajectory_chunks").fetchone()[0]
-            embedded = conn.execute(
-                "SELECT COUNT(*) FROM trajectory_chunks "
-                "WHERE embedding_blob IS NOT NULL OR embedding_json != '[]'"
-            ).fetchone()[0]
+            # Index-only counts (the embedded predicate full-scanned the table).
+            index_stats = state.trajectory_chunk_index.stats()
+            total = int(index_stats.get("total_chunks") or 0)
+            embedded = int(index_stats.get("embedded_chunks") or 0)
             sample = conn.execute(
                 "SELECT length(text) t, length(embedding_json) ej, length(embedding_blob) eb "
                 "FROM trajectory_chunks ORDER BY id DESC LIMIT 300"
