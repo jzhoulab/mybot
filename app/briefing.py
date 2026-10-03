@@ -80,9 +80,15 @@ def _fmt_local(iso: str) -> str:
         return iso[:16]
 
 
+ENGINE_LABELS = {"claude": "Claude", "gpt": "GPT"}
+
+
 class BriefingRunner:
-    def __init__(self, state: "AppState") -> None:
+    def __init__(self, state: "AppState", engine: str = "claude") -> None:
         self.state = state
+        self.engine = engine
+        # Claude keeps the original file names; other engines add a suffix.
+        self.suffix = "" if engine == "claude" else f".{engine}"
         self.enabled = _env_bool("BRIEFING_ENABLED", True)
         self.at = _env("BRIEFING_TIME", "08:00")
         self.analyst_effort = _env("BRIEFING_ANALYST_EFFORT", "xhigh")
@@ -131,9 +137,9 @@ class BriefingRunner:
             return False
         # Once per local day; a laptop asleep at the scheduled time catches up
         # on wake. A failed run is retried on the next tick only after an hour.
-        if (self.dir / f"{now.date().isoformat()}.md").exists():
+        if (self.dir / f"{now.date().isoformat()}{self.suffix}.md").exists():
             return False
-        failed = self.dir / f"{now.date().isoformat()}.failed"
+        failed = self.dir / f"{now.date().isoformat()}{self.suffix}.failed"
         if failed.exists() and time.time() - failed.stat().st_mtime < 3600:
             return False
         return not self.status["running"]
@@ -174,17 +180,20 @@ class BriefingRunner:
             record["open_loops"] = carry.get("overlooked", []) if isinstance(carry, dict) else []
             record["topics"] = carry.get("topics", []) if isinstance(carry, dict) else []
             record["briefing"] = text
+            self.status["stage"] = "follow-up actions"
+            record["sections"] = self.structure(text)
+            record["actions"] = self.make_actions(evidence, record["sections"])
             record["seconds"] = round(time.time() - started, 1)
             self._write(day, text, record)
             self.status["stage"] = "deliver"
             record["delivered"] = self.deliver(day, text)
-            (self.dir / f"{day}.json").write_text(json.dumps(record, indent=1, default=str))
-            (self.dir / f"{day}.failed").unlink(missing_ok=True)
+            (self.dir / f"{day}{self.suffix}.json").write_text(json.dumps(record, indent=1, default=str))
+            (self.dir / f"{day}{self.suffix}.failed").unlink(missing_ok=True)
             self.status["last"] = {"date": day, "ok": True, "seconds": record["seconds"]}
             log.info("daily briefing %s written in %.0fs", day, record["seconds"])
-            return {"ok": True, "date": day, "seconds": record["seconds"], "path": str(self.dir / f"{day}.md")}
+            return {"ok": True, "date": day, "seconds": record["seconds"], "path": str(self.dir / f"{day}{self.suffix}.md")}
         except Exception as exc:
-            (self.dir / f"{day}.failed").write_text(traceback.format_exc())
+            (self.dir / f"{day}{self.suffix}.failed").write_text(traceback.format_exc())
             self.status["last"] = {"date": day, "ok": False, "error": str(exc)}
             log.warning("daily briefing failed: %s", exc)
             return {"ok": False, "error": str(exc)}
@@ -196,7 +205,7 @@ class BriefingRunner:
 
     def _previous(self, limit: int = 5) -> list[dict[str, Any]]:
         out = []
-        for path in sorted(self.dir.glob("*.json"), reverse=True)[:limit]:
+        for path in sorted(self.dir.glob(f"????-??-??{self.suffix}.json"), reverse=True)[:limit]:
             try:
                 data = json.loads(path.read_text())
             except (OSError, json.JSONDecodeError):
@@ -541,6 +550,174 @@ class BriefingRunner:
                            effort=self.verify_effort, tools=True, web=True)
         return text or draft
 
+    # ------------------------------------------------------- app + follow-ups
+
+    @staticmethod
+    def structure(text: str) -> list[dict[str, Any]]:
+        """Split the verified pulse into app sections WITHOUT rewording it:
+        an intro, the overlooked list (one entry per item), and articles."""
+        sections: list[dict[str, Any]] = []
+        parts = re.split(r"(?m)^##\s+", text)
+        intro = parts[0].strip().strip("-").strip()
+        if intro:
+            sections.append({"kind": "intro", "title": "", "body": intro})
+        for part in parts[1:]:
+            title, _, body = part.partition("\n")
+            title = title.strip()
+            body = re.sub(r"(?m)^-{3,}\s*$", "", body).strip()
+            if "overlook" in title.lower():
+                items: list[str] = []
+                notes: list[str] = []
+                for line in body.splitlines():
+                    if re.match(r"^\s*[-*]\s+", line):
+                        items.append(re.sub(r"^\s*[-*]\s+", "", line).strip())
+                    elif items and line.startswith(("  ", "\t")) and line.strip():
+                        items[-1] += " " + line.strip()
+                    elif line.strip():
+                        notes.append(line.strip())
+                for index, item in enumerate(items, start=1):
+                    sections.append({"kind": "overlooked", "id": f"o{index}", "title": "", "body": item})
+                if notes:
+                    sections.append({"kind": "note", "title": "", "body": "\n".join(notes)})
+            else:
+                index = sum(1 for sec in sections if sec["kind"] == "article") + 1
+                sections.append({"kind": "article", "id": f"a{index}", "title": title, "body": body})
+        return sections
+
+    def make_actions(self, evidence: dict[str, Any], sections: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        targets = [sec for sec in sections if sec["kind"] in {"overlooked", "article"}]
+        if not targets:
+            return []
+        system = (
+            "You turn items from a researcher's morning pulse into tasks for a capable coding "
+            "agent (Claude Code / Codex with shell access and a `mybot` command that searches "
+            "the researcher's past sessions). Output ONLY a JSON array."
+        )
+        listing = "\n\n".join(
+            f"[{sec['id']}] ({sec['kind']}) {sec.get('title') or ''}\n{sec['body'][:3000]}" for sec in targets
+        )
+        message = (
+            listing
+            + "\n\nFor each item write a follow-up task the owner can launch with one tap. "
+            'Each element: {"id": item id, "label": 2–5 word button label, "source_ref": the '
+            'main session ref the item points to (e.g. "claude:2099f0a8-…" — copy the full id '
+            'if shown, else ""), "prompt": the task}. The prompt must be self-contained (the '
+            "agent has not seen the pulse): restate the item in plain words, say how to get "
+            "context (`mybot trajectory-read --source-ref REF`, `mybot trajectory-search -q ...`), "
+            "and say what to deliver. Overlooked items: find out whether it is really still "
+            "open, and if so prepare the next step (a draft message, a command, a short plan). "
+            "Articles: assess how the idea applies to the owner's actual code/models and propose "
+            "a concrete small experiment. Always: report findings briefly in plain language; do "
+            "NOT take irreversible or outward-facing actions (deleting data, messaging people, "
+            "launching large jobs, pushing code) without asking first."
+        )
+        text = self._agent(label="actions", system=system, message=message,
+                           effort=self.verify_effort, tools=False, web=False)
+        match = re.search(r"\[.*\]", text, re.S)
+        try:
+            raw = json.loads(match.group(0)) if match else []
+        except json.JSONDecodeError:
+            raw = []
+        by_id = {str(item.get("id")): item for item in raw if isinstance(item, dict)}
+        actions = []
+        for sec in targets:
+            item = by_id.get(sec["id"])
+            if not item or not str(item.get("prompt") or "").strip():
+                continue
+            ref = str(item.get("source_ref") or "")
+            actions.append({
+                "id": sec["id"],
+                "kind": sec["kind"],
+                "label": str(item.get("label") or ("Follow up" if sec["kind"] == "overlooked" else "Explore"))[:40],
+                "prompt": str(item["prompt"]),
+                "source_ref": ref,
+                "cwd": self._cwd_for(ref),
+                "spawned": None,
+            })
+        return actions
+
+    def _cwd_for(self, source_ref: str) -> str:
+        fallback = str(Path.home() / "Code")
+        if not source_ref or ":" not in source_ref:
+            return fallback
+        db = self.state.config.trajectory_index_db_path
+        try:
+            with sqlite3.connect(f"file:{db}?mode=ro", uri=True, timeout=10) as conn:
+                like = source_ref.rstrip("…").rstrip(".") + "%"
+                row = conn.execute(
+                    "SELECT cwd FROM trajectory_chunks WHERE source_ref LIKE ? LIMIT 1", (like,)
+                ).fetchone()
+        except sqlite3.Error:
+            row = None
+        cwd = str(row[0]) if row and row[0] else ""
+        # Agent mirror/scratch dirs are not where follow-up work belongs.
+        if not cwd or "/.nebula" in cwd or "/.claude/" in cwd or not os.path.isdir(cwd):
+            return fallback
+        return cwd
+
+    def latest(self) -> dict[str, Any] | None:
+        paths = sorted(self.dir.glob(f"????-??-??{self.suffix}.json"))
+        if not paths:
+            return None
+        data = json.loads(paths[-1].read_text())
+        sections = data.get("sections") or self.structure(str(data.get("briefing") or ""))
+        return {
+            "engine": self.engine,
+            "label": ENGINE_LABELS.get(self.engine, self.engine),
+            "date": data.get("date"),
+            "title": self._title(str(data.get("date"))),
+            "sections": sections,
+            "actions": data.get("actions") or [],
+        }
+
+    def follow_up(self, date: str, action_id: str) -> dict[str, Any]:
+        """Launch the item's follow-up as an agent in hop (the owner watches
+        and steers it there). Returns immediately; the agent works on."""
+        path = self.dir / f"{date}{self.suffix}.json"
+        data = json.loads(path.read_text())
+        action = next((a for a in data.get("actions") or [] if a.get("id") == action_id), None)
+        if action is None:
+            raise ValueError(f"no action {action_id} for {date}")
+        if action.get("spawned"):
+            return {"ok": True, "already": True, **action["spawned"]}
+        agent = "codex" if self.engine == "gpt" else "claude"
+        name = f"pulse-{date[5:].replace('-', '')}-{self.engine}-{action_id}"
+        spawn = self._hopa(["tool", "hopx_spawn_agent", json.dumps({
+            "name": name, "agent": agent, "cwd": action.get("cwd") or str(Path.home() / "Code"),
+        })], timeout=180)
+        if not spawn.get("ok"):
+            raise RuntimeError(f"hop spawn failed: {spawn}")
+        terminal = str(spawn.get("terminal_id") or name)
+        prompt = (
+            f"(Follow-up launched from mybot's morning pulse, {date}.)\n\n" + str(action["prompt"])
+        )
+        sent = self._hopa(["tool", "hopx_send_and_wait", json.dumps({
+            "terminal_id": terminal, "data": prompt, "press_enter": True, "wait": False,
+        })], timeout=60)
+        if not sent.get("ok"):
+            raise RuntimeError(f"hop send failed: {sent}")
+        action["spawned"] = {
+            "terminal": name, "terminal_id": terminal, "session": spawn.get("sessionName"),
+            "at": datetime.now(timezone.utc).isoformat(),
+        }
+        path.write_text(json.dumps(data, indent=1, default=str))
+        log.info("pulse follow-up %s/%s spawned in hop as %s", date, action_id, name)
+        return {"ok": True, **action["spawned"]}
+
+    @staticmethod
+    def _hopa(args: list[str], *, timeout: int) -> dict[str, Any]:
+        import subprocess
+
+        hopa = os.environ.get("HOPA_COMMAND") or "hopa"
+        proc = subprocess.run(
+            [hopa, *args, "--cli-timeout", str(timeout * 1000)],
+            capture_output=True, text=True, timeout=timeout + 15,
+        )
+        try:
+            return json.loads(proc.stdout or "{}")
+        except json.JSONDecodeError:
+            return {"ok": False, "error": (proc.stdout or proc.stderr)[:500]}
+
     # ----------------------------------------------------------------- outputs
 
     @staticmethod
@@ -561,16 +738,21 @@ class BriefingRunner:
         return "**Quiet stretch** — nothing new from you since the last pulse.\n\n```json\n{}\n```"
 
     def _write(self, day: str, text: str, record: dict[str, Any]) -> None:
-        header = f"# Morning pulse — {datetime.fromisoformat(day).strftime('%A %b %-d')}\n\n"
-        (self.dir / f"{day}.md").write_text(header + text + "\n")
+        header = f"# {self._title(day, long=True)}\n\n"
+        (self.dir / f"{day}{self.suffix}.md").write_text(header + text + "\n")
+
+    def _title(self, day: str, *, long: bool = False) -> str:
+        when = datetime.fromisoformat(day).strftime("%A %b %-d" if long else "%a %b %-d")
+        label = "" if self.engine == "claude" else f" ({ENGINE_LABELS.get(self.engine, self.engine)})"
+        return f"Morning pulse{label} — {when}"
 
     def deliver(self, day: str, text: str) -> dict[str, Any]:
         owner = self.state.config.imported_owner_actor_id
-        title = f"Morning pulse — {datetime.fromisoformat(day).strftime('%a %b %-d')}"
+        title = self._title(day)
         sessions = self.state.sessions
         delivered: dict[str, Any] = {}
         # A menu-app thread: shows up in Ask history; follow-ups continue in place.
-        thread = f"{THREAD_PREFIX}{day.replace('-', '')}"
+        thread = f"{THREAD_PREFIX}{day.replace('-', '')}{self.suffix.replace('.', '-')}"
         sessions.append_message(thread, owner, "user", title, {"kind": "briefing"})
         sessions.append_message(thread, owner, "assistant", text, {"kind": "briefing"})
         delivered["thread"] = thread
@@ -584,7 +766,7 @@ class BriefingRunner:
                 log.warning("could not seed DM session: %s", exc)
             with self.outbox_path.open("a") as handle:
                 handle.write(json.dumps({
-                    "id": f"briefing-{day}",
+                    "id": f"briefing-{day}{self.suffix}",
                     "platform": "discord",
                     "target_user_id": owner,
                     "text": f"**{title}**\n\n{text}",

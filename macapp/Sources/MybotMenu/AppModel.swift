@@ -53,8 +53,15 @@ final class AppModel: ObservableObject {
     private let maxDegradedHoldSeconds: TimeInterval = 180
 
     // ---- ask (search + chat) ----
-    enum Mode { case projects, ask }
-    @Published var mode: Mode = .projects
+    enum Mode { case projects, ask, pulse }
+    @Published var mode: Mode = .pulse
+
+    // morning pulse
+    @Published var pulses: [Pulse] = []
+    @Published var pulsesLoaded = false
+    @Published var pulseEngine = "claude"
+    @Published var pulseLaunching: Set<String> = []
+    var currentPulse: Pulse? { pulses.first { $0.engine == pulseEngine } ?? pulses.first }
     @Published var searchHits: [SearchHit] = []
     @Published var chat: [ChatMsg] = []
     @Published var chatPending = false
@@ -760,6 +767,36 @@ final class AppModel: ObservableObject {
                         update { $0.streaming = false }
                     }
                 }
+            }
+        }
+    }
+
+    // MARK: morning pulse
+
+    func loadPulses() {
+        PulseClient(config: config).latest { [weak self] pulses in
+            guard let self else { return }
+            self.pulses = pulses
+            self.pulsesLoaded = true
+            if !pulses.contains(where: { $0.engine == self.pulseEngine }), let first = pulses.first {
+                self.pulseEngine = first.engine
+            }
+        }
+    }
+
+    func followUp(pulse: Pulse, actionID: String) {
+        let key = "\(pulse.engine)/\(actionID)"
+        pulseLaunching.insert(key)
+        PulseClient(config: config).followUp(engine: pulse.engine, date: pulse.date, actionID: actionID) { [weak self] result in
+            guard let self else { return }
+            self.pulseLaunching.remove(key)
+            switch result {
+            case .success(let terminal):
+                if let i = self.pulses.firstIndex(where: { $0.engine == pulse.engine }) {
+                    self.pulses[i].actions[actionID]?.spawnedTerminal = terminal
+                }
+            case .failure(let error):
+                self.lastError = "Follow-up: \(error.localizedDescription)"
             }
         }
     }

@@ -1729,6 +1729,7 @@ class AppState:
         # file was cleaned up. Same DB as the chunk index so SQL reaches it.
         self.prompt_history = PromptHistoryStore(config.trajectory_index_db_path)
         self.briefing: Any = None  # BriefingRunner, created in main() once state is complete
+        self.briefings: dict[str, Any] = {}
         self.access_config = load_access_config()
         self.memory_index: dict[str, Any] | None = None
         self.trajectory_index_maintenance_lock = threading.Lock()
@@ -3770,6 +3771,19 @@ class ChatHandler(BaseHTTPRequestHandler):
                 "latest_text": latest[0].read_text() if latest else "",
             })
             return
+        if path == "/briefing/latest":
+            pulses = []
+            for runner in self.server.state.briefings.values():
+                try:
+                    latest = runner.latest()
+                except (OSError, ValueError) as exc:
+                    latest = {"engine": runner.engine, "error": str(exc)}
+                if latest:
+                    latest["running"] = bool(runner.status.get("running"))
+                    latest["stage"] = runner.status.get("stage") or ""
+                    pulses.append(latest)
+            self.respond_json(200, {"ok": True, "pulses": pulses})
+            return
         if path == "/outbox":
             query = urllib.parse.parse_qs(self.path.split("?", 1)[1] if "?" in self.path else "")
             platform = (query.get("platform") or ["discord"])[0]
@@ -3855,7 +3869,7 @@ class ChatHandler(BaseHTTPRequestHandler):
             self.handle_gui_scope(body)
             return
         if self.path == "/briefing/run":
-            runner = self.server.state.briefing
+            runner = self.server.state.briefings.get(str(body.get("engine") or "claude"))
             if runner is None:
                 self.respond_json(503, {"ok": False, "error": "briefing not initialized"})
                 return
@@ -3865,6 +3879,27 @@ class ChatHandler(BaseHTTPRequestHandler):
             force = coerce_bool(body.get("force"), False)
             threading.Thread(target=lambda: runner.run(force=force), name="briefing-manual", daemon=True).start()
             self.respond_json(202, {"ok": True, "started": True})
+            return
+        if self.path in {"/briefing/followup", "/briefing/actions"}:
+            runner = self.server.state.briefings.get(str(body.get("engine") or "claude"))
+            if runner is None:
+                self.respond_json(404, {"ok": False, "error": "unknown engine"})
+                return
+            date = str(body.get("date") or "")
+            try:
+                if self.path == "/briefing/followup":
+                    result = runner.follow_up(date, str(body.get("action_id") or ""))
+                else:
+                    path = runner.dir / f"{date}{runner.suffix}.json"
+                    data = json.loads(path.read_text())
+                    data["sections"] = runner.structure(str(data.get("briefing") or ""))
+                    data["actions"] = runner.make_actions({}, data["sections"])
+                    path.write_text(json.dumps(data, indent=1, default=str))
+                    result = {"ok": True, "actions": len(data["actions"])}
+            except (OSError, ValueError, RuntimeError) as exc:
+                self.respond_json(400, {"ok": False, "error": str(exc)})
+                return
+            self.respond_json(200, result)
             return
         if self.path == "/outbox/ack":
             runner = self.server.state.briefing
@@ -5217,8 +5252,11 @@ def main() -> None:
     state.maybe_start_identity_onboarding()
     from app.briefing import BriefingRunner
 
-    state.briefing = BriefingRunner(state)
-    state.briefing.start_scheduler()
+    engines = [e.strip() for e in (os.environ.get("BRIEFING_ENGINES") or "claude").split(",") if e.strip()]
+    state.briefings = {engine: BriefingRunner(state, engine) for engine in engines}
+    state.briefing = state.briefings.get("claude") or next(iter(state.briefings.values()))
+    for runner in state.briefings.values():
+        runner.start_scheduler()
     server = StandaloneServer((config.host, config.port), ChatHandler, state)
     print(f"Listening on http://{config.host}:{config.port}")
     server.serve_forever()

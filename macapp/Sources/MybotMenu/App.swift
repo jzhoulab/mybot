@@ -286,6 +286,8 @@ struct ContentView: View {
                     modeTabs
                     if model.mode == .ask {
                         AskView(model: model)
+                    } else if model.mode == .pulse {
+                        PulseView(model: model)
                     } else {
                         controls
                         projectScroll
@@ -591,8 +593,9 @@ struct ContentView: View {
     // MARK: mode tabs
     private var modeTabs: some View {
         Picker("", selection: $model.mode) {
-            Text("Projects").tag(AppModel.Mode.projects)
+            Text("Pulse").tag(AppModel.Mode.pulse)
             Text("Ask mybot").tag(AppModel.Mode.ask)
+            Text("Projects").tag(AppModel.Mode.projects)
         }
         .pickerStyle(.segmented)
         .labelsHidden()
