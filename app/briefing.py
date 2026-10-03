@@ -1,4 +1,15 @@
-"""Daily chief-of-staff briefing.
+"""Daily "pulse": ideas and overlooked things, written for the owner.
+
+The owner already gets per-session status elsewhere, so this deliberately does
+NOT recap sessions. It reads mainly what the OWNER typed (their own voice,
+filtered from tool-injected and automated prompts), then: a scout picks article
+topics and candidate overlooked items; writers research and write short plain-
+language articles; a checker keeps only overlooked items that are really still
+open; an editor assembles; a verifier fact- and jargon-checks.
+
+(Original design notes below describe the plumbing, which is unchanged.)
+
+Daily chief-of-staff briefing.
 
 Every morning (BRIEFING_TIME, local) mybot reads what happened since the last
 briefing and writes the owner a short, prioritized briefing: what matters
@@ -138,24 +149,30 @@ class BriefingRunner:
         try:
             self.status.update(running=True, started_at=record["started_at"], stage="gather")
             evidence = self.gather()
-            record["evidence"] = evidence
-            if not evidence["sessions"] and not evidence["prompts"] and not force:
+            record["evidence"] = {k: v for k, v in evidence.items() if k != "previous"}
+            if not evidence["recent_prompts"] and not force:
                 text = self._quiet_day_note(evidence)
-                record["stages"] = {"skipped": "no activity in window"}
             else:
-                self.status["stage"] = "plan"
-                workstreams = self.plan(evidence)
-                record["workstreams"] = workstreams
-                self.status["stage"] = f"analysts (0/{len(workstreams)})"
-                reports = self.analyze(evidence, workstreams)
-                record["analyst_reports"] = reports
-                self.status["stage"] = "chief of staff"
-                draft = self.chief_of_staff(evidence, workstreams, reports)
+                self.status["stage"] = "scout"
+                scout = self.scout(evidence)
+                record["scout"] = scout
+                self.status["stage"] = "articles + overlooked checks"
+                with ThreadPoolExecutor(max_workers=max(1, self.parallel)) as pool:
+                    articles_future = pool.submit(self.write_articles, evidence, scout)
+                    overlooked_future = pool.submit(self.check_overlooked, evidence, scout)
+                    articles = articles_future.result()
+                    overlooked = overlooked_future.result()
+                record["articles"] = articles
+                record["overlooked"] = overlooked
+                self.status["stage"] = "editor"
+                draft = self.edit(evidence, articles, overlooked)
                 record["draft"] = draft
                 self.status["stage"] = "verify"
-                text = self.verify(evidence, reports, draft)
-            text, open_loops = self._split_open_loops(text)
-            record["open_loops"] = open_loops
+                text = self.verify(evidence, draft)
+            text, carry = self._split_carry(text)
+            record["carry"] = carry
+            record["open_loops"] = carry.get("overlooked", []) if isinstance(carry, dict) else []
+            record["topics"] = carry.get("topics", []) if isinstance(carry, dict) else []
             record["briefing"] = text
             record["seconds"] = round(time.time() - started, 1)
             self._write(day, text, record)
@@ -177,7 +194,7 @@ class BriefingRunner:
 
     # ------------------------------------------------------------------ gather
 
-    def _previous(self, limit: int = 3) -> list[dict[str, Any]]:
+    def _previous(self, limit: int = 5) -> list[dict[str, Any]]:
         out = []
         for path in sorted(self.dir.glob("*.json"), reverse=True)[:limit]:
             try:
@@ -188,88 +205,106 @@ class BriefingRunner:
                 {
                     "date": data.get("date"),
                     "started_at": data.get("started_at"),
-                    "briefing": str(data.get("briefing") or "")[:6000],
+                    "briefing": str(data.get("briefing") or "")[:5000],
                     "open_loops": data.get("open_loops") or [],
+                    "topics": data.get("topics") or [],
                 }
             )
         return out
 
+    # Prompts that tools inject on the owner's behalf (handoffs, reconnects,
+    # plan executions, pasted dumps) are not how the owner talks; they would
+    # drown the owner's own voice, which is the briefing's primary signal.
+    _INJECTED = re.compile(
+        r"^(Read the ENTIRE file|You are driving a Nebula notebook|We were disconnected|"
+        r"Implement the following plan|<!--\s*agent-session|In notebook /|Continue from where|"
+        r"\[Pasted text|Caveat: The messages below|<command-name>|<local-command|"
+        r"This session is being continued|Summarize prior conversation|\[Agent-driver|"
+        r"Reply with exactly|Review expected|You are (an?|the) [a-z -]*agent\b|"
+        r".*\bcontinue authorized\b)",
+        re.I,
+    )
+
+    _ACKS = {"sure", "ok", "okay", "yes", "y", "proceed", "continue", "go ahead", "go", "thanks",
+             "thank you", "do it", "yes please", "sounds good", "please proceed", "great", "lgtm"}
+
+    def _owner_voice(self, text: str) -> bool:
+        text = text.strip()
+        if len(text) < 4 or len(text) > 1500:
+            return False
+        if text.lower().strip(" .!") in self._ACKS:
+            return False
+        if text.startswith("/") and " " not in text:
+            return False
+        return not self._INJECTED.match(text)
+
     def gather(self) -> dict[str, Any]:
         previous = self._previous()
         now = datetime.now(timezone.utc)
-        if previous and previous[0].get("started_at"):
-            since = str(previous[0]["started_at"])
-        else:
-            since = (now - timedelta(hours=36)).isoformat()
-        # Never reach further back than 4 days, even after a long gap.
-        floor = (now - timedelta(days=4)).isoformat()
-        since = max(since, floor)
-        week = (now - timedelta(days=7)).isoformat()
+        since = str(previous[0]["started_at"]) if previous and previous[0].get("started_at") else (now - timedelta(hours=36)).isoformat()
+        since = max(since, (now - timedelta(days=4)).isoformat())
+        backdrop_since = (now - timedelta(days=14)).isoformat()
         db = self.state.config.trajectory_index_db_path
-        prompts: list[dict[str, Any]] = []
-        week_projects: list[dict[str, Any]] = []
-        sessions: list[dict[str, Any]] = []
+        recent: list[dict[str, Any]] = []
+        backdrop: list[dict[str, Any]] = []
+        titles: dict[str, str] = {}
         with sqlite3.connect(f"file:{db}?mode=ro", uri=True, timeout=30) as conn:
             conn.row_factory = sqlite3.Row
-            for row in conn.execute(
-                "SELECT source_name, session_id, ts, cwd, text FROM prompt_history "
-                "WHERE ts >= ? ORDER BY ts",
-                (since,),
-            ):
+            rows = conn.execute(
+                "SELECT source_name, session_id, ts, cwd, text FROM prompt_history WHERE ts >= ? ORDER BY ts",
+                (backdrop_since,),
+            ).fetchall()
+            # Text repeated verbatim many times is a scheduler or driver, not the owner.
+            repeats: dict[str, int] = {}
+            for row in rows:
+                key = str(row["text"] or "").strip()[:200]
+                repeats[key] = repeats.get(key, 0) + 1
+            session_info: dict[str, tuple[str, str, str]] = {}
+
+            def info(ref: str) -> tuple[str, str, str]:
+                if ref not in session_info:
+                    one = conn.execute(
+                        "SELECT title, cwd, COALESCE(json_extract(metadata_json, '$.origin'), '') "
+                        "FROM trajectory_chunks WHERE source_ref = ? LIMIT 1",
+                        (ref,),
+                    ).fetchone()
+                    session_info[ref] = (str(one[0] or ""), str(one[1] or ""), str(one[2] or "")) if one else ("", "", "")
+                return session_info[ref]
+
+            for row in rows:
                 text = str(row["text"] or "").strip()
-                if len(text) < 3:
+                if not self._owner_voice(text) or repeats.get(text[:200], 0) >= 3:
                     continue
-                prompts.append(
-                    {
-                        "source_ref": f"{row['source_name']}:{row['session_id']}",
-                        "ts": row["ts"],
-                        "cwd": row["cwd"],
-                        "text": text[:600],
-                    }
-                )
-            for row in conn.execute(
-                "SELECT cwd, COUNT(*) AS prompts, COUNT(DISTINCT session_id) AS sessions, MAX(ts) AS last "
-                "FROM prompt_history WHERE ts >= ? GROUP BY cwd ORDER BY prompts DESC LIMIT 25",
-                (week,),
-            ):
-                week_projects.append(dict(row))
-            for row in conn.execute(
-                "SELECT source_ref, MAX(source_name) AS source_name, MAX(updated_at) AS updated_at, COUNT(*) AS chunks "
-                "FROM trajectory_chunks GROUP BY source_ref HAVING MAX(updated_at) >= ? "
-                "ORDER BY updated_at DESC LIMIT 60",
-                (since,),
-            ):
-                detail = conn.execute(
-                    "SELECT title, cwd FROM trajectory_chunks WHERE source_ref = ? LIMIT 1",
-                    (row["source_ref"],),
-                ).fetchone()
-                new_chunks = conn.execute(
-                    "SELECT COUNT(*) FROM trajectory_chunks WHERE source_ref = ? AND updated_at >= ?",
-                    (row["source_ref"], since),
-                ).fetchone()[0]
-                sessions.append(
-                    {
-                        "source_ref": row["source_ref"],
-                        "title": (detail["title"] if detail else "")[:120],
-                        "cwd": detail["cwd"] if detail else "",
-                        "updated_at": row["updated_at"],
-                        "chunks": row["chunks"],
-                        "new_chunks": new_chunks,
-                    }
-                )
-        prompted_refs = {p["source_ref"] for p in prompts}
-        # Human-driven work first: sessions the owner typed into, then the
-        # most-changed others (agent runs they launched).
-        sessions.sort(key=lambda s: (s["source_ref"] not in prompted_refs, -int(s["new_chunks"])))
+                ref = f"{row['source_name']}:{row['session_id']}"
+                title, session_cwd, origin = info(ref)
+                if origin == "automated":
+                    continue
+                item = {
+                    "source_ref": ref,
+                    "ts": row["ts"],
+                    "project": self._project_name(str(row["cwd"] or "") or session_cwd),
+                    "text": text[:700],
+                }
+                if row["ts"] >= since:
+                    recent.append(item)
+                    titles[ref] = title[:100]
+                else:
+                    backdrop.append(item)
         return {
             "window_start": since,
             "window_end": now.isoformat(),
-            "prompts": prompts[-400:],
-            "sessions": sessions[:40],
-            "week_projects": week_projects,
+            "recent_prompts": recent[-350:],
+            "backdrop_prompts": backdrop[-500:],
+            "session_titles": titles,
             "previous": previous,
             "owner": self._owner_line(),
         }
+
+    @staticmethod
+    def _project_name(cwd: str) -> str:
+        base = cwd.rstrip("/").rsplit("/", 1)[-1] if cwd else ""
+        # ~/.nebula/agent/p-<hex>-<project> mirrors → the project's name.
+        return re.sub(r"^p-[0-9a-f]{6}-", "", base) or cwd
 
     def _owner_line(self) -> str:
         parts = []
@@ -287,28 +322,26 @@ class BriefingRunner:
             pass
         return "\n".join(parts)[:2500]
 
-    def _evidence_digest(self, evidence: dict[str, Any], *, max_prompts: int = 250) -> str:
+    def _voice_digest(self, evidence: dict[str, Any], *, recent: int = 350, backdrop: int = 250) -> str:
         lines = [
-            f"Window: {evidence['window_start']} → {evidence['window_end']} (UTC).",
-            "",
-            "## Sessions active in the window (human-typed first)",
+            "# What the owner typed — their own words, the primary signal",
+            f"## Since the last briefing ({_fmt_local(evidence['window_start'])} → now)",
         ]
-        for s in evidence["sessions"]:
-            lines.append(
-                f"- {s['source_ref']} | {s['title']} | cwd={s['cwd']} | "
-                f"last={_fmt_local(s['updated_at'])} | +{s['new_chunks']} chunks"
-            )
-        lines += ["", "## What the owner typed (chronological; local time)"]
-        for p in evidence["prompts"][-max_prompts:]:
-            lines.append(f"- [{_fmt_local(p['ts'])}] {p['source_ref']} ({p['cwd']}): {p['text'][:300]}")
-        lines += ["", "## Last 7 days, by project (prompts / sessions / last)"]
-        for w in evidence["week_projects"]:
-            lines.append(f"- {w['cwd']}: {w['prompts']} prompts, {w['sessions']} sessions, last {_fmt_local(w['last'])}")
+        for p in evidence["recent_prompts"][-recent:]:
+            title = evidence["session_titles"].get(p["source_ref"], "")
+            lines.append(f"- [{_fmt_local(p['ts'])}] ({p['project']}; {p['source_ref']}; “{title[:50]}”) {p['text'][:400]}")
+        lines += ["", "## Earlier, last two weeks (background)"]
+        for p in evidence["backdrop_prompts"][-backdrop:]:
+            lines.append(f"- [{p['ts'][:10]}] ({p['project']}) {p['text'][:240]}")
         if evidence["previous"]:
-            lines += ["", "## Open loops handed forward by previous briefings"]
-            for prev in evidence["previous"]:
+            lines += ["", "## Already covered by recent briefings (don't repeat)"]
+            for prev in evidence["previous"][:5]:
+                topics = ", ".join(str(t) for t in prev.get("topics") or [])
+                if topics:
+                    lines.append(f"- {prev['date']}: articles on {topics}")
                 for loop in prev.get("open_loops") or []:
-                    lines.append(f"- (from {prev['date']}) {json.dumps(loop, ensure_ascii=False)[:300]}")
+                    item = loop.get("item") if isinstance(loop, dict) else loop
+                    lines.append(f"- {prev['date']}: flagged “{str(item)[:160]}”")
         return "\n".join(lines)
 
     # ------------------------------------------------------------------- agents
@@ -346,140 +379,163 @@ class BriefingRunner:
     def _tool_section(self) -> str:
         tool = f"{self.state.config.mybot_tool_python} {self.state.config.mybot_tool_path}"
         web = (
-            "You also have WebSearch and WebFetch for outside research (papers, docs, "
-            "deadlines, tool releases, anything that sharpens a recommendation). Cite URLs."
+            "You have WebSearch and WebFetch for real research. Cite URLs."
             if self.web_research
             else "You have no web access."
         )
         return (
             "## Tools\n"
-            f"`{tool} trajectory-search -q \"...\" [--after YYYY-MM-DD]`, "
-            f"`{tool} trajectory-read --source-ref REF [--around-event N | --chunk-id C]`, "
-            f"`{tool} sql -q \"SELECT ...\"` (tables trajectory_chunks, prompt_history), "
-            f"`{tool} budget [--extend N --reason ...]`. "
-            "These read the owner's own Claude Code / Codex sessions. Read the actual "
-            "transcripts — titles and prompts are only pointers. " + web
+            f"`{tool} sql -q \"SELECT ts, cwd, text FROM prompt_history WHERE ...\"` — everything the "
+            "owner ever typed (the primary source); "
+            f"`{tool} trajectory-search -q \"...\" [--after YYYY-MM-DD]` and "
+            f"`{tool} trajectory-read --source-ref REF [--around-event N]` — the full sessions, "
+            "agent replies included. Agent output is long and full of terms the agents coined: "
+            "open it only to check a specific fact, never as the source of what the owner cares "
+            "about. " + web
         )
 
-    def plan(self, evidence: dict[str, Any]) -> list[dict[str, Any]]:
+    _AUDIENCE = (
+        "The owner already has a separate tool that watches each session and reports job "
+        "status and progress. This briefing must NOT recap sessions, runs, metrics or progress. "
+        "It exists for what that misses: ideas worth thinking about, and things that slipped "
+        "through the cracks across days and projects.\n\n"
+        "Write for the owner, not for an agent: plain, well-written English. Use the owner's "
+        "own words for their projects (see how they talk in their prompts). Do not use terms "
+        "the agents invented (internal run names, stage labels, metric nicknames) unless the "
+        "owner uses them too; if a technical term is needed, explain it in a phrase."
+    )
+
+    def scout(self, evidence: dict[str, Any]) -> dict[str, Any]:
         system = (
-            "You organize a researcher's recent work into workstreams for a morning briefing. "
-            "Output ONLY a JSON array, no prose."
+            "You read a researcher's own messages to their AI agents and figure out what is on "
+            "their mind. You are the scout for a morning 'pulse' written for them.\n\n"
+            + self._AUDIENCE + "\n\nOwner: " + (evidence.get("owner") or "") + "\n\n" + self._tool_section()
         )
         message = (
-            self._evidence_digest(evidence, max_prompts=150)
-            + "\n\nGroup this activity into at most "
-            f"{self.max_workstreams} workstreams that deserve a careful look (merge small related "
-            "items; drop pure noise like tool tinkering that ended). For each: "
-            '{"name": short name, "why": one line, "source_refs": [refs from the list], '
-            '"questions": [2-4 specific things an analyst should establish — e.g. did the run '
-            'finish, what did the owner promise to do next, what is blocked, any deadline]}. '
-            "Include open loops from previous briefings in the most relevant workstream."
+            self._voice_digest(evidence)
+            + "\n\nFrom the owner's OWN words above (use the tools only to clarify), produce JSON "
+            "with two lists:\n"
+            '"article_topics": 3–5 candidates for a short inspiring article. Each: {"topic": '
+            '"...", "why_them": the specific things they said that make this relevant (quote '
+            'briefly), "angle": the idea or connection worth exploring — e.g. a method from '
+            "another field that fits a problem they keep hitting, a recent paper that changes "
+            "how to think about something they asked, a question they raised but never "
+            'answered}. Favor ideas, not tasks. Avoid topics already covered recently.\n'
+            '"overlooked_candidates": up to 12 things they may have let slip. Each: {"item": '
+            'plain one-line description in their words, "evidence": what they said and when '
+            '(source_ref), "kind": one of asked-but-never-followed-up | promised-someone | '
+            "idea-floated-and-dropped | started-then-abandoned | cross-project-connection | "
+            'deadline}. Only things they would plausibly NOT notice by glancing at their '
+            "active sessions.\n"
+            'Also "vocabulary": 10–25 terms/phrases the owner actually uses for their work, and '
+            '"agent_jargon_to_avoid": terms that appear only in agent output.\n'
+            "Output ONLY the JSON object."
         )
-        text = self._agent(label="planner", system=system, message=message,
-                           effort=self.planner_effort, tools=False, web=False)
-        match = re.search(r"\[.*\]", text, re.S)
+        text = self._agent(label="scout", system=system, message=message,
+                           effort=self.analyst_effort, tools=True, web=False)
+        match = re.search(r"\{.*\}", text, re.S)
         try:
-            items = json.loads(match.group(0)) if match else []
+            data = json.loads(match.group(0)) if match else {}
         except json.JSONDecodeError:
-            items = []
-        items = [item for item in items if isinstance(item, dict) and item.get("name")]
-        if not items:
-            refs = [s["source_ref"] for s in evidence["sessions"][:8]]
-            items = [{"name": "Recent work", "why": "fallback", "source_refs": refs, "questions": []}]
-        return items[: self.max_workstreams]
+            data = {}
+        return data if isinstance(data, dict) else {}
 
-    def analyze(self, evidence: dict[str, Any], workstreams: list[dict[str, Any]]) -> list[dict[str, Any]]:
-        digest = self._evidence_digest(evidence, max_prompts=120)
-        system = (
-            "You are an analyst on a chief of staff's team, preparing one section of a "
-            "researcher's morning briefing. Be rigorous: every claim must come from what you "
-            "read in their sessions (cite the source_ref and, when useful, the event/chunk), or "
-            "from a cited web source. Never guess at outcomes — if a job's result is not in the "
-            "record, say it is unknown and what to check.\n\n" + self._tool_section()
+    def _style_note(self, scout: dict[str, Any]) -> str:
+        vocab = ", ".join(str(v) for v in (scout.get("vocabulary") or [])[:25])
+        avoid = ", ".join(str(v) for v in (scout.get("agent_jargon_to_avoid") or [])[:25])
+        return (
+            (f"The owner's own vocabulary: {vocab}.\n" if vocab else "")
+            + (f"Agent-coined terms to avoid (or explain): {avoid}.\n" if avoid else "")
         )
-        done = [0]
 
-        def one(ws: dict[str, Any]) -> dict[str, Any]:
+    def write_articles(self, evidence: dict[str, Any], scout: dict[str, Any]) -> list[dict[str, Any]]:
+        topics = [t for t in scout.get("article_topics") or [] if isinstance(t, dict)][:3]
+        if not topics:
+            return []
+        system = (
+            "You write a short, genuinely interesting article for one specific researcher — "
+            "like a great science writer who knows exactly what they are working on. You do "
+            "real research first (read sources, not just abstracts), then write.\n\n"
+            + self._AUDIENCE + "\n" + self._style_note(scout)
+            + "\nOwner: " + (evidence.get("owner") or "") + "\n\n" + self._tool_section()
+        )
+
+        def one(topic: dict[str, Any]) -> dict[str, Any]:
             message = (
-                f"# Workstream: {ws.get('name')}\nWhy it matters: {ws.get('why','')}\n"
-                f"Sessions: {', '.join(ws.get('source_refs') or [])}\n"
-                f"Questions to establish: {json.dumps(ws.get('questions') or [], ensure_ascii=False)}\n\n"
-                "Context (all recent activity, for orientation):\n" + digest + "\n\n"
-                "Dig into this workstream's sessions — read the last stretch of each, plus "
-                "anything older the questions need. Then report, in markdown:\n"
-                "1. **State** — where it stands now, concretely (numbers, file/job names).\n"
-                "2. **Since last briefing** — what got done or decided.\n"
-                "3. **Open loops** — things the owner said they would do, asked an agent to do, "
-                "or left running/unverified; who/what is waiting on them; any dates.\n"
-                "4. **Risks / blockers** — anything likely to bite today or this week.\n"
-                "5. **Suggestions** — specific next steps worth taking, with reasoning; use web "
-                "research where it adds something real (a relevant paper, a known bug/fix, a "
-                "deadline). Skip generic advice.\n"
-                "End with a line `EVIDENCE:` listing the source_refs (and URLs) you relied on."
+                f"Candidate topic: {json.dumps(topic, ensure_ascii=False)}\n\n"
+                "Research it properly (web: papers, docs, talks; their own prompts for what "
+                "they actually said). If, after researching, the idea turns out weak, obvious "
+                "to them, or not actually connected to their work, reply only with `SKIP: "
+                "<reason>`.\n\nOtherwise write the article (350–600 words): a title; open with "
+                "the connection to something they said (paraphrase, say roughly when); explain "
+                "the idea clearly from first principles; give one or two concrete examples; end "
+                "with what they could try or think about, in a sentence or two. Cite sources "
+                "inline as links. No bullet-point dumps — prose."
             )
-            text = self._agent(label=f"analyst:{ws.get('name')}", system=system, message=message,
-                               effort=self.analyst_effort, tools=True, web=True)
-            done[0] += 1
-            self.status["stage"] = f"analysts ({done[0]}/{len(workstreams)})"
-            return {"workstream": ws.get("name"), "report": text}
+            text = self._agent(label=f"article:{str(topic.get('topic'))[:40]}", system=system,
+                               message=message, effort=self.chief_effort, tools=True, web=True)
+            return {"topic": topic.get("topic"), "text": text}
 
         with ThreadPoolExecutor(max_workers=max(1, self.parallel)) as pool:
-            return list(pool.map(one, workstreams))
+            results = list(pool.map(one, topics))
+        return [r for r in results if r["text"] and not r["text"].lstrip().upper().startswith("SKIP")]
 
-    def chief_of_staff(self, evidence: dict[str, Any], workstreams: list[dict[str, Any]],
-                       reports: list[dict[str, Any]]) -> str:
-        previous = "\n\n".join(
-            f"### Briefing {p['date']}\n{p['briefing'][:2500]}" for p in evidence["previous"][:2]
-        ) or "(none — this is the first briefing)"
+    def check_overlooked(self, evidence: dict[str, Any], scout: dict[str, Any]) -> str:
+        candidates = [c for c in scout.get("overlooked_candidates") or [] if isinstance(c, dict)]
+        if not candidates:
+            return ""
         system = (
-            "You are the owner's chief of staff: senior, discerning, proactive. You think hard "
-            "about what actually matters for them today, not about summarizing activity. You "
-            "verify before you assert, and you do your own extra research when a point deserves "
-            "it.\n\nThe owner: " + (evidence.get("owner") or "a principal investigator running "
-            "a computational genomics lab, who works through many Claude Code / Codex sessions.")
-            + "\n\n" + self._tool_section()
+            "You check whether things a researcher mentioned really slipped through the cracks. "
+            "Be skeptical: most candidates were handled somewhere later.\n\n"
+            + self._AUDIENCE + "\n" + self._style_note(scout) + "\n\n" + self._tool_section()
         )
         message = (
-            "Analyst reports for today's briefing:\n\n"
-            + "\n\n".join(f"## {r['workstream']}\n{r['report']}" for r in reports)
-            + "\n\n# Previous briefings (do not repeat what is unchanged; follow up on what was "
-            "flagged)\n" + previous
-            + "\n\n# Activity digest\n" + self._evidence_digest(evidence, max_prompts=80)
-            + "\n\nWrite this morning's briefing. They will read it at 9–10am, likely on a phone. "
-            "Structure:\n"
-            "**Today, in one line** — the single most important thing.\n"
-            "**Top priorities** (≤3) — what to do first and why now.\n"
-            "**Don't forget** — commitments, promised follow-ups, things left running or "
-            "unverified, people waiting on them; with dates where known.\n"
-            "**Heads-up** — risks, blockers, anomalies worth a look.\n"
-            "**Worth considering** — 1–3 sharper ideas: a better approach, a relevant new "
-            "paper/tool, a connection across workstreams. Research these properly.\n"
-            "Rules: every item cites its evidence compactly (session ref like `codex:019f…` "
-            "or a URL). Be concrete (names, numbers, paths). Cut anything they obviously "
-            "already know or that has no action. Aim for what a great human chief of staff "
-            "would write in ~400–700 words.\n\n"
-            "After the briefing, output a fenced ```json block: a list of open loops to carry "
-            "forward to tomorrow, each {\"item\": ..., \"source_ref\": ..., \"due\": optional}."
+            "Candidates:\n" + json.dumps(candidates, ensure_ascii=False, indent=1)
+            + "\n\nFor each, look for evidence it was later done, answered, or deliberately "
+            "dropped (search their later prompts first, then sessions). Keep only the ones that "
+            "still look open and that they would plausibly not notice on their own. For each "
+            "keeper write ONE plain line in their words (what, why it may matter), plus a short "
+            "pointer they can follow up with (a session ref or the day they mentioned it). No "
+            "details beyond that — they will follow up themselves. Output the keepers as a "
+            "markdown list, at most 7, most important first."
         )
-        return self._agent(label="chief-of-staff", system=system, message=message,
-                           effort=self.chief_effort, tools=True, web=True)
+        return self._agent(label="overlooked", system=system, message=message,
+                           effort=self.analyst_effort, tools=True, web=False)
 
-    def verify(self, evidence: dict[str, Any], reports: list[dict[str, Any]], draft: str) -> str:
+    def edit(self, evidence: dict[str, Any], articles: list[dict[str, Any]], overlooked: str) -> str:
         system = (
-            "You are the fact-checker for a chief of staff's morning briefing. Your job is to "
-            "make sure nothing in it is wrong or unsupported.\n\n" + self._tool_section()
+            "You are the editor of a one-reader morning pulse. Taste matters: cut anything "
+            "generic, anything that recaps their sessions, and any jargon they would not use.\n\n"
+            + self._AUDIENCE + "\nOwner: " + (evidence.get("owner") or "")
+        )
+        previous = "\n\n".join(f"### {p['date']}\n{p['briefing'][:1500]}" for p in evidence["previous"][:2]) or "(none)"
+        message = (
+            "Articles (pick the best one or two; if none is genuinely good, use none):\n\n"
+            + "\n\n---\n\n".join(f"## {a['topic']}\n{a['text']}" for a in articles)
+            + "\n\nOverlooked items (already checked):\n" + (overlooked or "(none)")
+            + "\n\nRecent briefings, to avoid repeating:\n" + previous
+            + "\n\nAssemble today's pulse:\n"
+            "1. One short opening line (no greeting fluff).\n"
+            "2. **You may have overlooked** — the list, at most 7 one-liners with their pointers.\n"
+            "3. The article(s), lightly edited for clarity and the owner's vocabulary.\n"
+            "Then a fenced ```json block: {\"topics\": [article topics used], \"overlooked\": "
+            "[{\"item\": ..., \"pointer\": ...}]} so tomorrow can avoid repeats and follow up."
+        )
+        return self._agent(label="editor", system=system, message=message,
+                           effort=self.verify_effort, tools=False, web=False)
+
+    def verify(self, evidence: dict[str, Any], draft: str) -> str:
+        system = (
+            "You are the last check before a morning pulse reaches its reader.\n\n"
+            + self._AUDIENCE + "\n\n" + self._tool_section()
         )
         message = (
-            "Draft briefing:\n\n" + draft
-            + "\n\nAnalyst reports it was built from:\n\n"
-            + "\n\n".join(f"## {r['workstream']}\n{r['report']}" for r in reports)
-            + "\n\nCheck every factual claim in the draft that the reports do not clearly "
-            "support — and spot-check the most important ones even if they do — by reading the "
-            "cited sessions (or URLs). Fix wrong facts, soften unsupported ones (\"unclear "
-            "whether…\"), remove items you cannot support at all. Keep the structure, voice and "
-            "length. Output ONLY the corrected briefing followed by the (corrected) ```json "
-            "open-loops block — no commentary about your checking."
+            "Draft:\n\n" + draft
+            + "\n\nCheck: (1) every factual claim about the owner's own work is supported — "
+            "verify the overlooked items' pointers quickly with the tools; fix or drop what is "
+            "wrong; (2) every external claim matches its cited source; (3) no session-status "
+            "recap slipped in; (4) no unexplained agent jargon — rewrite in plain words. Keep "
+            "the voice and length. Output ONLY the final pulse followed by the ```json block."
         )
         text = self._agent(label="verifier", system=system, message=message,
                            effort=self.verify_effort, tools=True, web=True)
@@ -488,34 +544,29 @@ class BriefingRunner:
     # ----------------------------------------------------------------- outputs
 
     @staticmethod
-    def _split_open_loops(text: str) -> tuple[str, list[Any]]:
+    def _split_carry(text: str) -> tuple[str, Any]:
         match = None
         for match in re.finditer(r"```json\s*(.*?)```", text, re.S):
             pass
         if not match:
-            return text.strip(), []
+            return text.strip(), {}
         try:
-            loops = json.loads(match.group(1))
+            carry = json.loads(match.group(1))
         except json.JSONDecodeError:
-            loops = []
+            carry = {}
         body = (text[: match.start()] + text[match.end():]).strip()
-        return body, loops if isinstance(loops, list) else []
+        return body, carry if isinstance(carry, (dict, list)) else {}
 
     def _quiet_day_note(self, evidence: dict[str, Any]) -> str:
-        carried = [loop for prev in evidence["previous"][:1] for loop in prev.get("open_loops") or []]
-        lines = ["**Quiet stretch** — no session activity since the last briefing."]
-        if carried:
-            lines.append("\n**Still open from before:**")
-            lines += [f"- {loop.get('item') if isinstance(loop, dict) else loop}" for loop in carried]
-        return "\n".join(lines) + "\n\n```json\n" + json.dumps(carried) + "\n```"
+        return "**Quiet stretch** — nothing new from you since the last pulse.\n\n```json\n{}\n```"
 
     def _write(self, day: str, text: str, record: dict[str, Any]) -> None:
-        header = f"# Morning briefing — {datetime.fromisoformat(day).strftime('%A %b %-d')}\n\n"
+        header = f"# Morning pulse — {datetime.fromisoformat(day).strftime('%A %b %-d')}\n\n"
         (self.dir / f"{day}.md").write_text(header + text + "\n")
 
     def deliver(self, day: str, text: str) -> dict[str, Any]:
         owner = self.state.config.imported_owner_actor_id
-        title = f"Morning briefing — {datetime.fromisoformat(day).strftime('%a %b %-d')}"
+        title = f"Morning pulse — {datetime.fromisoformat(day).strftime('%a %b %-d')}"
         sessions = self.state.sessions
         delivered: dict[str, Any] = {}
         # A menu-app thread: shows up in Ask history; follow-ups continue in place.
