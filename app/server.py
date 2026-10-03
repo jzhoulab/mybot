@@ -1399,11 +1399,17 @@ class ProviderClient:
         tool_env: dict[str, str] | None = None,
         model: str | None = None,
         reasoning_effort: str | None = None,
+        search: bool = False,
+        timeout: int | None = None,
     ) -> dict[str, Any]:
         if self.config.codex_disable_backend_resume:
             backend_session_id = None
 
         cmd = [self.config.codex_command]
+        if search:
+            # Native web_search tool (background jobs only). A top-level flag:
+            # it must precede the `exec` subcommand.
+            cmd.append("--search")
         if self.config.codex_service_tier:
             cmd.extend(["-c", f'service_tier="{self.config.codex_service_tier}"'])
         # Reasoning effort per call: the internal query planner (ephemeral) runs
@@ -1445,7 +1451,7 @@ class ProviderClient:
         env = os.environ.copy()
         if tool_env:
             env.update(tool_env)
-        proc = subprocess.run(cmd, capture_output=True, text=True, env=env)
+        proc = subprocess.run(cmd, capture_output=True, text=True, env=env, timeout=timeout)
         if proc.returncode != 0:
             stderr = normalize_text(proc.stderr, 1500)
             stdout = normalize_text(proc.stdout, 1500)

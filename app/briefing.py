@@ -95,7 +95,10 @@ class BriefingRunner:
         self.chief_effort = _env("BRIEFING_CHIEF_EFFORT", "max")
         self.verify_effort = _env("BRIEFING_VERIFY_EFFORT", "high")
         self.planner_effort = _env("BRIEFING_PLANNER_EFFORT", "medium")
-        self.model = _env("BRIEFING_MODEL", "")
+        # Each engine uses its strongest model by default.
+        self.model = (
+            _env("BRIEFING_GPT_MODEL", "gpt-6-astra") if engine == "gpt" else _env("BRIEFING_MODEL", "fable")
+        )
         self.web_research = _env_bool("BRIEFING_WEB_RESEARCH", True)
         self.max_workstreams = int(_env("BRIEFING_MAX_WORKSTREAMS", "6"))
         self.parallel = int(_env("BRIEFING_PARALLEL_ANALYSTS", "3"))
@@ -250,7 +253,16 @@ class BriefingRunner:
     def gather(self) -> dict[str, Any]:
         previous = self._previous()
         now = datetime.now(timezone.utc)
-        since = str(previous[0]["started_at"]) if previous and previous[0].get("started_at") else (now - timedelta(hours=36)).isoformat()
+        # One shared window across engines (anchored on the latest run of ANY
+        # engine) so side-by-side pulses are comparable.
+        anchors = []
+        for path in self.dir.glob("????-??-??*.json"):
+            try:
+                anchors.append(str(json.loads(path.read_text()).get("started_at") or ""))
+            except (OSError, json.JSONDecodeError):
+                continue
+        anchors = [a for a in anchors if a]
+        since = max(anchors) if anchors else (now - timedelta(hours=36)).isoformat()
         since = max(since, (now - timedelta(days=4)).isoformat())
         backdrop_since = (now - timedelta(days=14)).isoformat()
         db = self.state.config.trajectory_index_db_path
@@ -372,16 +384,29 @@ class BriefingRunner:
             else None
         )
         started = time.time()
-        result = provider.run_claude_task(
-            system_prompt=system,
-            message=message,
-            model=model,
-            effort=effort,
-            with_tools=tools,
-            extra_tools=["WebSearch", "WebFetch"] if (web and self.web_research) else [],
-            tool_env=tool_env,
-            timeout=self.agent_timeout,
-        )
+        if self.engine == "gpt":
+            # Codex has no separate system prompt in exec mode; it always has
+            # its (sandboxed) shell, and --search turns on live web search.
+            result = provider._run_codex(
+                prompt=f"{system}\n\n---\n\n{message}",
+                backend_session_id=None,
+                tool_env=tool_env,
+                model=self.model,
+                reasoning_effort=effort,
+                search=bool(web and self.web_research),
+                timeout=self.agent_timeout,
+            )
+        else:
+            result = provider.run_claude_task(
+                system_prompt=system,
+                message=message,
+                model=model,
+                effort=effort,
+                with_tools=tools,
+                extra_tools=["WebSearch", "WebFetch"] if (web and self.web_research) else [],
+                tool_env=tool_env,
+                timeout=self.agent_timeout,
+            )
         log.info("briefing %s finished in %.0fs", label, time.time() - started)
         return str(result.get("text") or "").strip()
 
