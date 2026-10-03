@@ -548,10 +548,12 @@ class BriefingRunner:
             + "\n\n---\n\n".join(f"## {a['topic']}\n{a['text']}" for a in articles)
             + "\n\nOverlooked items (already checked):\n" + (overlooked or "(none)")
             + "\n\nRecent briefings, to avoid repeating:\n" + previous
-            + "\n\nAssemble today's pulse:\n"
-            "1. One short opening line (no greeting fluff).\n"
-            "2. **You may have overlooked** — the list, at most 7 one-liners with their pointers.\n"
-            "3. The article(s), lightly edited for clarity and the owner's vocabulary.\n"
+            + "\n\nAssemble today's pulse in EXACTLY this markdown shape (the app parses it):\n"
+            "1. One short opening line (no greeting fluff), no heading.\n"
+            "2. A line `## You may have overlooked`, then the items as `- ` bullets (at most 7 "
+            "one-liners, each with its pointer).\n"
+            "3. Each article under its own `## <article title>` heading, lightly edited for "
+            "clarity and the owner's vocabulary.\n"
             "Then a fenced ```json block: {\"topics\": [article topics used], \"overlooked\": "
             "[{\"item\": ..., \"pointer\": ...}]} so tomorrow can avoid repeats and follow up."
         )
@@ -569,7 +571,9 @@ class BriefingRunner:
             "verify the overlooked items' pointers quickly with the tools; fix or drop what is "
             "wrong; (2) every external claim matches its cited source; (3) no session-status "
             "recap slipped in; (4) no unexplained agent jargon — rewrite in plain words. Keep "
-            "the voice and length. Output ONLY the final pulse followed by the ```json block."
+            "the voice, length and markdown shape (`## You may have overlooked` with `- ` bullets, "
+            "then one `## <title>` per article). Output ONLY the final pulse followed by the "
+            "```json block."
         )
         text = self._agent(label="verifier", system=system, message=message,
                            effort=self.verify_effort, tools=True, web=True)
