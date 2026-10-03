@@ -207,6 +207,25 @@ class ChatbotApi:
 
         return await asyncio.to_thread(_get)
 
+    async def outbox(self, platform: str = "discord") -> list[dict[str, Any]]:
+        """Messages the server wants pushed (e.g. the daily briefing)."""
+        def _get() -> list[dict[str, Any]]:
+            request = urllib.request.Request(
+                url=f"{self.config.chatbot_base_url.rstrip('/')}/outbox?platform={platform}", method="GET"
+            )
+            try:
+                with urllib.request.urlopen(request, timeout=15) as response:
+                    parsed = json.loads(response.read().decode("utf-8"))
+            except (urllib.error.URLError, json.JSONDecodeError, OSError):
+                return []
+            items = parsed.get("items") if isinstance(parsed, dict) else None
+            return [item for item in items or [] if isinstance(item, dict)]
+
+        return await asyncio.to_thread(_get)
+
+    async def outbox_ack(self, item_id: str) -> None:
+        await asyncio.to_thread(self._post_json, "/outbox/ack", {"id": item_id})
+
     def _post_json(self, path: str, payload: dict[str, Any]) -> dict[str, Any]:
         request = urllib.request.Request(
             url=f"{self.config.chatbot_base_url.rstrip('/')}{path}",
@@ -442,7 +461,29 @@ class DiscordBridgeClient(discord.Client):
                 allowed_mentions=self.safe_mentions,
             )
 
+    async def _outbox_loop(self) -> None:
+        """Deliver server-initiated messages (the morning briefing) as DMs.
+        Each item is acknowledged only after it is sent, so a bridge restart
+        or a Discord outage delays delivery instead of losing it."""
+        await self.wait_until_ready()
+        while not self.is_closed():
+            try:
+                for item in await self.api.outbox("discord"):
+                    target = str(item.get("target_user_id") or "")
+                    if not target.isdigit():
+                        await self.api.outbox_ack(str(item.get("id")))
+                        continue
+                    user = self.get_user(int(target)) or await self.fetch_user(int(target))
+                    channel = user.dm_channel or await user.create_dm()
+                    await self._send_channel_text(channel, str(item.get("text") or ""))
+                    await self.api.outbox_ack(str(item.get("id")))
+                    log.info("delivered outbox item %s to %s", item.get("id"), target)
+            except Exception as exc:  # keep the loop alive; retry next tick
+                log.warning("outbox delivery failed: %s", exc)
+            await asyncio.sleep(60)
+
     async def setup_hook(self) -> None:
+        self.loop.create_task(self._outbox_loop())
         if self.config.command_guild_id:
             guild = discord.Object(id=self.config.command_guild_id)
             self.tree.copy_global_to(guild=guild)

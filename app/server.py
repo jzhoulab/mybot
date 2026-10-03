@@ -16,6 +16,7 @@ import sys
 import threading
 import time
 import urllib.error
+import urllib.parse
 import urllib.request
 import uuid
 from dataclasses import dataclass
@@ -1226,6 +1227,62 @@ class ProviderClient:
             "usage": (raw or {}).get("usage") if isinstance(raw, dict) else None,
         }
 
+    def run_claude_task(
+        self,
+        *,
+        system_prompt: str,
+        message: str,
+        model: str,
+        effort: str,
+        with_tools: bool,
+        extra_tools: list[str] | None = None,
+        tool_env: dict[str, str] | None = None,
+        timeout: int = 2700,
+    ) -> dict[str, Any]:
+        """One standalone Claude agent turn for background jobs (the daily
+        briefing): same sandboxed Bash as the answer agent, plus optional
+        built-in tools (e.g. WebSearch/WebFetch, which run outside the Bash
+        sandbox), an explicit effort, and a wall-clock timeout."""
+        cmd = [self.config.claude_command, "-p", "--model", model,
+               "--permission-mode", "default", "--output-format", "json"]
+        if effort:
+            cmd.extend(["--effort", effort])
+        if system_prompt:
+            cmd.extend(["--append-system-prompt", system_prompt])
+        allowed: list[str] = []
+        if with_tools:
+            if self.config.claude_bash_sandbox:
+                cmd.extend(["--settings", self._claude_sandbox_settings_json()])
+                allowed.append("Bash")
+            else:
+                allowed.append(f"Bash({self.config.mybot_tool_python} {self.config.mybot_tool_path}:*)")
+        allowed.extend(extra_tools or [])
+        if allowed:
+            cmd.extend(["--allowedTools", *allowed])
+        env = os.environ.copy()
+        if tool_env:
+            env.update(tool_env)
+        proc = subprocess.run(
+            cmd, input=message, capture_output=True, text=True, env=env,
+            cwd=str(Path(self.config.codex_cwd).expanduser()), timeout=timeout,
+        )
+        if proc.returncode != 0:
+            raise RuntimeError(
+                f"Claude CLI failed (exit {proc.returncode}). "
+                f"stderr={normalize_text(proc.stderr, 1500)} stdout={normalize_text(proc.stdout, 800)}"
+            )
+        try:
+            raw = json.loads(proc.stdout)
+        except json.JSONDecodeError:
+            return {"text": proc.stdout.strip(), "usage": None}
+        if isinstance(raw, dict) and raw.get("is_error"):
+            raise RuntimeError(f"Claude CLI reported error: {str(raw.get('result') or '')[:500]}")
+        return {
+            "text": str((raw or {}).get("result") or "").strip() if isinstance(raw, dict) else "",
+            "usage": raw.get("usage") if isinstance(raw, dict) else None,
+            "cost_usd": raw.get("total_cost_usd") if isinstance(raw, dict) else None,
+        }
+
     def _run_claude_stream(self, cmd, message, env, on_event, cwd: str | None = None) -> dict[str, Any]:
         """Popen the claude CLI in stream-json mode and forward events via
         on_event({kind, ...}) as they arrive. Accumulates the final answer text.
@@ -1671,6 +1728,7 @@ class AppState:
         # logs outlive their transcripts, so this answers even when a session
         # file was cleaned up. Same DB as the chunk index so SQL reaches it.
         self.prompt_history = PromptHistoryStore(config.trajectory_index_db_path)
+        self.briefing: Any = None  # BriefingRunner, created in main() once state is complete
         self.access_config = load_access_config()
         self.memory_index: dict[str, Any] | None = None
         self.trajectory_index_maintenance_lock = threading.Lock()
@@ -3700,6 +3758,24 @@ class ChatHandler(BaseHTTPRequestHandler):
         if path == "/gui/state":
             self.respond_json(200, build_gui_state(self.server.state))
             return
+        if path == "/briefing/status":
+            runner = self.server.state.briefing
+            latest = sorted(runner.dir.glob("*.md"))[-1:] if runner else []
+            self.respond_json(200, {
+                "ok": True,
+                "enabled": bool(runner and runner.enabled),
+                "at": runner.at if runner else "",
+                "status": runner.status if runner else {},
+                "latest": latest[0].name if latest else "",
+                "latest_text": latest[0].read_text() if latest else "",
+            })
+            return
+        if path == "/outbox":
+            query = urllib.parse.parse_qs(self.path.split("?", 1)[1] if "?" in self.path else "")
+            platform = (query.get("platform") or ["discord"])[0]
+            runner = self.server.state.briefing
+            self.respond_json(200, {"ok": True, "items": runner.outbox_pending(platform) if runner else []})
+            return
         if path == "/health":
             cfg = self.server.state.config
             active = self.server.state.provider.active_model()
@@ -3777,6 +3853,24 @@ class ChatHandler(BaseHTTPRequestHandler):
             return
         if self.path == "/gui/scope":
             self.handle_gui_scope(body)
+            return
+        if self.path == "/briefing/run":
+            runner = self.server.state.briefing
+            if runner is None:
+                self.respond_json(503, {"ok": False, "error": "briefing not initialized"})
+                return
+            if runner.status.get("running"):
+                self.respond_json(409, {"ok": False, "error": "already running", "status": runner.status})
+                return
+            force = coerce_bool(body.get("force"), False)
+            threading.Thread(target=lambda: runner.run(force=force), name="briefing-manual", daemon=True).start()
+            self.respond_json(202, {"ok": True, "started": True})
+            return
+        if self.path == "/outbox/ack":
+            runner = self.server.state.briefing
+            if runner is not None and body.get("id"):
+                runner.outbox_ack(str(body["id"]))
+            self.respond_json(200, {"ok": True})
             return
         if self.path == "/memory/rebuild":
             self.handle_memory_rebuild(body)
@@ -5121,6 +5215,10 @@ def main() -> None:
     # search otherwise pays tens of seconds out of the agent's retrieval budget.
     state.trajectory_chunk_index.warm_vector_cache_async()
     state.maybe_start_identity_onboarding()
+    from app.briefing import BriefingRunner
+
+    state.briefing = BriefingRunner(state)
+    state.briefing.start_scheduler()
     server = StandaloneServer((config.host, config.port), ChatHandler, state)
     print(f"Listening on http://{config.host}:{config.port}")
     server.serve_forever()
