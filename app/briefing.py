@@ -584,20 +584,28 @@ class BriefingRunner:
     @staticmethod
     def structure(text: str) -> list[dict[str, Any]]:
         """Split the verified pulse into app sections WITHOUT rewording it:
-        an intro, the overlooked list (one entry per item), and articles."""
+        an intro, the overlooked list (one entry per item), and articles.
+        Any heading level starts a new section (models vary between # and
+        ##); the overlooked list also ends at a horizontal rule, so bullets
+        inside articles never become overlooked items."""
         sections: list[dict[str, Any]] = []
-        parts = re.split(r"(?m)^##\s+", text)
-        intro = parts[0].strip().strip("-").strip()
-        if intro:
-            sections.append({"kind": "intro", "title": "", "body": intro})
-        for part in parts[1:]:
-            title, _, body = part.partition("\n")
-            title = title.strip()
-            body = re.sub(r"(?m)^-{3,}\s*$", "", body).strip()
+        blocks: list[tuple[str, list[str]]] = [("", [])]
+        for line in text.splitlines():
+            heading = re.match(r"^\s{0,3}#{1,4}\s+(.*\S)\s*$", line)
+            if heading:
+                blocks.append((heading.group(1).strip("* ").strip(), []))
+            elif re.match(r"^\s*(-{3,}|\*{3,}|_{3,})\s*$", line):
+                blocks.append(("", []))
+            else:
+                blocks[-1][1].append(line)
+        for title, lines in blocks:
+            body = "\n".join(lines).strip()
+            if not title and not body:
+                continue
             if "overlook" in title.lower():
                 items: list[str] = []
                 notes: list[str] = []
-                for line in body.splitlines():
+                for line in lines:
                     if re.match(r"^\s*[-*]\s+", line):
                         items.append(re.sub(r"^\s*[-*]\s+", "", line).strip())
                     elif items and line.startswith(("  ", "\t")) and line.strip():
@@ -608,9 +616,13 @@ class BriefingRunner:
                     sections.append({"kind": "overlooked", "id": f"o{index}", "title": "", "body": item})
                 if notes:
                     sections.append({"kind": "note", "title": "", "body": "\n".join(notes)})
-            else:
+            elif title:
                 index = sum(1 for sec in sections if sec["kind"] == "article") + 1
                 sections.append({"kind": "article", "id": f"a{index}", "title": title, "body": body})
+            elif not sections:
+                sections.append({"kind": "intro", "title": "", "body": body.strip("*").strip()})
+            else:
+                sections.append({"kind": "note", "title": "", "body": body})
         return sections
 
     def make_actions(self, evidence: dict[str, Any], sections: list[dict[str, Any]]) -> list[dict[str, Any]]:
