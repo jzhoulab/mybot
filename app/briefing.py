@@ -191,6 +191,10 @@ class BriefingRunner:
             self.status["stage"] = "deliver"
             record["delivered"] = self.deliver(day, text)
             (self.dir / f"{day}{self.suffix}.json").write_text(json.dumps(record, indent=1, default=str))
+            try:
+                publish_for_hop(getattr(self.state, "briefings", {}) or {self.engine: self})
+            except Exception as exc:  # pragma: no cover - phone copy is best-effort
+                log.warning("could not publish pulse for hop: %s", exc)
             (self.dir / f"{day}{self.suffix}.failed").unlink(missing_ok=True)
             self.status["last"] = {"date": day, "ok": True, "seconds": record["seconds"]}
             log.info("daily briefing %s written in %.0fs", day, record["seconds"])
@@ -875,3 +879,74 @@ class BriefingRunner:
         if not path.exists():
             return set()
         return {line.strip() for line in path.read_text().splitlines() if line.strip()}
+
+
+# ------------------------------------------------------------- hop (phone)
+
+# The hop daemon serves files under /assets/ to its logged-in clients; the
+# hop iOS app already reads digest.json from there with its session cookie.
+# Write pulse.json beside it (to every candidate root, as digest.mjs does:
+# the daemon rebuilds the dev dist and wipes it) so the phone shows the pulse
+# natively with no new endpoint and no mybot port exposed.
+HOP_ASSET_ROOTS = [
+    Path.home() / "Code/hop2/hay/apps/web/dist/assets",
+    Path.home() / "Code/hop2/hay-web/assets",
+]
+PULSE_TASK_DIR = Path.home() / ".mybot" / "pulse-tasks"
+
+
+def _launch_command(engine: str, task_path: Path) -> str:
+    # The phone creates a hop session in the item's folder and types this
+    # one line. The task itself lives in a file, so nothing long or quoted
+    # crosses the terminal. `command` bypasses shell wrappers/functions.
+    if engine == "gpt":
+        return f"command codex --dangerously-bypass-approvals-and-sandbox \"$(cat '{task_path}')\""
+    return f"command claude --permission-mode bypassPermissions \"$(cat '{task_path}')\""
+
+
+def publish_for_hop(runners: dict[str, "BriefingRunner"]) -> dict[str, Any]:
+    roots = [root for root in HOP_ASSET_ROOTS if root.is_dir()]
+    if not roots:
+        return {"ok": False, "error": "no hop asset directory found"}
+    PULSE_TASK_DIR.mkdir(parents=True, exist_ok=True)
+    pulses = []
+    for engine, runner in runners.items():
+        try:
+            latest = runner.latest()
+        except (OSError, ValueError):
+            latest = None
+        if not latest:
+            continue
+        actions = []
+        for action in latest.get("actions") or []:
+            stem = f"{latest['date']}-{engine}-{action['id']}"
+            task_path = PULSE_TASK_DIR / f"{stem}.md"
+            task_path.write_text(
+                f"(Follow-up launched from mybot's morning pulse, {latest['date']}.)\n\n{action['prompt']}\n"
+            )
+            actions.append({
+                "id": action["id"],
+                "label": action.get("label") or "Follow up",
+                "cwd": action.get("cwd") or str(Path.home() / "Code"),
+                "session_name": f"pulse-{latest['date'][5:].replace('-', '')}-{engine}-{action['id']}",
+                "command": _launch_command(engine, task_path),
+            })
+        pulses.append({
+            "engine": engine,
+            "label": latest.get("label") or engine,
+            "date": latest.get("date"),
+            "title": latest.get("title"),
+            "sections": latest.get("sections") or [],
+            "actions": actions,
+        })
+    payload = json.dumps({"generated_at": datetime.now(timezone.utc).isoformat(), "pulses": pulses},
+                         ensure_ascii=False)
+    written = []
+    for root in roots:
+        target = root / "pulse.json"
+        tmp = root / ".pulse.json.tmp"
+        tmp.write_text(payload)
+        os.chmod(tmp, 0o600)
+        os.replace(tmp, target)
+        written.append(str(target))
+    return {"ok": True, "pulses": len(pulses), "written": written}

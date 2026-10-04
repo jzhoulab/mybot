@@ -3913,6 +3913,9 @@ class ChatHandler(BaseHTTPRequestHandler):
                     data["sections"] = runner.structure(str(data.get("briefing") or ""))
                     data["actions"] = runner.make_actions({}, data["sections"])
                     path.write_text(json.dumps(data, indent=1, default=str))
+                    from app.briefing import publish_for_hop
+
+                    publish_for_hop(self.server.state.briefings)
                     result = {"ok": True, "actions": len(data["actions"])}
             except (OSError, ValueError, RuntimeError) as exc:
                 self.respond_json(400, {"ok": False, "error": str(exc)})
@@ -5275,6 +5278,12 @@ def main() -> None:
     state.briefing = state.briefings.get("claude") or next(iter(state.briefings.values()))
     for runner in state.briefings.values():
         runner.start_scheduler()
+    try:
+        from app.briefing import publish_for_hop
+
+        publish_for_hop(state.briefings)
+    except Exception as exc:  # pragma: no cover
+        log.warning("could not publish pulse for hop: %s", exc)
     server = StandaloneServer((config.host, config.port), ChatHandler, state)
     print(f"Listening on http://{config.host}:{config.port}")
     server.serve_forever()
