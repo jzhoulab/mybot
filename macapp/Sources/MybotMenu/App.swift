@@ -14,6 +14,13 @@ struct MybotMenuApp: App {
                 .renderingMode(.template)
         }
         .menuBarExtraStyle(.window)
+
+        // A roomier, resizable place to read the pulse (opened from its tab).
+        Window("Morning pulse", id: "pulse") {
+            PulseView(model: model, scale: 1.2, inWindow: true)
+                .frame(minWidth: 520, minHeight: 500)
+        }
+        .defaultSize(width: 820, height: 940)
     }
 }
 
@@ -2022,7 +2029,35 @@ enum UIExporter {
         try? png.write(to: URL(fileURLWithPath: "\(dir)/\(name).png"))
     }
 
+    @MainActor static func exportPulse() {
+        // Today's real pulse from disk, rendered at popover and window scale.
+        let dir = MybotConfig.shared.repoRoot.appendingPathComponent("state/briefings")
+        guard let files = try? FileManager.default.contentsOfDirectory(atPath: dir.path),
+              let latest = files.filter({ $0.range(of: #"^\d{4}-\d{2}-\d{2}\.json$"#, options: .regularExpression) != nil }).sorted().last,
+              let data = try? Data(contentsOf: dir.appendingPathComponent(latest)),
+              let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else { return }
+        let sections = ((obj["sections"] as? [[String: Any]]) ?? []).enumerated().map { index, s in
+            PulseSection(id: (s["id"] as? String) ?? "s\(index)", kind: (s["kind"] as? String) ?? "note",
+                         title: (s["title"] as? String) ?? "", body: (s["body"] as? String) ?? "")
+        }
+        var actions: [String: PulseAction] = [:]
+        for a in (obj["actions"] as? [[String: Any]]) ?? [] {
+            if let id = a["id"] as? String { actions[id] = PulseAction(id: id, label: (a["label"] as? String) ?? "Follow up") }
+        }
+        let pulse = Pulse(engine: "claude", label: "Claude", date: (obj["date"] as? String) ?? "",
+                          title: "Morning pulse", sections: sections, actions: actions, running: false, stage: "")
+        let model = AppModel.sample()
+        for (name, scheme) in [("pulse-dark", ColorScheme.dark), ("pulse-light", ColorScheme.light)] {
+            let bg = scheme == .dark ? Color(white: 0.12) : Color(white: 0.97)
+            write(PulseView(model: model).sectionsStack(pulse).frame(width: 480)
+                    .environment(\.colorScheme, scheme).background(bg), name)
+            write(PulseView(model: model, scale: 1.2, inWindow: true).sectionsStack(pulse).frame(width: 820)
+                    .environment(\.colorScheme, scheme).background(bg), name + "-window")
+        }
+    }
+
     @MainActor static func exportAll() {
+        exportPulse()
         for (name, scheme) in [("ui-dark", ColorScheme.dark), ("ui-light", ColorScheme.light)] {
             let bg = scheme == .dark ? Color(white: 0.12) : Color(white: 0.95)
             write(ContentView(model: AppModel.sample()).environment(\.colorScheme, scheme).background(bg), name)

@@ -1,4 +1,5 @@
 import SwiftUI
+import AppKit
 
 /// The morning pulse in the app: the same text as the Discord/markdown copy,
 /// split into sections, with one-tap follow-ups that start an agent in hop.
@@ -91,28 +92,11 @@ struct PulseClient {
     }
 }
 
-/// Minimal markdown for pulse text: paragraphs, "- " bullets, and inline
-/// bold/italic/links/code via AttributedString.
-struct MarkdownBlock: View {
-    let text: String
-    var size: CGFloat = 12
-
-    var body: some View {
-        VStack(alignment: .leading, spacing: 7) {
-            ForEach(Array(blocks.enumerated()), id: \.offset) { _, block in
-                if block.hasPrefix("- ") || block.hasPrefix("* ") {
-                    HStack(alignment: .firstTextBaseline, spacing: 6) {
-                        Text("•").font(.system(size: size))
-                        inline(String(block.dropFirst(2)))
-                    }
-                } else {
-                    inline(block)
-                }
-            }
-        }
-    }
-
-    private var blocks: [String] {
+/// Pulse markdown rendered as ONE attributed text per section, so a drag
+/// selects across paragraphs and bullets (separate Text views per paragraph
+/// made selection stop at every paragraph boundary).
+enum PulseMarkdown {
+    static func blocks(_ text: String) -> [String] {
         var out: [String] = []
         var paragraph: [String] = []
         func flush() {
@@ -132,34 +116,70 @@ struct MarkdownBlock: View {
         return out
     }
 
-    private func inline(_ s: String) -> some View {
-        let attributed = (try? AttributedString(
-            markdown: s,
-            options: .init(interpretedSyntax: .inlineOnlyPreservingWhitespace))) ?? AttributedString(s)
-        return Text(attributed)
+    static func attributed(_ text: String) -> AttributedString {
+        var result = AttributedString()
+        for (index, block) in blocks(text).enumerated() {
+            if index > 0 { result += AttributedString("\n\n") }
+            let isBullet = block.hasPrefix("- ") || block.hasPrefix("* ")
+            let body = isBullet ? String(block.dropFirst(2)) : block
+            if isBullet { result += AttributedString("•  ") }
+            result += (try? AttributedString(
+                markdown: body,
+                options: .init(interpretedSyntax: .inlineOnlyPreservingWhitespace))) ?? AttributedString(body)
+        }
+        return result
+    }
+
+    /// Copy a section: rich text (keeps bold and links) plus the markdown as
+    /// plain text, so it pastes well into both editors and chat boxes.
+    static func copy(title: String, body: String) {
+        let markdown = title.isEmpty ? body : "## \(title)\n\n\(body)"
+        let pasteboard = NSPasteboard.general
+        pasteboard.clearContents()
+        var rich = AttributedString()
+        if !title.isEmpty {
+            var heading = AttributedString(title + "\n\n")
+            heading.font = .boldSystemFont(ofSize: 14)
+            rich += heading
+        }
+        rich += attributed(body)
+        let ns = NSAttributedString(rich)
+        if let rtf = try? ns.data(from: NSRange(location: 0, length: ns.length),
+                                  documentAttributes: [.documentType: NSAttributedString.DocumentType.rtf]) {
+            pasteboard.setData(rtf, forType: .rtf)
+        }
+        pasteboard.setString(markdown, forType: .string)
+    }
+}
+
+struct MarkdownBlock: View {
+    let text: String
+    var size: CGFloat = 12
+
+    var body: some View {
+        Text(PulseMarkdown.attributed(text))
             .font(.system(size: size))
-            .lineSpacing(2)
+            .lineSpacing(size * 0.28)
             .textSelection(.enabled)
             .fixedSize(horizontal: false, vertical: true)
+            .frame(maxWidth: .infinity, alignment: .leading)
     }
 }
 
 struct PulseView: View {
     @ObservedObject var model: AppModel
+    /// 1 in the menu-bar popover; larger in the reading window.
+    var scale: CGFloat = 1
+    var inWindow = false
+    @Environment(\.openWindow) private var openWindow
+    @State private var copied: String?
 
     var body: some View {
         VStack(spacing: 0) {
             header
             Divider().opacity(0.3)
             if let pulse = model.currentPulse {
-                ScrollView {
-                    VStack(alignment: .leading, spacing: 14) {
-                        ForEach(pulse.sections) { section in
-                            sectionView(section, pulse: pulse)
-                        }
-                    }
-                    .padding(14)
-                }
+                ScrollView { sectionsStack(pulse) }
             } else {
                 VStack(spacing: 8) {
                     Spacer()
@@ -174,10 +194,24 @@ struct PulseView: View {
         .onAppear { model.loadPulses() }
     }
 
+    /// The pulse content without the scroll container (also used by the
+    /// offline UI exporter, since ImageRenderer can't draw ScrollView content).
+    func sectionsStack(_ pulse: Pulse) -> some View {
+        VStack(alignment: .leading, spacing: 16 * scale) {
+            ForEach(pulse.sections) { section in
+                sectionView(section, pulse: pulse)
+            }
+        }
+        .padding(.horizontal, inWindow ? 34 : 14)
+        .padding(.vertical, inWindow ? 24 : 14)
+        .frame(maxWidth: inWindow ? 760 : .infinity, alignment: .leading)
+        .frame(maxWidth: .infinity)
+    }
+
     private var header: some View {
         HStack(spacing: 8) {
             Text(model.currentPulse?.title ?? "Morning pulse")
-                .font(.system(size: 12, weight: .semibold)).lineLimit(1)
+                .font(.system(size: 12 * min(scale, 1.15), weight: .semibold)).lineLimit(1)
             if let pulse = model.currentPulse, pulse.running {
                 ProgressView().controlSize(.mini)
                 Text(pulse.stage).font(.system(size: 10)).foregroundStyle(.secondary).lineLimit(1)
@@ -189,6 +223,19 @@ struct PulseView: View {
                 }
                 .pickerStyle(.segmented).labelsHidden().frame(width: 130)
             }
+            if let pulse = model.currentPulse {
+                Button { copyAll(pulse) } label: {
+                    Image(systemName: copied == "all" ? "checkmark" : "doc.on.doc")
+                }
+                .buttonStyle(.plain).help("Copy the whole pulse")
+            }
+            if !inWindow {
+                Button {
+                    openWindow(id: "pulse")
+                    NSApp.activate(ignoringOtherApps: true)
+                } label: { Image(systemName: "macwindow") }
+                    .buttonStyle(.plain).help("Open in a reading window")
+            }
             Button { model.loadPulses() } label: { Image(systemName: "arrow.clockwise") }
                 .buttonStyle(.plain).help("Reload")
         }
@@ -199,36 +246,74 @@ struct PulseView: View {
     private func sectionView(_ section: PulseSection, pulse: Pulse) -> some View {
         switch section.kind {
         case "intro":
-            MarkdownBlock(text: section.body, size: 12.5)
+            MarkdownBlock(text: section.body, size: 13 * scale)
                 .foregroundStyle(.primary)
         case "overlooked":
             VStack(alignment: .leading, spacing: 6) {
                 if pulse.sections.first(where: { $0.kind == "overlooked" })?.id == section.id {
-                    Text("YOU MAY HAVE OVERLOOKED").font(.system(size: 10, weight: .heavy)).tracking(0.6)
+                    Text("YOU MAY HAVE OVERLOOKED").font(.system(size: 10 * scale, weight: .heavy)).tracking(0.6)
                         .foregroundStyle(.secondary)
                 }
-                HStack(alignment: .top, spacing: 8) {
-                    MarkdownBlock(text: section.body, size: 12)
-                    Spacer(minLength: 0)
-                    actionButton(pulse: pulse, id: section.id)
+                VStack(alignment: .leading, spacing: 8) {
+                    MarkdownBlock(text: section.body, size: 12.5 * scale)
+                    HStack(spacing: 10) {
+                        actionButton(pulse: pulse, id: section.id)
+                        Spacer()
+                        copyButton(key: section.id, title: "", body: section.body)
+                    }
                 }
-                .padding(10)
+                .padding(12)
                 .background(RoundedRectangle(cornerRadius: 8).fill(Color.primary.opacity(0.04)))
             }
         case "article":
-            VStack(alignment: .leading, spacing: 8) {
+            VStack(alignment: .leading, spacing: 10) {
                 Divider().opacity(0.4)
-                HStack(alignment: .top) {
-                    Text(section.title).font(.system(size: 14, weight: .bold))
-                        .fixedSize(horizontal: false, vertical: true)
-                    Spacer(minLength: 6)
+                Text(section.title).font(.system(size: 15.5 * scale, weight: .bold))
+                    .textSelection(.enabled)
+                    .fixedSize(horizontal: false, vertical: true)
+                HStack(spacing: 10) {
                     actionButton(pulse: pulse, id: section.id)
+                    Spacer()
+                    copyButton(key: section.id, title: section.title, body: section.body)
                 }
-                MarkdownBlock(text: section.body, size: 12)
+                MarkdownBlock(text: section.body, size: 13 * scale)
             }
         default:
-            MarkdownBlock(text: section.body, size: 11).foregroundStyle(.secondary)
+            MarkdownBlock(text: section.body, size: 11.5 * scale).foregroundStyle(.secondary)
         }
+    }
+
+    private func copyButton(key: String, title: String, body: String) -> some View {
+        Button {
+            PulseMarkdown.copy(title: title, body: body)
+            flashCopied(key)
+        } label: {
+            Label(copied == key ? "Copied" : "Copy", systemImage: copied == key ? "checkmark" : "doc.on.doc")
+                .font(.system(size: 10.5 * min(scale, 1.15)))
+        }
+        .buttonStyle(.plain).foregroundStyle(.secondary)
+        .help("Copy this text (keeps formatting and links)")
+    }
+
+    private func copyAll(_ pulse: Pulse) {
+        var parts: [String] = []
+        var overlookedHeader = false
+        for section in pulse.sections {
+            switch section.kind {
+            case "overlooked":
+                if !overlookedHeader { parts.append("## You may have overlooked"); overlookedHeader = true }
+                parts.append("- " + section.body)
+            case "article": parts.append("## \(section.title)\n\n\(section.body)")
+            default: parts.append(section.body)
+            }
+        }
+        PulseMarkdown.copy(title: pulse.title, body: parts.joined(separator: "\n\n"))
+        flashCopied("all")
+    }
+
+    private func flashCopied(_ key: String) {
+        copied = key
+        DispatchQueue.main.asyncAfter(deadline: .now() + 1.5) { if copied == key { copied = nil } }
     }
 
     @ViewBuilder
@@ -236,14 +321,16 @@ struct PulseView: View {
         if let action = pulse.actions[id] {
             if let terminal = action.spawnedTerminal {
                 Label("In hop: \(terminal)", systemImage: "checkmark.circle.fill")
-                    .font(.system(size: 10)).foregroundStyle(.green).lineLimit(1)
+                    .font(.system(size: 10.5)).foregroundStyle(.green).lineLimit(1)
                     .help("A follow-up agent is working on this in hop (\(terminal)).")
             } else if model.pulseLaunching.contains("\(pulse.engine)/\(id)") {
                 ProgressView().controlSize(.small)
             } else {
-                Button(action.label) { model.followUp(pulse: pulse, actionID: id) }
-                    .controlSize(.small)
-                    .help("Start an agent in hop to follow up on this.")
+                Button { model.followUp(pulse: pulse, actionID: id) } label: {
+                    Label(action.label, systemImage: "arrow.up.forward.app")
+                }
+                .controlSize(.small)
+                .help("Start an agent in hop to follow up on this.")
             }
         }
     }
