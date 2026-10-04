@@ -159,7 +159,7 @@ class BriefingRunner:
             self.status.update(running=True, started_at=record["started_at"], stage="gather")
             evidence = self.gather()
             record["evidence"] = {k: v for k, v in evidence.items() if k != "previous"}
-            if not evidence["recent_prompts"] and not force:
+            if not evidence["recent_prompts"] and not evidence["backdrop_prompts"] and not force:
                 text = self._quiet_day_note(evidence)
             else:
                 self.status["stage"] = "scout"
@@ -259,14 +259,22 @@ class BriefingRunner:
         now = datetime.now(timezone.utc)
         # One shared window across engines (anchored on the latest run of ANY
         # engine) so side-by-side pulses are comparable.
+        # Only pulses from PREVIOUS days anchor the window: a same-morning run
+        # (the other engine, or this one before a restart) must not shrink it
+        # to minutes. And always look back at least BRIEFING_MIN_LOOKBACK_HOURS
+        # so a quiet evening or a re-run still has material.
+        today = _local_now().date().isoformat()
         anchors = []
         for path in self.dir.glob("????-??-??*.json"):
+            if path.name[:10] >= today:
+                continue
             try:
                 anchors.append(str(json.loads(path.read_text()).get("started_at") or ""))
             except (OSError, json.JSONDecodeError):
                 continue
         anchors = [a for a in anchors if a]
-        since = max(anchors) if anchors else (now - timedelta(hours=36)).isoformat()
+        min_lookback = (now - timedelta(hours=float(_env("BRIEFING_MIN_LOOKBACK_HOURS", "36")))).isoformat()
+        since = min(max(anchors), min_lookback) if anchors else min_lookback
         since = max(since, (now - timedelta(days=4)).isoformat())
         backdrop_since = (now - timedelta(days=14)).isoformat()
         db = self.state.config.trajectory_index_db_path
