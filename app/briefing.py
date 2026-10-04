@@ -579,6 +579,40 @@ class BriefingRunner:
                            effort=self.verify_effort, tools=True, web=True)
         return text or draft
 
+    # ------------------------------------------------------------------ replay
+
+    def replay(self, source_date: str, model: str, tag: str = "") -> dict[str, Any]:
+        """Re-run the pulse pipeline on a stored evidence snapshot with a given
+        model, for side-by-side comparison. Nothing is delivered; output goes
+        to briefings/compare/. (Fact checks still read the current index.)"""
+        data = json.loads((self.dir / f"{source_date}{self.suffix}.json").read_text())
+        evidence = dict(data["evidence"])
+        evidence["previous"] = []
+        evidence.setdefault("owner", self._owner_line())
+        runner = BriefingRunner(self.state, self.engine)
+        runner.model = model
+        started = time.time()
+        scout = runner.scout(evidence)
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            articles_f = pool.submit(runner.write_articles, evidence, scout)
+            overlooked_f = pool.submit(runner.check_overlooked, evidence, scout)
+            articles, overlooked = articles_f.result(), overlooked_f.result()
+        draft = runner.edit(evidence, articles, overlooked)
+        text, carry = self._split_carry(runner.verify(evidence, draft))
+        out_dir = self.dir / "compare"
+        out_dir.mkdir(exist_ok=True)
+        stem = f"{source_date}{self.suffix}.{tag or model}"
+        (out_dir / f"{stem}.md").write_text(
+            f"# Replay of {source_date} with {model}\n\n" + text + "\n"
+        )
+        (out_dir / f"{stem}.json").write_text(json.dumps({
+            "source_date": source_date, "model": model, "scout": scout, "articles": articles,
+            "overlooked": overlooked, "draft": draft, "briefing": text, "carry": carry,
+            "seconds": round(time.time() - started, 1),
+        }, indent=1, default=str))
+        log.info("replay of %s with %s done in %.0fs", source_date, model, time.time() - started)
+        return {"ok": True, "path": str(out_dir / f"{stem}.md")}
+
     # ------------------------------------------------------- app + follow-ups
 
     @staticmethod

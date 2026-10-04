@@ -3886,6 +3886,18 @@ class ChatHandler(BaseHTTPRequestHandler):
             threading.Thread(target=lambda: runner.run(force=force), name="briefing-manual", daemon=True).start()
             self.respond_json(202, {"ok": True, "started": True})
             return
+        if self.path == "/briefing/replay":
+            runner = self.server.state.briefings.get(str(body.get("engine") or "claude"))
+            if runner is None:
+                self.respond_json(404, {"ok": False, "error": "unknown engine"})
+                return
+            date = str(body.get("date") or "")
+            for model in [str(m) for m in body.get("models") or []]:
+                threading.Thread(
+                    target=lambda m=model: runner.replay(date, m), name=f"replay-{model}", daemon=True
+                ).start()
+            self.respond_json(202, {"ok": True, "started": body.get("models") or []})
+            return
         if self.path in {"/briefing/followup", "/briefing/actions"}:
             runner = self.server.state.briefings.get(str(body.get("engine") or "claude"))
             if runner is None:
