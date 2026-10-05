@@ -767,6 +767,31 @@ class BriefingRunner:
             raise ValueError(f"no action {action_id} for {date}")
         if action.get("spawned"):
             return {"ok": True, "already": True, **action["spawned"]}
+        task_path = PULSE_TASK_DIR / f"{date}-{self.engine}-{action_id}.md"
+        if not task_path.exists():
+            PULSE_TASK_DIR.mkdir(parents=True, exist_ok=True)
+            task_path.write_text(
+                f"(Follow-up launched from mybot's morning pulse, {date}.)\n\n{action['prompt']}\n"
+            )
+        target = hop_target_for(str(action.get("source_ref") or ""), hop_agent_sessions())
+        if target:
+            message = pulse_message(date, str(action.get("label") or "Follow up"), task_path)
+            sent = self._hopa(["tool", "hopx_send_and_wait", json.dumps({
+                "terminal_id": target["internal_name"], "data": message,
+                "press_enter": True, "wait": False,
+            })], timeout=60)
+            if sent.get("ok"):
+                action["spawned"] = {"terminal": target["name"], "terminal_id": target["internal_name"],
+                                     "session": target["internal_name"], "routed": "existing",
+                                     "at": datetime.now(timezone.utc).isoformat()}
+                path.write_text(json.dumps(data, indent=1, default=str))
+                return {"ok": True, **action["spawned"]}
+            # hop refuses agent input into sessions the owner hasn't opened to
+            # agents. Don't fall back to a new agent: hand the owner the line.
+            return {"ok": False, "needs_owner_send": True, "target": target["name"],
+                    "message": message,
+                    "error": f"hop won't let agents type into “{target['name']}”. "
+                             "The message is ready to paste there."}
         agent = "codex" if self.engine == "gpt" else "claude"
         name = f"pulse-{date[5:].replace('-', '')}-{self.engine}-{action_id}"
         spawn = self._hopa(["tool", "hopx_spawn_agent", json.dumps({
@@ -917,6 +942,7 @@ def publish_for_hop(runners: dict[str, "BriefingRunner"]) -> dict[str, Any]:
     if not roots:
         return {"ok": False, "error": "no hop asset directory found"}
     PULSE_TASK_DIR.mkdir(parents=True, exist_ok=True)
+    sessions = hop_agent_sessions()
     pulses = []
     for engine, runner in runners.items():
         try:
@@ -932,13 +958,22 @@ def publish_for_hop(runners: dict[str, "BriefingRunner"]) -> dict[str, Any]:
             task_path.write_text(
                 f"(Follow-up launched from mybot's morning pulse, {latest['date']}.)\n\n{action['prompt']}\n"
             )
-            actions.append({
+            entry = {
                 "id": action["id"],
                 "label": action.get("label") or "Follow up",
                 "cwd": action.get("cwd") or str(Path.home() / "Code"),
+                # Last resort only: a fresh session running this command.
                 "session_name": f"pulse-{latest['date'][5:].replace('-', '')}-{engine}-{action['id']}",
                 "command": _launch_command(engine, task_path),
-            })
+            }
+            # Preferred: the live hop session already holding this item's
+            # conversation gets a one-line message pointing at the task.
+            target = hop_target_for(str(action.get("source_ref") or ""), sessions)
+            if target:
+                entry["target_internal_name"] = target["internal_name"]
+                entry["target_name"] = target["name"]
+                entry["message"] = pulse_message(latest["date"], entry["label"], task_path)
+            actions.append(entry)
         pulses.append({
             "engine": engine,
             "label": latest.get("label") or engine,
@@ -958,3 +993,75 @@ def publish_for_hop(runners: dict[str, "BriefingRunner"]) -> dict[str, Any]:
         os.replace(tmp, target)
         written.append(str(target))
     return {"ok": True, "pulses": len(pulses), "written": written}
+
+
+def hop_agent_sessions() -> dict[str, dict[str, Any]]:
+    """Map agent conversation ids (Claude session uuid / Codex thread id) to
+    the live hop session hosting them. Claude: hop's own claude-sessions
+    records. Codex: the codex process's HOP_SESSION environment plus the
+    thread id it was resumed with (or the rollout file it has open)."""
+    import subprocess
+
+    try:
+        proc = subprocess.run(["hopa", "sessions", "--json"], capture_output=True, text=True, timeout=30)
+        listing = json.loads(proc.stdout or "[]")
+    except (OSError, subprocess.SubprocessError, json.JSONDecodeError):
+        return {}
+    items = listing if isinstance(listing, list) else (listing.get("sessions") or [])
+    live = {
+        str(s.get("internalName")): s for s in items
+        if s.get("live") and s.get("agent") in ("claude", "codex")
+    }
+    out: dict[str, dict[str, Any]] = {}
+
+    def add(conversation: str, internal: str) -> None:
+        s = live.get(internal)
+        if s and conversation:
+            out[conversation] = {
+                "internal_name": internal,
+                "name": str(s.get("name") or internal),
+                "agent": s.get("agent"),
+                "agent_permitted": bool(s.get("agentPermitted")),
+            }
+
+    records = Path.home() / ".hop2" / "claude-sessions"
+    for path in records.glob("*.json"):
+        try:
+            add(str(json.loads(path.read_text()).get("sessionId") or ""), path.stem)
+        except (OSError, json.JSONDecodeError):
+            continue
+    try:
+        ps = subprocess.run(["ps", "eww", "-axo", "pid=,command="], capture_output=True, text=True, timeout=30)
+    except (OSError, subprocess.SubprocessError):
+        ps = None
+    uuid_re = re.compile(r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}")
+    for line in (ps.stdout.splitlines() if ps else []):
+        if "codex" not in line or "HOP_SESSION=" not in line:
+            continue
+        hop = re.search(r"\bHOP_SESSION=(\S+)", line)
+        resumed = re.search(r"\bresume\s+'?(" + uuid_re.pattern + r")", line)
+        if hop and resumed:
+            add(resumed.group(1), hop.group(1))
+    return out
+
+
+def hop_target_for(source_ref: str, sessions: dict[str, dict[str, Any]]) -> dict[str, Any] | None:
+    """The live hop session for a pulse item's source session. Refs from the
+    actions agent are sometimes abbreviated ("claude:2099f0a8…"), so match on
+    the conversation id's prefix."""
+    ident = (source_ref.split(":", 1)[1] if ":" in source_ref else source_ref).rstrip("…. ").lower()
+    if len(ident) < 8:
+        return None
+    for conversation, target in sessions.items():
+        if conversation.lower().startswith(ident):
+            return target
+    return None
+
+
+def pulse_message(date: str, label: str, task_path: Path) -> str:
+    # One line: input is submitted with Enter, so a newline would split it.
+    return (
+        f"From mybot's morning pulse ({date}): {label}. The details and the ask are in "
+        f"{task_path} - please read it and pick this up here; check with me before anything "
+        "irreversible or outward-facing."
+    )

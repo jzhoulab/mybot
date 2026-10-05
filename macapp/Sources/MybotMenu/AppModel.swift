@@ -792,8 +792,16 @@ final class AppModel: ObservableObject {
             self.pulseLaunching.remove(key)
             switch result {
             case .success(let terminal):
+                // A "paste into …" result is transient: don't record it as
+                // started, so the button stays usable after pasting.
                 if let i = self.pulses.firstIndex(where: { $0.engine == pulse.engine }) {
                     self.pulses[i].actions[actionID]?.spawnedTerminal = terminal
+                }
+                if terminal.hasPrefix("paste into") {
+                    DispatchQueue.main.asyncAfter(deadline: .now() + 6) { [weak self] in
+                        guard let self, let i = self.pulses.firstIndex(where: { $0.engine == pulse.engine }) else { return }
+                        self.pulses[i].actions[actionID]?.spawnedTerminal = nil
+                    }
                 }
             case .failure(let error):
                 self.lastError = "Follow-up: \(error.localizedDescription)"

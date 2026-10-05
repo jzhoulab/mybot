@@ -82,6 +82,14 @@ struct PulseClient {
             DispatchQueue.main.async {
                 if let terminal = obj?["terminal"] as? String {
                     completion(.success(terminal))
+                } else if (obj?["needs_owner_send"] as? Bool) == true,
+                          let message = obj?["message"] as? String,
+                          let target = obj?["target"] as? String {
+                    // hop only lets the owner type into this session: hand
+                    // over the line instead of starting a new agent.
+                    NSPasteboard.general.clearContents()
+                    NSPasteboard.general.setString(message, forType: .string)
+                    completion(.success("paste into \(target) (copied)"))
                 } else {
                     let message = (obj?["error"] as? String) ?? error?.localizedDescription ?? "follow-up failed"
                     completion(.failure(NSError(domain: "mybot", code: 1,
@@ -320,9 +328,15 @@ struct PulseView: View {
     private func actionButton(pulse: Pulse, id: String) -> some View {
         if let action = pulse.actions[id] {
             if let terminal = action.spawnedTerminal {
-                Label("In hop: \(terminal)", systemImage: "checkmark.circle.fill")
-                    .font(.system(size: 10.5)).foregroundStyle(.green).lineLimit(1)
-                    .help("A follow-up agent is working on this in hop (\(terminal)).")
+                if terminal.hasPrefix("paste into") {
+                    Label(terminal.prefix(1).uppercased() + terminal.dropFirst(), systemImage: "doc.on.clipboard")
+                        .font(.system(size: 10.5)).foregroundStyle(.orange).lineLimit(1)
+                        .help("hop only lets you type into that session. The message is on your clipboard — paste it there.")
+                } else {
+                    Label("In hop: \(terminal)", systemImage: "checkmark.circle.fill")
+                        .font(.system(size: 10.5)).foregroundStyle(.green).lineLimit(1)
+                        .help("Sent to the hop session \(terminal).")
+                }
             } else if model.pulseLaunching.contains("\(pulse.engine)/\(id)") {
                 ProgressView().controlSize(.small)
             } else {
