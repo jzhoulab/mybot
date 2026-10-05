@@ -683,12 +683,21 @@ class BriefingRunner:
         listing = "\n\n".join(
             f"[{sec['id']}] ({sec['kind']}) {sec.get('title') or ''}\n{sec['body'][:3000]}" for sec in targets
         )
+        live = self._live_hop_sessions_described()
+        if live:
+            listing += (
+                "\n\nLive hop sessions (agent conversations the owner already has open). Prefer "
+                "routing each item to the one that owns that work — articles too, when one "
+                "project session clearly fits:\n" + live
+            )
         message = (
             listing
             + "\n\nFor each item write a follow-up task the owner can launch with one tap. "
             'Each element: {"id": item id, "label": 2–5 word button label, "source_ref": the '
             'main session ref the item points to (e.g. "claude:2099f0a8-…" — copy the full id '
-            'if shown, else ""), "prompt": the task}. The prompt must be self-contained (the '
+            'if shown, else ""), "hop_session": the name of the live hop session (from the '
+            'list) that owns this work, or "" only if none fits, "prompt": the task}. The prompt '
+            'must be self-contained (the '
             "agent has not seen the pulse): restate the item in plain words, say how to get "
             "context (`mybot trajectory-read --source-ref REF`, `mybot trajectory-search -q ...`), "
             "and say what to deliver. Overlooked items: find out whether it is really still "
@@ -712,7 +721,12 @@ class BriefingRunner:
             if not item or not str(item.get("prompt") or "").strip():
                 continue
             ref = str(item.get("source_ref") or "")
+            if not ref:
+                found = re.search(r"\b(claude|codex):([0-9a-f]{8}[0-9a-f-]*)", sec["body"])
+                if found:
+                    ref = f"{found.group(1)}:{found.group(2)}"
             actions.append({
+                "hop_session": str(item.get("hop_session") or ""),
                 "id": sec["id"],
                 "kind": sec["kind"],
                 "label": str(item.get("label") or ("Follow up" if sec["kind"] == "overlooked" else "Explore"))[:40],
@@ -722,6 +736,32 @@ class BriefingRunner:
                 "spawned": None,
             })
         return actions
+
+    def _live_hop_sessions_described(self) -> str:
+        """Live hop agent sessions, each with what its conversation is about
+        (title from the index), for the actions agent to route items to."""
+        sessions = hop_agent_sessions()
+        if not sessions:
+            return ""
+        db = self.state.config.trajectory_index_db_path
+        lines = []
+        try:
+            conn = sqlite3.connect(f"file:{db}?mode=ro", uri=True, timeout=10)
+        except sqlite3.Error:
+            conn = None
+        for conversation, target in sessions.items():
+            title = cwd = ""
+            if conn is not None:
+                row = conn.execute(
+                    "SELECT title, cwd FROM trajectory_chunks WHERE source_ref LIKE ? LIMIT 1",
+                    (f"%:{conversation}",),
+                ).fetchone()
+                if row:
+                    title, cwd = str(row[0] or "")[:90], str(row[1] or "")
+            lines.append(f"- {target['name']} ({target['agent']}; {cwd or '?'}): {title or '(untitled)'}")
+        if conn is not None:
+            conn.close()
+        return "\n".join(sorted(set(lines)))
 
     def _cwd_for(self, source_ref: str) -> str:
         fallback = str(Path.home() / "Code")
@@ -773,7 +813,9 @@ class BriefingRunner:
             task_path.write_text(
                 f"(Follow-up launched from mybot's morning pulse, {date}.)\n\n{action['prompt']}\n"
             )
-        target = hop_target_for(str(action.get("source_ref") or ""), hop_agent_sessions())
+        live = hop_agent_sessions()
+        target = hop_target_named(str(action.get("hop_session") or ""), live) or \
+            hop_target_for(str(action.get("source_ref") or ""), live)
         if target:
             message = pulse_message(date, str(action.get("label") or "Follow up"), task_path)
             sent = self._hopa(["tool", "hopx_send_and_wait", json.dumps({
@@ -968,7 +1010,8 @@ def publish_for_hop(runners: dict[str, "BriefingRunner"]) -> dict[str, Any]:
             }
             # Preferred: the live hop session already holding this item's
             # conversation gets a one-line message pointing at the task.
-            target = hop_target_for(str(action.get("source_ref") or ""), sessions)
+            target = hop_target_named(str(action.get("hop_session") or ""), sessions) or \
+                hop_target_for(str(action.get("source_ref") or ""), sessions)
             if target:
                 entry["target_internal_name"] = target["internal_name"]
                 entry["target_name"] = target["name"]
@@ -1065,3 +1108,13 @@ def pulse_message(date: str, label: str, task_path: Path) -> str:
         f"{task_path} - please read it and pick this up here; check with me before anything "
         "irreversible or outward-facing."
     )
+
+
+def hop_target_named(name: str, sessions: dict[str, dict[str, Any]]) -> dict[str, Any] | None:
+    name = name.strip()
+    if not name:
+        return None
+    for target in sessions.values():
+        if target["name"] == name or target["internal_name"] == name:
+            return target
+    return None
