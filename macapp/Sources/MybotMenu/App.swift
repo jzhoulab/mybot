@@ -277,6 +277,11 @@ private struct ConnectionsCard: View {
 
 struct ContentView: View {
     @ObservedObject var model: AppModel
+    // Menu-bar panels can't be resized by the window edges, so the size is
+    // ours: a corner grip changes it and it is remembered across launches.
+    @AppStorage("panelWidth") private var panelWidth: Double = 480
+    @AppStorage("panelHeight") private var panelHeight: Double = 640
+    @State private var dragStart: CGSize?
 
     var body: some View {
         VStack(spacing: 0) {
@@ -310,8 +315,30 @@ struct ContentView: View {
             .opacity(model.busyMessage != nil ? 0.45 : 1)
             footer
         }
-        .frame(width: 480, height: 640)
+        .frame(width: panelWidth, height: panelHeight)
+        .overlay(alignment: .bottomTrailing) { resizeGrip }
         .background(background)
+    }
+
+    private var resizeGrip: some View {
+        Image(systemName: "arrow.up.left.and.arrow.down.right")
+            .font(.system(size: 9, weight: .bold))
+            .foregroundStyle(.tertiary)
+            .frame(width: 18, height: 18)
+            .contentShape(Rectangle())
+            .help("Drag to resize · double-click to reset")
+            .gesture(
+                DragGesture(minimumDistance: 1, coordinateSpace: .global)
+                    .onChanged { value in
+                        let start = dragStart ?? CGSize(width: panelWidth, height: panelHeight)
+                        if dragStart == nil { dragStart = start }
+                        panelWidth = min(1400, max(420, start.width + value.translation.width))
+                        panelHeight = min(1400, max(480, start.height + value.translation.height))
+                    }
+                    .onEnded { _ in dragStart = nil }
+            )
+            .onTapGesture(count: 2) { panelWidth = 480; panelHeight = 640 }
+            .padding(2)
     }
 
     private func busyBanner(_ message: String) -> some View {
