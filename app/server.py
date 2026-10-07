@@ -1144,6 +1144,17 @@ class ProviderClient:
             }
         )
 
+    def _claude_isolation_args(self, *, sandbox: bool) -> list[str]:
+        """Every mybot Claude agent runs cut off from the owner's personal
+        integrations: no claude.ai connectors (Gmail, Calendar, Drive, Slack…)
+        and no MCP servers (hop, notebooks, browser…) — only the tools mybot
+        grants explicitly. One --settings blob carries this plus, when the
+        Bash sandbox is on, the sandbox policy."""
+        settings: dict[str, Any] = {"disableClaudeAiConnectors": True}
+        if sandbox:
+            settings.update(json.loads(self._claude_sandbox_settings_json()))
+        return ["--strict-mcp-config", "--settings", json.dumps(settings)]
+
     def _run_claude(
         self,
         *,
@@ -1163,6 +1174,7 @@ class ProviderClient:
 
         cmd = [self.config.claude_command, "-p", "--model", model,
                "--permission-mode", "default"]
+        cmd.extend(self._claude_isolation_args(sandbox=(not ephemeral) and self.config.claude_bash_sandbox))
         if streaming:
             cmd.extend(["--output-format", "stream-json", "--include-partial-messages", "--verbose"])
         else:
@@ -1183,7 +1195,6 @@ class ProviderClient:
         # the strict single-prefix whitelist. Planner (ephemeral) gets no tools.
         if not ephemeral:
             if self.config.claude_bash_sandbox:
-                cmd.extend(["--settings", self._claude_sandbox_settings_json()])
                 cmd.extend(["--allowedTools", "Bash"])
             else:
                 tool_prefix = f"{self.config.mybot_tool_python} {self.config.mybot_tool_path}"
@@ -1245,6 +1256,7 @@ class ProviderClient:
         sandbox), an explicit effort, and a wall-clock timeout."""
         cmd = [self.config.claude_command, "-p", "--model", model,
                "--permission-mode", "default", "--output-format", "json"]
+        cmd.extend(self._claude_isolation_args(sandbox=with_tools and self.config.claude_bash_sandbox))
         if effort:
             cmd.extend(["--effort", effort])
         if system_prompt:
@@ -1252,7 +1264,6 @@ class ProviderClient:
         allowed: list[str] = []
         if with_tools:
             if self.config.claude_bash_sandbox:
-                cmd.extend(["--settings", self._claude_sandbox_settings_json()])
                 allowed.append("Bash")
             else:
                 allowed.append(f"Bash({self.config.mybot_tool_python} {self.config.mybot_tool_path}:*)")
