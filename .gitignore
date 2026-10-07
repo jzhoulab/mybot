@@ -6,6 +6,7 @@
 .slack.env
 config/sync_tokens.json
 config/access.json
+config/conduct.json
 # Retrieval test cases name your own projects and pin real session ids.
 scripts/demo_queries.local.json
 

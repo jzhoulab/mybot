@@ -1,0 +1,13 @@
+{
+  "_comment": "Optional per-surface conduct overrides. Copy to config/conduct.json. 'social' = Discord/Slack (others can ask); 'local' = your own menu app / CLI / GUI. Omitted keys keep the defaults (privacy protection on, scope limited to projects and science).",
+  "social": {
+    "protect_owner_privacy": true,
+    "scope": "projects_and_science",
+    "extra": ""
+  },
+  "local": {
+    "protect_owner_privacy": true,
+    "scope": "projects_and_science",
+    "extra": ""
+  }
+}

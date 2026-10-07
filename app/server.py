@@ -3392,6 +3392,59 @@ class AppState:
         owner_id = normalize_text(self.config.imported_owner_actor_id, 128)
         return bool(owner_id) and normalize_text(actor_id, 128) == owner_id
 
+    # Conduct policy per surface. "social" = asked through a chat bridge
+    # (Discord/Slack: other people can be on the other end); "local" = the
+    # owner's own clients (menu app, CLI, GUI). Both default to the same
+    # policy for now; config/conduct.json can override either one (keys
+    # "social" / "local"; see config/conduct.example.json).
+    DEFAULT_CONDUCT = {
+        "protect_owner_privacy": True,
+        "scope": "projects_and_science",
+        "extra": "",
+    }
+
+    def conduct_policy(self, mode: str) -> dict[str, Any]:
+        policy = dict(self.DEFAULT_CONDUCT)
+        path = Path(__file__).resolve().parent.parent / "config" / "conduct.json"
+        try:
+            overrides = json.loads(path.read_text()) if path.exists() else {}
+        except (OSError, json.JSONDecodeError):
+            overrides = {}
+        if isinstance(overrides, dict) and isinstance(overrides.get(mode), dict):
+            policy.update(overrides[mode])
+        return policy
+
+    @staticmethod
+    def conduct_mode(channel_kind: str) -> str:
+        # Bridges always tag requests with a channel kind (dm/group); the
+        # owner's own clients never do.
+        return "social" if (channel_kind or "").strip() else "local"
+
+    def conduct_section(self, mode: str) -> str:
+        policy = self.conduct_policy(mode)
+        lines = [f"## Conduct ({mode} mode)"]
+        if policy.get("protect_owner_privacy", True):
+            lines.append(
+                "- Privacy: do not disclose personal or privacy-sensitive information about the "
+                "owner — health, family, relationships, finances, home address or whereabouts, "
+                "personal contacts, accounts and credentials, private messages, email, calendar, "
+                "or non-work activities — nor such details about other people who appear in the "
+                "sessions. If a question asks for that, decline in one sentence and offer to help "
+                "with the project or science side instead. When unsure whether something is "
+                "personal, leave it out."
+            )
+        if str(policy.get("scope") or "projects_and_science") == "projects_and_science":
+            lines.append(
+                "- Scope: you exist to answer questions about the owner's research projects, "
+                "code, data, experiments, methods and the science behind them. Politely decline "
+                "requests outside that (personal errands, opinions about people, gossip, general "
+                "chit-chat unrelated to the work)."
+            )
+        extra = str(policy.get("extra") or "").strip()
+        if extra:
+            lines.append(f"- {extra}")
+        return "\n".join(lines) if len(lines) > 1 else ""
+
     def asker_section(
         self,
         *,
@@ -3502,6 +3555,9 @@ class AppState:
                 channel_label=channel_label,
             )
         )
+        conduct = self.conduct_section(self.conduct_mode(channel_kind))
+        if conduct:
+            sections.append(conduct)
 
         sections.append(
             "## Grounding Policy\n"
