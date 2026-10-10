@@ -409,16 +409,26 @@ class BriefingRunner:
                 timeout=self.agent_timeout,
             )
         else:
-            result = provider.run_claude_task(
+            kwargs = dict(
                 system_prompt=system,
                 message=message,
-                model=model,
                 effort=effort,
                 with_tools=tools,
                 extra_tools=["WebSearch", "WebFetch"] if (web and self.web_research) else [],
                 tool_env=tool_env,
                 timeout=self.agent_timeout,
             )
+            try:
+                result = provider.run_claude_task(model=model, **kwargs)
+            except RuntimeError as exc:
+                # A model can run out of plan credits while others still work
+                # (Fable did, twice, and the whole pulse failed). Retry on the
+                # fallback model rather than skip the day.
+                fallback = os.environ.get("BRIEFING_FALLBACK_MODEL", "opus").strip()
+                if not fallback or fallback == model or "usage credits" not in str(exc).lower():
+                    raise
+                log.warning("briefing %s: %s out of credits; retrying on %s", label, model, fallback)
+                result = provider.run_claude_task(model=fallback, **kwargs)
         log.info("briefing %s finished in %.0fs", label, time.time() - started)
         return str(result.get("text") or "").strip()
 
