@@ -1278,8 +1278,14 @@ class ProviderClient:
             cwd=str(Path(self.config.codex_cwd).expanduser()), timeout=timeout,
         )
         if proc.returncode != 0:
+            # The CLI's own message ("You're out of usage credits…") sits at
+            # the end of a long JSON blob; surface it before truncation.
+            try:
+                reason = str(json.loads(proc.stdout).get("result") or "")
+            except (json.JSONDecodeError, AttributeError):
+                reason = ""
             raise RuntimeError(
-                f"Claude CLI failed (exit {proc.returncode}). "
+                f"Claude CLI failed (exit {proc.returncode}). {normalize_text(reason, 500)} "
                 f"stderr={normalize_text(proc.stderr, 1500)} stdout={normalize_text(proc.stdout, 800)}"
             )
         try:
