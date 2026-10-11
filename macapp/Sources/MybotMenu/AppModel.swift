@@ -61,6 +61,11 @@ final class AppModel: ObservableObject {
     @Published var pulsesLoaded = false
     @Published var pulseEngine = "claude"
     @Published var pulseLaunching: Set<String> = []
+    /// Text to drop into the Ask box (set by "Discuss"; AskView consumes it).
+    @Published var askDraft: String?
+    /// The pulse item being discussed, sent along with the first question
+    /// when its thread has no history on the server yet.
+    private var discussContext: (key: String, text: String)?
     var currentPulse: Pulse? { pulses.first { $0.engine == pulseEngine } ?? pulses.first }
     @Published var searchHits: [SearchHit] = []
     @Published var chat: [ChatMsg] = []
@@ -707,6 +712,11 @@ final class AppModel: ObservableObject {
     func ask(_ question: String) {
         let q = question.trimmingCharacters(in: .whitespaces)
         guard !q.isEmpty, !chatPending else { return }
+        var sent = q
+        if let ctx = discussContext, ctx.key == activeThreadKey {
+            if chat.isEmpty { sent = "\(ctx.text)\n\n---\n\n\(q)" }
+            discussContext = nil
+        }
         chat.append(ChatMsg(role: "user", text: q))
         chat.append(ChatMsg(role: "assistant", text: "", streaming: true))
         chatPending = true
@@ -720,7 +730,7 @@ final class AppModel: ObservableObject {
 
         var client = ChatClient(config: config)
         client.sessionKey = activeThreadKey
-        streamTask = client.stream(q) { [weak self] event in
+        streamTask = client.stream(sent) { [weak self] event in
             guard let self else { return }
             switch event {
             case .tool(let label):
@@ -809,6 +819,21 @@ final class AppModel: ObservableObject {
         }
     }
 
+    /// Open the pulse's chat thread with a question about one item started.
+    func discuss(pulse: Pulse, section: PulseSection) {
+        // Same key the server posts the pulse under (briefing.THREAD_PREFIX).
+        let suffix = pulse.engine == "claude" ? "" : "-\(pulse.engine)"
+        let key = "\(ChatClient.threadPrefix)-briefing-\(pulse.date.replacingOccurrences(of: "-", with: ""))\(suffix)"
+        let title = section.title.isEmpty
+            ? String(section.body.replacingOccurrences(of: "**", with: "").prefix(70)) + "…"
+            : section.title
+        let heading = section.title.isEmpty ? "" : " — “\(section.title)”"
+        discussContext = (key, "From my morning pulse (\(pulse.date))\(heading):\n\n\(section.body)")
+        openThread(key: key)
+        askDraft = "About “\(title)”: "
+        mode = .ask
+    }
+
     // MARK: chat threads (Ask history)
 
     func loadChatThreads() {
@@ -835,18 +860,22 @@ final class AppModel: ObservableObject {
 
     /// Reopen a saved chat: load its transcript and continue in that thread.
     func openChat(_ thread: ChatClient.ChatThread) {
-        guard thread.key != activeThreadKey || chat.isEmpty else { showChatList = false; return }
+        openThread(key: thread.key)
+    }
+
+    func openThread(key: String) {
+        guard key != activeThreadKey || chat.isEmpty else { showChatList = false; return }
         streamTask?.cancel()
         chatPending = false
         chatActivity = ""
         showChatList = false
-        activeThreadKey = thread.key
+        activeThreadKey = key
         chat = []
         loadingThread = true
         var client = ChatClient(config: config)
-        client.sessionKey = thread.key
-        client.loadHistory(thread.key) { [weak self] msgs in
-            guard let self, self.activeThreadKey == thread.key else { return }
+        client.sessionKey = key
+        client.loadHistory(key) { [weak self] msgs in
+            guard let self, self.activeThreadKey == key else { return }
             self.chat = msgs
             self.loadingThread = false
         }

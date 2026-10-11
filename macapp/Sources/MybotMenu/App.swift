@@ -21,6 +21,13 @@ struct MybotMenuApp: App {
                 .frame(minWidth: 520, minHeight: 500)
         }
         .defaultSize(width: 820, height: 940)
+
+        // Chat beside the reading window ("Discuss" on a pulse item there).
+        Window("Ask mybot", id: "ask") {
+            AskView(model: model)
+                .frame(minWidth: 420, minHeight: 480)
+        }
+        .defaultSize(width: 560, height: 720)
     }
 }
 
@@ -1390,7 +1397,15 @@ struct AskView: View {
             Divider().opacity(0.3)
             inputBar   // at the bottom, per chatbot convention
         }
-        .onAppear { focused = true; model.loadChatThreads() }
+        .onAppear { focused = true; model.loadChatThreads(); takeDraft() }
+        .onChange(of: model.askDraft) { takeDraft() }
+    }
+
+    private func takeDraft() {
+        guard let draft = model.askDraft else { return }
+        input = draft
+        model.askDraft = nil
+        focused = true
     }
 
     // Header: toggle the saved-chats list, and start a new chat.

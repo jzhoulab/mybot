@@ -223,8 +223,8 @@ class ChatbotApi:
 
         return await asyncio.to_thread(_get)
 
-    async def outbox_ack(self, item_id: str) -> None:
-        await asyncio.to_thread(self._post_json, "/outbox/ack", {"id": item_id})
+    async def outbox_ack(self, item_id: str, channel_id: str = "") -> None:
+        await asyncio.to_thread(self._post_json, "/outbox/ack", {"id": item_id, "channel_id": channel_id})
 
     def _post_json(self, path: str, payload: dict[str, Any]) -> dict[str, Any]:
         request = urllib.request.Request(
@@ -476,7 +476,8 @@ class DiscordBridgeClient(discord.Client):
                     user = self.get_user(int(target)) or await self.fetch_user(int(target))
                     channel = user.dm_channel or await user.create_dm()
                     await self._send_channel_text(channel, str(item.get("text") or ""))
-                    await self.api.outbox_ack(str(item.get("id")))
+                    # The DM channel lets the phone's pulse open this conversation.
+                    await self.api.outbox_ack(str(item.get("id")), str(channel.id))
                     log.info("delivered outbox item %s to %s", item.get("id"), target)
             except Exception as exc:  # keep the loop alive; retry next tick
                 log.warning("outbox delivery failed: %s", exc)

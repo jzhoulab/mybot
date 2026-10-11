@@ -3998,7 +3998,10 @@ class ChatHandler(BaseHTTPRequestHandler):
         if self.path == "/outbox/ack":
             runner = self.server.state.briefing
             if runner is not None and body.get("id"):
-                runner.outbox_ack(str(body["id"]))
+                if runner.outbox_ack(str(body["id"]), str(body.get("channel_id") or "")):
+                    from app.briefing import publish_for_hop
+
+                    publish_for_hop(self.server.state.briefings)
             self.respond_json(200, {"ok": True})
             return
         if self.path == "/memory/rebuild":

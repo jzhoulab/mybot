@@ -267,6 +267,7 @@ struct PulseView: View {
                     HStack(spacing: 10) {
                         actionButton(pulse: pulse, id: section.id)
                         Spacer()
+                        discussButton(pulse: pulse, section: section)
                         copyButton(key: section.id, title: "", body: section.body)
                     }
                 }
@@ -282,6 +283,7 @@ struct PulseView: View {
                 HStack(spacing: 10) {
                     actionButton(pulse: pulse, id: section.id)
                     Spacer()
+                    discussButton(pulse: pulse, section: section)
                     copyButton(key: section.id, title: section.title, body: section.body)
                 }
                 MarkdownBlock(text: section.body, size: 13 * scale)
@@ -289,6 +291,18 @@ struct PulseView: View {
         default:
             MarkdownBlock(text: section.body, size: 11.5 * scale).foregroundStyle(.secondary)
         }
+    }
+
+    private func discussButton(pulse: Pulse, section: PulseSection) -> some View {
+        Button {
+            model.discuss(pulse: pulse, section: section)
+            if inWindow { openWindow(id: "ask") }
+        } label: {
+            Label("Discuss", systemImage: "bubble.left.and.text.bubble.right")
+                .font(.system(size: 10.5 * min(scale, 1.15)))
+        }
+        .buttonStyle(.plain).foregroundStyle(.secondary)
+        .help("Ask mybot about this — explain a concept, dig into the idea")
     }
 
     private func copyButton(key: String, title: String, body: String) -> some View {

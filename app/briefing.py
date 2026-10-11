@@ -955,9 +955,14 @@ class BriefingRunner:
                 out.append(item)
         return out
 
-    def outbox_ack(self, item_id: str) -> None:
+    def outbox_ack(self, item_id: str, channel_id: str = "") -> bool:
+        """Record delivery; returns True when the owner's DM channel changed."""
         with (self.outbox_path.with_suffix(".acked")).open("a") as handle:
             handle.write(item_id + "\n")
+        if not channel_id.isdigit() or discord_dm_channel(self.state) == channel_id:
+            return False
+        _dm_channel_path(self.state).write_text(json.dumps({"channel_id": channel_id}))
+        return True
 
     def _acked_ids(self) -> set[str]:
         path = self.outbox_path.with_suffix(".acked")
@@ -987,6 +992,17 @@ def _launch_command(engine: str, task_path: Path) -> str:
     if engine == "gpt":
         return f"command codex --dangerously-bypass-approvals-and-sandbox \"$(cat '{task_path}')\""
     return f"command claude --permission-mode bypassPermissions \"$(cat '{task_path}')\""
+
+
+def _dm_channel_path(state: Any) -> Path:
+    return Path(state.config.state_dir) / "discord_dm.json"
+
+
+def discord_dm_channel(state: Any) -> str:
+    try:
+        return str(json.loads(_dm_channel_path(state).read_text()).get("channel_id") or "")
+    except (OSError, ValueError, AttributeError):
+        return ""
 
 
 def publish_for_hop(runners: dict[str, "BriefingRunner"]) -> dict[str, Any]:
@@ -1035,8 +1051,13 @@ def publish_for_hop(runners: dict[str, "BriefingRunner"]) -> dict[str, Any]:
             "sections": latest.get("sections") or [],
             "actions": actions,
         })
-    payload = json.dumps({"generated_at": datetime.now(timezone.utc).isoformat(), "pulses": pulses},
-                         ensure_ascii=False)
+    feed: dict[str, Any] = {"generated_at": datetime.now(timezone.utc).isoformat(), "pulses": pulses}
+    # "Discuss" on the phone opens the owner's DM with mybot, where each
+    # pulse is already part of the conversation.
+    channel = next((discord_dm_channel(r.state) for r in runners.values()), "")
+    if channel:
+        feed["discuss_url"] = f"https://discord.com/channels/@me/{channel}"
+    payload = json.dumps(feed, ensure_ascii=False)
     written = []
     for root in roots:
         target = root / "pulse.json"
