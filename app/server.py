@@ -1717,6 +1717,21 @@ class PersonRegistry:
             log.warning("person gist write failed for actor %s", actor_id, exc_info=True)
 
 
+class _TimedTrace(list):
+    """Stamps each search-trace entry with seconds since the search began,
+    writing through to the caller's list."""
+
+    def __init__(self, target: list[dict[str, Any]], started: float) -> None:
+        super().__init__()
+        self._target = target
+        self._started = started
+
+    def append(self, entry: dict[str, Any]) -> None:  # type: ignore[override]
+        if isinstance(entry, dict):
+            entry.setdefault("t", round(time.monotonic() - self._started, 2))
+        self._target.append(entry)
+
+
 class AppState:
     def __init__(self, config: AppConfig) -> None:
         self.config = config
@@ -2177,7 +2192,11 @@ class AppState:
         with self.maintenance_lock:
             return {"ok": True, "status": dict(self.maintenance_status)}
 
-    def ensure_trajectory_chunk_index_current(self) -> dict[str, Any]:
+    def ensure_trajectory_chunk_index_current(self, *, blocking: bool = False) -> dict[str, Any]:
+        """Refresh a stale index. Request paths (blocking=False) never wait on
+        it: a rebuild took 80s inside a user's search. They start the refresh
+        in the background and search the index as it stands; the background
+        loop and startup pass blocking=True."""
         freshness = self.trajectory_chunk_index.freshness()
         if not self.config.trajectory_index_autobuild or not freshness.get("stale"):
             return {"rebuilt": False, "freshness": freshness}
@@ -2190,6 +2209,12 @@ class AppState:
                 "freshness": freshness,
                 "min_interval_seconds": min_interval,
             }
+        if not blocking:
+            if not self.trajectory_index_maintenance_lock.locked():
+                threading.Thread(
+                    target=self._refresh_index_quietly, name="index-refresh", daemon=True
+                ).start()
+            return {"rebuilt": False, "deferred": True, "background": True, "freshness": freshness}
 
         with self.trajectory_index_maintenance_lock:
             freshness = self.trajectory_chunk_index.freshness()
@@ -2211,6 +2236,12 @@ class AppState:
                 "freshness_before": freshness,
                 "trajectory_index": result,
             }
+
+    def _refresh_index_quietly(self) -> None:
+        try:
+            self.ensure_trajectory_chunk_index_current(blocking=True)
+        except Exception as exc:  # pragma: no cover - best-effort
+            self.background_refresh_error = {"at": utc_now(), "error": str(exc)}
 
     def maybe_run_deep_backfill(self) -> None:
         """One-time full-history indexing pass. The steady-state scan window is
@@ -2274,7 +2305,7 @@ class AppState:
                     print("Trajectory index background refresh resumed (on AC power).")
                 self.maybe_run_deep_backfill()
                 try:
-                    refresh = self.ensure_trajectory_chunk_index_current()
+                    refresh = self.ensure_trajectory_chunk_index_current(blocking=True)
                     self.background_refresh_last_ok = utc_now()
                     self.background_refresh_error = None
                 except Exception as exc:  # pragma: no cover - best-effort background maintenance
@@ -2480,6 +2511,7 @@ class AppState:
 
         by_ref: dict[str, dict[str, Any]] = {}
         counts: dict[str, int] = {}
+        seconds: dict[str, float] = {}
 
         for source in seed_sources or []:
             if not in_window(source):
@@ -2490,6 +2522,7 @@ class AppState:
 
         if include_index:
             for mode in index_modes:
+                channel_started = time.monotonic()
                 index_matches = self.trajectory_chunk_index.search(
                     query=query,
                     limit=channel_limit,
@@ -2499,6 +2532,7 @@ class AppState:
                     source=source_filter,
                 )
                 counts[f"index:{mode}"] = len(index_matches)
+                seconds[f"index:{mode}"] = round(time.monotonic() - channel_started, 2)
                 for match in index_matches:
                     if not self.source_allowed_by_visibility(match):
                         continue
@@ -2507,6 +2541,7 @@ class AppState:
                     merge_trajectory_source(by_ref, match, query=query, channel=f"index:{mode}")
 
         if include_semantic:
+            channel_started = time.monotonic()
             semantic_matches = self.memory_store.search(
                 query=query,
                 actor_id=actor_id,
@@ -2515,12 +2550,14 @@ class AppState:
                 limit=channel_limit,
             )
             counts["semantic"] = len(semantic_matches)
+            seconds["semantic"] = round(time.monotonic() - channel_started, 2)
             for match in semantic_matches:
                 if not self.source_allowed_by_visibility(match) or not in_window(match):
                     continue
                 merge_trajectory_source(by_ref, match, query=query, channel="semantic")
 
         if include_lexical:
+            channel_started = time.monotonic()
             lexical_matches = self.memory_store.lexical_trajectory_search(
                 query=query,
                 actor_id=actor_id,
@@ -2529,6 +2566,7 @@ class AppState:
                 limit=channel_limit,
             )
             counts["lexical"] = len(lexical_matches)
+            seconds["lexical"] = round(time.monotonic() - channel_started, 2)
             for match in lexical_matches:
                 if not self.source_allowed_by_visibility(match) or not in_window(match):
                     continue
@@ -2558,6 +2596,7 @@ class AppState:
                     "stage": stage,
                     "query": query,
                     "counts": counts,
+                    "seconds": seconds,
                     "top": [
                         {
                             "source_ref": item.get("source_ref"),
@@ -2610,15 +2649,26 @@ class AppState:
             if value and value.lower() not in {variant.lower() for variant in variants}:
                 variants.append(value)
 
+        # Path parts every session shares ("Users", the account name, "Code")
+        # make queries that match everything and still cost a round.
+        generic_parts = {part.lower() for part in Path.home().parts} | {"users", "code", "home", "documents", "desktop", "downloads"}
         for candidate in candidates[:4]:
             title = normalize_text(str(candidate.get("title") or ""), 140)
             title_lower = title.lower()
-            if title and not title_lower.startswith("system and memory context"):
+            # Injected boilerplate titles (<local-command-caveat>…, system
+            # prompts) are not things the user worked on.
+            junk_title = title_lower.startswith(
+                ("system and memory context", "<", "#", "caveat:", "you are ")
+            )
+            if title and not junk_title:
                 add(title)
                 if focused and focused.lower() not in title_lower:
                     add(f"{focused} {title}")
             cwd = str(candidate.get("cwd") or "")
-            cwd_parts = [part for part in re.split(r"[/\\s_-]+", cwd) if len(part) >= 4]
+            cwd_parts = [
+                part for part in re.split(r"[/\s_-]+", cwd)
+                if len(part) >= 4 and part.lower() not in generic_parts
+            ]
             if cwd_parts:
                 add(" ".join(cwd_parts[-4:]))
                 if focused:
@@ -2757,6 +2807,8 @@ class AppState:
         source_filter: str = "",
     ) -> list[dict[str, Any]]:
         search_started = time.monotonic()
+        if trace is not None:
+            trace = _TimedTrace(trace, search_started)
         refresh = self.ensure_trajectory_chunk_index_current()
         if trace is not None and refresh.get("rebuilt"):
             trace.append(

@@ -1484,6 +1484,41 @@ class TrajectoryChunkIndex:
             flush()
         return chunks
 
+    # A bare LIKE scan reads every chunk (25s at ~300k chunks) and ran on
+    # every query with a path, a dot or a token like "e11". Narrow it with the
+    # FTS index first: a chunk containing the literal contains its inner
+    # words (the first may be cut mid-word, the last is a prefix), and only
+    # the most recent candidates are scanned.
+    _LITERAL_SCAN_CANDIDATES = 5000
+
+    def _literal_rows(self, conn: sqlite3.Connection, literal: str, limit: int) -> list[sqlite3.Row]:
+        words = re.findall(r"[^\W_]+", literal)
+        inner = words[1:] if len(words) > 1 else words
+        # Very short words ("2" in "2.5") prefix-match half the index.
+        inner = [word for word in inner if len(word) >= 3] or inner
+        if not inner:
+            return []
+        prefilter = " AND ".join(f'text: "{word}"*' for word in inner[:8])
+        try:
+            return conn.execute(
+                """
+                SELECT id, text, title, updated_at
+                FROM trajectory_chunks
+                WHERE id IN (
+                    SELECT rowid FROM trajectory_chunks_fts
+                    WHERE trajectory_chunks_fts MATCH ?
+                    ORDER BY rowid DESC
+                    LIMIT ?
+                )
+                AND lower(text) LIKE ?
+                ORDER BY updated_at DESC
+                LIMIT ?
+                """,
+                (prefilter, self._LITERAL_SCAN_CANDIDATES, f"%{literal}%", limit),
+            ).fetchall()
+        except sqlite3.OperationalError:
+            return []
+
     def _exact_scores(self, query: str, *, limit: int) -> list[tuple[int, float]]:
         focused = focus_query(query)
         literal = focused.lower()
@@ -1510,16 +1545,7 @@ class TrajectoryChunkIndex:
                     scores[row["rowid"]] = max(scores.get(row["rowid"], 0.0), score)
 
             if literal and needs_literal_fallback(query):
-                rows = conn.execute(
-                    """
-                    SELECT id, text, title, updated_at
-                    FROM trajectory_chunks
-                    WHERE lower(text) LIKE ?
-                    ORDER BY updated_at DESC
-                    LIMIT ?
-                    """,
-                    (f"%{literal}%", limit),
-                ).fetchall()
+                rows = self._literal_rows(conn, literal, limit)
                 for row in rows:
                     count = row["text"].lower().count(literal)
                     scores[row["id"]] = max(scores.get(row["id"], 0.0), 100.0 + min(count, 5) * 10.0)
