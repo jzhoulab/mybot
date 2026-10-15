@@ -792,11 +792,22 @@ class BriefingRunner:
             return fallback
         return cwd
 
-    def latest(self) -> dict[str, Any] | None:
-        paths = sorted(self.dir.glob(f"????-??-??{self.suffix}.json"))
-        if not paths:
-            return None
-        data = json.loads(paths[-1].read_text())
+    def dates(self) -> list[str]:
+        """Days with a pulse from this engine, newest first."""
+        return sorted((p.name[:10] for p in self.dir.glob(f"????-??-??{self.suffix}.json")), reverse=True)
+
+    def latest(self, date: str | None = None) -> dict[str, Any] | None:
+        """The newest pulse, or the one for `date` (YYYY-MM-DD) when given."""
+        if date:
+            path = self.dir / f"{date}{self.suffix}.json"
+            if not re.fullmatch(r"\d{4}-\d{2}-\d{2}", date) or not path.exists():
+                return None
+        else:
+            paths = sorted(self.dir.glob(f"????-??-??{self.suffix}.json"))
+            if not paths:
+                return None
+            path = paths[-1]
+        data = json.loads(path.read_text())
         sections = data.get("sections") or self.structure(str(data.get("briefing") or ""))
         return {
             "engine": self.engine,
@@ -1005,53 +1016,73 @@ def discord_dm_channel(state: Any) -> str:
         return ""
 
 
+HOP_HISTORY_DAYS = 14
+
+
+def _hop_pulse(engine: str, latest: dict[str, Any], sessions: dict[str, dict[str, Any]]) -> dict[str, Any]:
+    """One engine's pulse as the phone reads it, with launchable follow-ups."""
+    actions = []
+    for action in latest.get("actions") or []:
+        stem = f"{latest['date']}-{engine}-{action['id']}"
+        task_path = PULSE_TASK_DIR / f"{stem}.md"
+        if not task_path.exists():
+            task_path.write_text(
+                f"(Follow-up launched from mybot's morning pulse, {latest['date']}.)\n\n{action['prompt']}\n"
+            )
+        entry = {
+            "id": action["id"],
+            "label": action.get("label") or "Follow up",
+            "cwd": action.get("cwd") or str(Path.home() / "Code"),
+            # Last resort only: a fresh session running this command.
+            "session_name": f"pulse-{latest['date'][5:].replace('-', '')}-{engine}-{action['id']}",
+            "command": _launch_command(engine, task_path),
+        }
+        # Preferred: the live hop session already holding this item's
+        # conversation gets a one-line message pointing at the task.
+        target = hop_target_named(str(action.get("hop_session") or ""), sessions) or \
+            hop_target_for(str(action.get("source_ref") or ""), sessions)
+        if target:
+            entry["target_internal_name"] = target["internal_name"]
+            entry["target_name"] = target["name"]
+            entry["message"] = pulse_message(latest["date"], entry["label"], task_path)
+        actions.append(entry)
+    return {
+        "engine": engine,
+        "label": latest.get("label") or engine,
+        "date": latest.get("date"),
+        "title": latest.get("title"),
+        "sections": latest.get("sections") or [],
+        "actions": actions,
+    }
+
+
 def publish_for_hop(runners: dict[str, "BriefingRunner"]) -> dict[str, Any]:
     roots = [root for root in HOP_ASSET_ROOTS if root.is_dir()]
     if not roots:
         return {"ok": False, "error": "no hop asset directory found"}
     PULSE_TASK_DIR.mkdir(parents=True, exist_ok=True)
     sessions = hop_agent_sessions()
-    pulses = []
-    for engine, runner in runners.items():
-        try:
-            latest = runner.latest()
-        except (OSError, ValueError):
-            latest = None
-        if not latest:
-            continue
-        actions = []
-        for action in latest.get("actions") or []:
-            stem = f"{latest['date']}-{engine}-{action['id']}"
-            task_path = PULSE_TASK_DIR / f"{stem}.md"
-            task_path.write_text(
-                f"(Follow-up launched from mybot's morning pulse, {latest['date']}.)\n\n{action['prompt']}\n"
-            )
-            entry = {
-                "id": action["id"],
-                "label": action.get("label") or "Follow up",
-                "cwd": action.get("cwd") or str(Path.home() / "Code"),
-                # Last resort only: a fresh session running this command.
-                "session_name": f"pulse-{latest['date'][5:].replace('-', '')}-{engine}-{action['id']}",
-                "command": _launch_command(engine, task_path),
-            }
-            # Preferred: the live hop session already holding this item's
-            # conversation gets a one-line message pointing at the task.
-            target = hop_target_named(str(action.get("hop_session") or ""), sessions) or \
-                hop_target_for(str(action.get("source_ref") or ""), sessions)
-            if target:
-                entry["target_internal_name"] = target["internal_name"]
-                entry["target_name"] = target["name"]
-                entry["message"] = pulse_message(latest["date"], entry["label"], task_path)
-            actions.append(entry)
-        pulses.append({
-            "engine": engine,
-            "label": latest.get("label") or engine,
-            "date": latest.get("date"),
-            "title": latest.get("title"),
-            "sections": latest.get("sections") or [],
-            "actions": actions,
-        })
-    feed: dict[str, Any] = {"generated_at": datetime.now(timezone.utc).isoformat(), "pulses": pulses}
+    # Two weeks of pulses so the phone can page back through earlier days;
+    # "pulses" stays the newest day (what older builds read).
+    dates = sorted({d for runner in runners.values() for d in runner.dates()}, reverse=True)[:HOP_HISTORY_DAYS]
+    days = []
+    for date in dates:
+        day_pulses = []
+        for engine, runner in runners.items():
+            try:
+                pulse = runner.latest(date)
+            except (OSError, ValueError):
+                pulse = None
+            if pulse:
+                day_pulses.append(_hop_pulse(engine, pulse, sessions))
+        if day_pulses:
+            days.append({"date": date, "pulses": day_pulses})
+    pulses = days[0]["pulses"] if days else []
+    feed: dict[str, Any] = {
+        "generated_at": datetime.now(timezone.utc).isoformat(),
+        "pulses": pulses,
+        "history": days[1:],
+    }
     # "Discuss" on the phone opens the owner's DM with mybot, where each
     # pulse is already part of the conversation.
     channel = next((discord_dm_channel(r.state) for r in runners.values()), "")

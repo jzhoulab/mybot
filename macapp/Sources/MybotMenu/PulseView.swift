@@ -37,8 +37,18 @@ struct PulseClient {
         return comps.url!
     }
 
-    func latest(completion: @escaping ([Pulse]) -> Void) {
-        var request = URLRequest(url: baseURL.appendingPathComponent("briefing/latest"))
+    struct Feed {
+        var date = ""                       // the day these pulses are from
+        var dates: [String] = []            // every day on file, newest first
+        var pulses: [Pulse] = []
+        var running: [String: String] = [:] // engine -> stage, while today's is being written
+    }
+
+    /// One day's pulses (the newest day when `date` is nil).
+    func latest(date: String? = nil, completion: @escaping (Feed) -> Void) {
+        var comps = URLComponents(url: baseURL.appendingPathComponent("briefing/latest"), resolvingAgainstBaseURL: false)!
+        if let date { comps.queryItems = [URLQueryItem(name: "date", value: date)] }
+        var request = URLRequest(url: comps.url!)
         request.timeoutInterval = 15
         URLSession.shared.dataTask(with: request) { data, _, _ in
             let obj = data.flatMap { try? JSONSerialization.jsonObject(with: $0) as? [String: Any] }
@@ -64,7 +74,11 @@ struct PulseClient {
                              actions: actions, running: (p["running"] as? Bool) ?? false,
                              stage: (p["stage"] as? String) ?? "")
             }
-            DispatchQueue.main.async { completion(pulses) }
+            let feed = Feed(date: (obj?["date"] as? String) ?? (pulses.first?.date ?? ""),
+                            dates: (obj?["dates"] as? [String]) ?? [],
+                            pulses: pulses,
+                            running: (obj?["running"] as? [String: String]) ?? [:])
+            DispatchQueue.main.async { completion(feed) }
         }.resume()
     }
 
@@ -174,6 +188,25 @@ struct MarkdownBlock: View {
     }
 }
 
+enum PulseDay {
+    private static let parser: DateFormatter = {
+        let f = DateFormatter(); f.dateFormat = "yyyy-MM-dd"; f.locale = Locale(identifier: "en_US_POSIX"); return f
+    }()
+
+    /// "Today", "Yesterday", or "Mon Oct 12" (long: "Monday, Oct 12").
+    static func label(_ day: String, long: Bool = false) -> String {
+        guard let date = parser.date(from: day) else { return day }
+        let cal = Calendar.current
+        let name: String
+        if cal.isDateInToday(date) { name = "Today" }
+        else if cal.isDateInYesterday(date) { name = "Yesterday" }
+        else { name = "" }
+        let f = DateFormatter(); f.dateFormat = long ? "EEEE, MMM d" : "EEE MMM d"
+        if name.isEmpty { return f.string(from: date) }
+        return long ? "\(name) — \(f.string(from: date))" : name
+    }
+}
+
 struct PulseView: View {
     @ObservedObject var model: AppModel
     /// 1 in the menu-bar popover; larger in the reading window.
@@ -218,11 +251,11 @@ struct PulseView: View {
 
     private var header: some View {
         HStack(spacing: 8) {
-            Text(model.currentPulse?.title ?? "Morning pulse")
-                .font(.system(size: 12 * min(scale, 1.15), weight: .semibold)).lineLimit(1)
-            if let pulse = model.currentPulse, pulse.running {
+            dayNavigator
+            if !model.pulseRunning.isEmpty {
                 ProgressView().controlSize(.mini)
-                Text(pulse.stage).font(.system(size: 10)).foregroundStyle(.secondary).lineLimit(1)
+                Text("Writing today's pulse…").font(.system(size: 10)).foregroundStyle(.secondary).lineLimit(1)
+                    .help(model.pulseRunning.map { "\($0.key): \($0.value)" }.sorted().joined(separator: "\n"))
             }
             Spacer()
             if model.pulses.count > 1 {
@@ -244,10 +277,32 @@ struct PulseView: View {
                 } label: { Image(systemName: "macwindow") }
                     .buttonStyle(.plain).help("Open in a reading window")
             }
-            Button { model.loadPulses() } label: { Image(systemName: "arrow.clockwise") }
-                .buttonStyle(.plain).help("Reload")
         }
         .padding(.horizontal, 12).padding(.vertical, 8)
+    }
+
+    /// ‹ Yesterday ›  — step through earlier pulses, or pick a day.
+    private var dayNavigator: some View {
+        let size = 12 * min(scale, 1.15)
+        return HStack(spacing: 4) {
+            Button { model.showPulseDay(offset: 1) } label: { Image(systemName: "chevron.left") }
+                .buttonStyle(.plain).disabled(!model.canShowOlderPulse)
+                .help("Previous day's pulse")
+            Menu {
+                ForEach(model.pulseDates, id: \.self) { day in
+                    Button(PulseDay.label(day, long: true)) { model.loadPulses(date: day) }
+                }
+            } label: {
+                Text(model.pulseDate.isEmpty ? "Morning pulse" : "\(PulseDay.label(model.pulseDate)) — pulse")
+                    .font(.system(size: size, weight: .semibold)).lineLimit(1)
+            }
+            .menuStyle(.borderlessButton).menuIndicator(.hidden).fixedSize()
+            .help("Pick a day")
+            Button { model.showPulseDay(offset: -1) } label: { Image(systemName: "chevron.right") }
+                .buttonStyle(.plain).disabled(!model.canShowNewerPulse)
+                .help("Next day's pulse")
+        }
+        .font(.system(size: size))
     }
 
     @ViewBuilder

@@ -61,6 +61,10 @@ final class AppModel: ObservableObject {
     @Published var pulsesLoaded = false
     @Published var pulseEngine = "claude"
     @Published var pulseLaunching: Set<String> = []
+    @Published var pulseDate = ""                       // the day shown
+    @Published var pulseDates: [String] = []            // days on file, newest first
+    @Published var pulseRunning: [String: String] = [:] // engine -> stage while today's is written
+    private var pulsePoll: DispatchWorkItem?
     /// Text to drop into the Ask box (set by "Discuss"; AskView consumes it).
     @Published var askDraft: String?
     /// The pulse item being discussed, sent along with the first question
@@ -783,15 +787,42 @@ final class AppModel: ObservableObject {
 
     // MARK: morning pulse
 
-    func loadPulses() {
-        PulseClient(config: config).latest { [weak self] pulses in
+    var canShowOlderPulse: Bool {
+        guard let i = pulseDates.firstIndex(of: pulseDate) else { return false }
+        return i + 1 < pulseDates.count
+    }
+    var canShowNewerPulse: Bool { (pulseDates.firstIndex(of: pulseDate) ?? 0) > 0 }
+
+    /// Load a day's pulses. With no date: stay on the day being read, unless
+    /// that is the newest — then follow the newest, so a new morning's pulse
+    /// shows up on its own.
+    func loadPulses(date: String? = nil) {
+        let following = pulseDate.isEmpty || pulseDate == pulseDates.first
+        let wanted = date ?? (following ? nil : pulseDate)
+        PulseClient(config: config).latest(date: wanted) { [weak self] feed in
             guard let self else { return }
-            self.pulses = pulses
+            self.pulses = feed.pulses
+            self.pulseDate = feed.date
+            self.pulseDates = feed.dates
+            self.pulseRunning = feed.running
             self.pulsesLoaded = true
-            if !pulses.contains(where: { $0.engine == self.pulseEngine }), let first = pulses.first {
+            if !feed.pulses.contains(where: { $0.engine == self.pulseEngine }), let first = feed.pulses.first {
                 self.pulseEngine = first.engine
             }
+            // While today's pulse is being written, check back so it appears.
+            self.pulsePoll?.cancel()
+            if !feed.running.isEmpty {
+                let poll = DispatchWorkItem { [weak self] in self?.loadPulses() }
+                self.pulsePoll = poll
+                DispatchQueue.main.asyncAfter(deadline: .now() + 60, execute: poll)
+            }
         }
+    }
+
+    /// Step through days: +1 = the day before, -1 = the day after.
+    func showPulseDay(offset: Int) {
+        guard let i = pulseDates.firstIndex(of: pulseDate), pulseDates.indices.contains(i + offset) else { return }
+        loadPulses(date: pulseDates[i + offset])
     }
 
     func followUp(pulse: Pulse, actionID: String) {

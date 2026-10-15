@@ -3903,17 +3903,31 @@ class ChatHandler(BaseHTTPRequestHandler):
             })
             return
         if path == "/briefing/latest":
+            # ?date=YYYY-MM-DD revisits an earlier day; without it, the
+            # newest day any engine has. "dates" lists every day on file.
+            query = urllib.parse.parse_qs(self.path.split("?", 1)[1] if "?" in self.path else "")
+            dates = sorted(
+                {d for runner in self.server.state.briefings.values() for d in runner.dates()}, reverse=True
+            )
+            date = (query.get("date") or [""])[0] or (dates[0] if dates else "")
             pulses = []
             for runner in self.server.state.briefings.values():
                 try:
-                    latest = runner.latest()
+                    latest = runner.latest(date) if date else None
                 except (OSError, ValueError) as exc:
                     latest = {"engine": runner.engine, "error": str(exc)}
                 if latest:
                     latest["running"] = bool(runner.status.get("running"))
                     latest["stage"] = runner.status.get("stage") or ""
                     pulses.append(latest)
-            self.respond_json(200, {"ok": True, "pulses": pulses})
+            running = {
+                runner.engine: runner.status.get("stage") or "starting"
+                for runner in self.server.state.briefings.values()
+                if runner.status.get("running")
+            }
+            self.respond_json(
+                200, {"ok": True, "date": date, "dates": dates, "pulses": pulses, "running": running}
+            )
             return
         if path == "/outbox":
             query = urllib.parse.parse_qs(self.path.split("?", 1)[1] if "?" in self.path else "")
