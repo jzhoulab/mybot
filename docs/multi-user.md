@@ -38,13 +38,52 @@ references ("my notes") mean the guest.
   (`dm`|`group`), `channel_label`. The system prompt gets a `## Who Is Asking` section:
   owner → full trust; guest → "a teammate of <owner>, not the owner", with scope rules.
 - **Access** — with `GUEST_OWNER_ACCESS=true` (default), guests query the owner's
-  trajectory history through the bot: that is the collaboration feature. Whoever the
-  Discord channel allowlist admits can read what the bot can read, so gate exposure
-  with `DISCORD_ALLOWED_CHANNEL_IDS` and the scope/visibility controls at `/gui`.
+  trajectory history through the bot: that is the collaboration feature — limited to
+  projects the owner shared (see "Privacy model" below). Whoever the channel
+  allowlist admits can read what is shared, so gate exposure with
+  `DISCORD_ALLOWED_CHANNEL_IDS` / `SLACK_ALLOWED_CHANNEL_IDS`.
   Set `GUEST_OWNER_ACCESS=false` to restrict trajectory lookup to the owner: guests
   then fall back to shared team memory + their own private memories + the current
   conversation (endpoints enforce 403 regardless of what the prompt advertises), and
   `!ask @owner <question>` remains the explicit owner-scope valve.
+
+## Privacy model
+
+What a teammate can learn through the owner's bot, and what enforces it. Prompt
+rules (the conduct policy) shape answers; everything below holds even if a model
+is talked into ignoring them.
+
+- **Team sharing.** With `TEAM_SHARING=reviewed` (default) a teammate's answer can
+  draw only on projects the owner set to *team*; new and unreviewed projects stay
+  owner-only. Single sessions can be made owner-only inside a shared project. An
+  agent (`SHARING_REVIEW_MODEL`, default `sonnet`) reads each project's session
+  titles and the owner's typed requests and suggests *team / only me / exclude*
+  with a reason, flagging personal sessions (tenure files, taxes, HR, confidential
+  peer review…) in work folders. It runs after startup and hourly for new or grown
+  projects, and never decides: the owner confirms in the menu app's **Team
+  sharing** view. Decisions live in `state/sharing.json`; `TEAM_SHARING=open`
+  restores folder-only rules.
+- **Owner-private folders** (`private_workdirs`, `private_workdir_classes`) are never
+  served to anyone else, whatever the sharing level.
+- **Shared channels.** An answer posted in a channel is read by everyone there, so
+  it uses teammate-level data even when the owner asks.
+- **Authenticated API.** Every endpoint but `/health` and sync needs the local API
+  key (`~/.mybot/api-key`, created on first start). The bridges, menu app, control
+  page and the owner's own tools send it. Answer agents never see it: each turn
+  gets a grant bound to the asker's identity and scope, good only for the search
+  and read endpoints, so a guest who talks the agent into calling the API directly
+  still gets exactly the guest's view.
+- **Agent isolation.** Answer agents run in an OS sandbox (home unreadable except
+  their workspace, network to localhost only), with an allowlisted environment
+  (no bot tokens or API keys), none of the owner's Claude settings, CLAUDE.md,
+  connectors, MCP servers or auto-memory, and a tool restored before every turn.
+- **Credentials.** Keys, tokens, passwords and private keys found in transcripts
+  are masked in every response and streamed event (`app/redact.py`).
+- **Identity.** Owner status is decided by platform id (`MEMORY_IMPORTED_OWNER_ID`
+  plus `MYBOT_OWNER_ACTOR_IDS` for other platforms), never by display name.
+  Shared-channel turns are recorded as `[Name · id]` with forged brackets removed.
+  A sibling bot's relay can never claim the owner: its asker is namespaced under
+  that bot. Shared notes (`!remember-shared`) are owner-only.
 
 ## Remembering people over time
 
@@ -170,16 +209,21 @@ transport-neutral twin of the Discord bridge and needs **no server changes**:
 - Addressed (DM, or bot mentioned) → `/chat`; otherwise non-addressed channel
   messages → `/sessions/observe` (when `SLACK_OBSERVE_CHANNELS=true`). `<@id>`
   mentions resolve to `@Name`; the bot's own mention is stripped.
-- Commands mirror Discord: `!iam <name>`, `!remember`, `!remember-shared`,
-  `!new`/`!reset`. An `eyes` reaction acknowledges receipt while the answer runs.
+- Commands mirror Discord: `!iam <name>`, `!remember`, `!remember-shared` (owner
+  only), `!new`/`!reset` (DMs only — a channel's conversation is shared). An `eyes`
+  reaction acknowledges receipt while the answer runs.
+- Who it talks to: DMs, plus only the channels in `SLACK_ALLOWED_CHANNEL_IDS`
+  (empty = DMs only; being invited to a channel is not consent to answer it), and
+  only full members of its own workspace — no Slack Connect users from other
+  organizations, no guest accounts unless `SLACK_ALLOW_GUEST_ACCOUNTS=true`. It
+  observes only allowed channels.
 - Runs `App(bot_token)` + `SocketModeHandler(app_token)` — no public URL. The
   launcher shares the chat server (won't start a second one if healthy) and uses its
   own single-instance lock, so Discord and Slack can run side by side.
 
-Caveat still open (both transports): the owner's `actor_id` differs per platform
-(Discord id today). To make the SAME human the owner on Slack, either set
-`MEMORY_IMPORTED_OWNER_ID` to their Slack id for the Slack install or add an
-actor-alias map — otherwise a Slack owner is treated as a teammate.
+The owner's `actor_id` differs per platform. Add the owner's Slack user id to
+`MYBOT_OWNER_ACTOR_IDS` (comma-separated) so the same person is the owner on
+Slack too — otherwise a Slack owner is treated as a teammate.
 
 ## New/changed endpoints & fields
 
