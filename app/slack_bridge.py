@@ -29,6 +29,7 @@ except ImportError as exc:  # pragma: no cover - import guard for runtime only
         "slack_bolt is required. Install it with: python3 -m pip install -U slack_bolt"
     ) from exc
 
+from app.api_auth import authorize
 from app.logging_setup import get_logger
 
 log = get_logger("mybot.slack", "slack.log")
@@ -93,6 +94,7 @@ class ChatbotApi:
             data=json.dumps(payload).encode("utf-8"),
             method="POST",
         )
+        authorize(request)
         request.add_header("Content-Type", "application/json")
         try:
             with urllib.request.urlopen(request, timeout=self.timeout_seconds) as response:
@@ -180,6 +182,38 @@ class SlackBridge:
         self.team_id = ""
         self._name_cache: dict[str, str] = {}
         self._channel_cache: dict[str, str] = {}
+        self._account_cache: dict[str, bool] = {}
+        # Channels the bot answers and listens in. Empty = DMs only: being
+        # invited to a channel is not consent to answer everyone in it.
+        self.allowed_channels = {
+            value.strip()
+            for value in os.environ.get("SLACK_ALLOWED_CHANNEL_IDS", "").split(",")
+            if value.strip()
+        }
+        # Slack guest accounts (single/multi-channel guests) are outsiders.
+        self.allow_guest_accounts = env_bool("SLACK_ALLOW_GUEST_ACCOUNTS", False)
+
+    def channel_allowed(self, channel_id: str, is_dm: bool) -> bool:
+        return is_dm or channel_id in self.allowed_channels
+
+    def member_allowed(self, client, event: dict) -> bool:
+        """Only full members of this workspace: no Slack Connect users from
+        other organizations, and no guest accounts unless opted in."""
+        team = event.get("user_team") or event.get("team") or ""
+        if self.team_id and team and team != self.team_id:
+            return False
+        user_id = event.get("user") or ""
+        if user_id not in self._account_cache:
+            allowed = False
+            try:
+                user = (client.users_info(user=user_id).get("user") or {})
+                restricted = bool(user.get("is_restricted") or user.get("is_ultra_restricted"))
+                foreign = bool(self.team_id and user.get("team_id") and user.get("team_id") != self.team_id)
+                allowed = not user.get("is_bot") and not foreign and (self.allow_guest_accounts or not restricted)
+            except Exception:
+                log.warning("users_info failed for %s; refusing", user_id, exc_info=True)
+            self._account_cache[user_id] = allowed
+        return self._account_cache[user_id]
 
     # -- identity/label lookups (cached; Slack events carry ids, not names) --
 
@@ -293,6 +327,8 @@ def build_bridge() -> tuple[App, SlackBridge, str]:
                 except RuntimeError as exc:
                     return f"Memory promote failed: {exc}"
         if text.lower() in ("!new", "!reset"):
+            if not session_key.startswith("slack-dm-"):
+                return "`!new` only works in a DM — a channel's conversation is shared."
             api.reset_session(user_key=user_key, session_key=session_key)
             return "Started a fresh conversation."
         return None
@@ -314,6 +350,10 @@ def build_bridge() -> tuple[App, SlackBridge, str]:
             return
 
         is_dm = channel_type == "im"
+        if not bridge.channel_allowed(channel_id, is_dm):
+            return  # not an allowed channel: don't answer, don't listen
+        if not bridge.member_allowed(client, event):
+            return
         addressed = is_dm or (bridge.bot_user_id and bridge.bot_user_id in (event.get("text") or ""))
         actor_id = user_id  # transport-neutral: the raw Slack user id
         user_key = bridge.user_key(user_id)

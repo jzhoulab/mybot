@@ -68,7 +68,7 @@ struct ChatClient {
             "return_sources": true,
         ] as [String: Any])
 
-        URLSession.shared.dataTask(with: request) { data, _, error in
+        MybotHTTP.session.dataTask(with: request) { data, _, error in
             if let error {
                 let hint = (error as? URLError)?.code == .cannotConnectToHost
                     ? ChatClient.serverDownMessage
@@ -146,7 +146,7 @@ struct ChatClient {
         return Task {
             func send(_ e: StreamEvent) { DispatchQueue.main.async { onEvent(e) } }
             do {
-                let (bytes, response) = try await URLSession.shared.bytes(for: request)
+                let (bytes, response) = try await MybotHTTP.session.bytes(for: request)
                 if let http = response as? HTTPURLResponse, http.statusCode >= 400 {
                     send(.failure("server error \(http.statusCode)")); return
                 }
@@ -219,7 +219,7 @@ struct ChatClient {
             "user": config.ownerActorID,
             "session_key": sessionKey,
         ])
-        URLSession.shared.dataTask(with: request).resume()
+        MybotHTTP.session.dataTask(with: request).resume()
     }
 
     /// One stored chat thread, for the Ask chat list.
@@ -241,7 +241,7 @@ struct ChatClient {
         request.httpBody = try? JSONSerialization.data(withJSONObject: [
             "user": config.ownerActorID, "prefix": Self.threadPrefix,
         ])
-        URLSession.shared.dataTask(with: request) { data, _, _ in
+        MybotHTTP.session.dataTask(with: request) { data, _, _ in
             let obj = data.flatMap { try? JSONSerialization.jsonObject(with: $0) as? [String: Any] }
             let rawThreads = (obj?["threads"] as? [[String: Any]]) ?? []
             let threads = rawThreads.compactMap { t -> ChatThread? in
@@ -266,7 +266,7 @@ struct ChatClient {
         request.httpBody = try? JSONSerialization.data(withJSONObject: [
             "user": config.ownerActorID, "session_key": key, "limit": 200,
         ])
-        URLSession.shared.dataTask(with: request) { data, _, _ in
+        MybotHTTP.session.dataTask(with: request) { data, _, _ in
             let obj = data.flatMap { try? JSONSerialization.jsonObject(with: $0) as? [String: Any] }
             let raw = (obj?["history"] as? [[String: Any]]) ?? []
             let msgs: [ChatMsg] = raw.compactMap { m in
@@ -306,7 +306,7 @@ struct ChatClient {
         request.setValue("application/json", forHTTPHeaderField: "Content-Type")
         request.timeoutInterval = 15
         request.httpBody = try? JSONSerialization.data(withJSONObject: payload)
-        URLSession.shared.dataTask(with: request) { data, _, _ in
+        MybotHTTP.session.dataTask(with: request) { data, _, _ in
             guard let data,
                   let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
                   (obj["ok"] as? Bool) == true else {

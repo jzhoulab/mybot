@@ -24,6 +24,8 @@ def post_via_proxy(proxy_url: str, request: urllib.request.Request) -> str:
     if not parsed.hostname or not parsed.port:
         raise SystemExit(f"Unusable proxy URL in HTTP_PROXY: {proxy_url!r}")
     headers = {"Content-Type": "application/json"}
+    if request.get_header("Authorization"):
+        headers["Authorization"] = request.get_header("Authorization")
     if parsed.username:
         credentials = f"{parsed.username}:{parsed.password or ''}"
         headers["Proxy-Authorization"] = "Basic " + base64.b64encode(credentials.encode()).decode()
@@ -41,6 +43,21 @@ def post_via_proxy(proxy_url: str, request: urllib.request.Request) -> str:
         conn.close()
 
 
+def api_credential() -> str:
+    """The answer agent's per-request grant (scoped to its asker), else the
+    owner's local API key — readable by the owner's own tools, never from
+    inside the answer agent's sandbox."""
+    token = os.environ.get("MYBOT_TOOL_TOKEN", "").strip()
+    if token:
+        return token
+    path = os.path.expanduser(os.environ.get("MYBOT_API_KEY_PATH", "~/.mybot/api-key"))
+    try:
+        with open(path) as handle:
+            return handle.read().strip()
+    except OSError:
+        return ""
+
+
 def post_json(base_url: str, path: str, payload: dict[str, Any]) -> dict[str, Any]:
     request = urllib.request.Request(
         url=f"{base_url.rstrip('/')}{path}",
@@ -48,6 +65,9 @@ def post_json(base_url: str, path: str, payload: dict[str, Any]) -> dict[str, An
         method="POST",
     )
     request.add_header("Content-Type", "application/json")
+    credential = api_credential()
+    if credential:
+        request.add_header("Authorization", f"Bearer {credential}")
     try:
         with urllib.request.urlopen(request, timeout=180) as response:
             raw = response.read().decode("utf-8")

@@ -50,7 +50,7 @@ struct PulseClient {
         if let date { comps.queryItems = [URLQueryItem(name: "date", value: date)] }
         var request = URLRequest(url: comps.url!)
         request.timeoutInterval = 15
-        URLSession.shared.dataTask(with: request) { data, _, _ in
+        MybotHTTP.session.dataTask(with: request) { data, _, _ in
             let obj = data.flatMap { try? JSONSerialization.jsonObject(with: $0) as? [String: Any] }
             let raw = (obj?["pulses"] as? [[String: Any]]) ?? []
             let pulses = raw.compactMap { p -> Pulse? in
@@ -91,7 +91,7 @@ struct PulseClient {
         request.httpBody = try? JSONSerialization.data(withJSONObject: [
             "engine": engine, "date": date, "action_id": actionID,
         ])
-        URLSession.shared.dataTask(with: request) { data, _, error in
+        MybotHTTP.session.dataTask(with: request) { data, _, error in
             let obj = data.flatMap { try? JSONSerialization.jsonObject(with: $0) as? [String: Any] }
             DispatchQueue.main.async {
                 if let terminal = obj?["terminal"] as? String {

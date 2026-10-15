@@ -306,6 +306,12 @@ GUI_HTML = """<!doctype html>
     </div>
   </main>
   <script>
+    // The page is opened as /gui?key=<api key>; every call back sends it.
+    const MYBOT_KEY = new URLSearchParams(location.search).get("key") || "";
+    const mybotFetch = (url, options = {}) => fetch(url, {
+      ...options,
+      headers: {...(options.headers || {}), "Authorization": "Bearer " + MYBOT_KEY},
+    });
     const text = (v) => v === null || v === undefined || v === "" ? "-" : String(v);
     const number = (v) => Number(v || 0).toLocaleString();
     const el = (id) => document.getElementById(id);
@@ -575,7 +581,7 @@ GUI_HTML = """<!doctype html>
       toast.className = "job-status running";
       toast.textContent = `${action} ${kind || ""}…`;
       try {
-        const res = await fetch("/gui/scope", {
+        const res = await mybotFetch("/gui/scope", {
           method: "POST", headers: {"Content-Type": "application/json"},
           body: JSON.stringify({action, kind, value, source_name}),
         });
@@ -593,7 +599,7 @@ GUI_HTML = """<!doctype html>
       const toast = el("scope-toast");
       toast.className = "job-status running"; toast.textContent = `${decision} ${cwd}…`;
       try {
-        const res = await fetch("/gui/scope", {
+        const res = await mybotFetch("/gui/scope", {
           method: "POST", headers: {"Content-Type": "application/json"},
           body: JSON.stringify({action: "review", decision, value: cwd, source_name}),
         });
@@ -699,7 +705,7 @@ GUI_HTML = """<!doctype html>
     }
 
     async function load() {
-      const res = await fetch("/gui/state", {cache: "no-store"});
+      const res = await mybotFetch("/gui/state", {cache: "no-store"});
       const data = await res.json();
       set("generated", `updated ${ago(data.generated_at)}`);
       renderHealth(data);
@@ -723,7 +729,7 @@ GUI_HTML = """<!doctype html>
       if (!q) { node.innerHTML = '<div class="empty">Type a query to probe the retriever.</div>'; return; }
       node.innerHTML = '<div class="empty">Searching…</div>';
       try {
-        const res = await fetch("/gui/query", {
+        const res = await mybotFetch("/gui/query", {
           method: "POST", headers: {"Content-Type": "application/json"},
           body: JSON.stringify({query: q, mode: el("q-mode").value, limit: 10}),
         });
@@ -763,7 +769,7 @@ GUI_HTML = """<!doctype html>
         el("job-status").className = "job-status running";
         el("job-status").textContent = `starting ${action}…`;
         try {
-          const res = await fetch("/gui/maintenance", {
+          const res = await mybotFetch("/gui/maintenance", {
             method: "POST", headers: {"Content-Type": "application/json"},
             body: JSON.stringify({action}),
           });

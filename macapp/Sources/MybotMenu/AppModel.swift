@@ -250,7 +250,7 @@ final class AppModel: ObservableObject {
         guard let healthURL = parts.url else { return }
         var request = URLRequest(url: healthURL)
         request.timeoutInterval = 3
-        URLSession.shared.dataTask(with: request) { [weak self] _, response, _ in
+        MybotHTTP.session.dataTask(with: request) { [weak self] _, response, _ in
             if (response as? HTTPURLResponse)?.statusCode == 200 { return }
             Task { @MainActor in self?.startLocalServer() }
         }.resume()

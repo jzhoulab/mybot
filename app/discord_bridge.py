@@ -22,6 +22,7 @@ except ImportError as exc:  # pragma: no cover - import guard for runtime only
         "discord.py is required. Install it with: python3 -m pip install -U discord.py"
     ) from exc
 
+from app.api_auth import authorize
 from app.logging_setup import get_logger
 
 log = get_logger("mybot.discord", "discord.log")
@@ -119,7 +120,9 @@ def parse_relay(text: str) -> dict[str, Any] | None:
     """Parse a relay envelope, tolerating leading @mentions. Returns
     {kind: 'ask'|'ans', id, actor_id, name, body} or None if not a relay."""
     from urllib.parse import unquote
-    match = _RELAY_RE.search(text or "")
+    # Anchored: an envelope buried inside ordinary bot output (e.g. a model
+    # coaxed into quoting one) is not a relay.
+    match = _RELAY_RE.match((text or "").strip())
     if not match:
         return None
     kind, fields_raw, body = match.group(1), match.group(2), match.group(3)
@@ -198,6 +201,7 @@ class ChatbotApi:
             request = urllib.request.Request(
                 url=f"{self.config.chatbot_base_url.rstrip('/')}/health", method="GET"
             )
+            authorize(request)
             try:
                 with urllib.request.urlopen(request, timeout=10) as response:
                     parsed = json.loads(response.read().decode("utf-8"))
@@ -213,6 +217,7 @@ class ChatbotApi:
             request = urllib.request.Request(
                 url=f"{self.config.chatbot_base_url.rstrip('/')}/outbox?platform={platform}", method="GET"
             )
+            authorize(request)
             try:
                 with urllib.request.urlopen(request, timeout=15) as response:
                     parsed = json.loads(response.read().decode("utf-8"))
@@ -232,6 +237,7 @@ class ChatbotApi:
             data=json.dumps(payload).encode("utf-8"),
             method="POST",
         )
+        authorize(request)
         request.add_header("Content-Type", "application/json")
         try:
             with urllib.request.urlopen(
@@ -625,8 +631,12 @@ class DiscordBridgeClient(discord.Client):
             return
         if self.user is None or self.user not in message.mentions:
             return
-        actor_id = relay["actor_id"]
-        question = normalize_text(relay["body"])
+        # The sending bot only CLAIMS who is asking, so the claim is namespaced
+        # under that bot: it can never equal the owner (or anyone local) and
+        # always gets a teammate's view — even "actor=<owner id>".
+        claimed = re.sub(r"[^\w.-]", "", relay["actor_id"] or "")[:64]
+        actor_id = f"relay-{message.author.id}-{claimed}" if claimed else ""
+        question = normalize_text(relay["body"])[:4000]
         if not actor_id or not question:
             return
         guild_id = getattr(message.guild, "id", "dm")

@@ -5,7 +5,9 @@ from __future__ import annotations
 
 import argparse
 import hashlib
+import hmac
 import json
+import secrets
 import os
 import re
 import shlex
@@ -27,6 +29,8 @@ from typing import Any
 
 from app.auth import SyncAuthStore
 from app.gui import GUI_HTML, build_gui_state
+from app.api_auth import load_or_create_api_key
+from app.redact import extra_literal_secrets, redact_text
 from app.logging_setup import get_logger
 from app.semantic_memory import SemanticMemoryStore, VALID_MEMORY_SCOPES, parse_tags
 from app.prompt_history import PromptHistoryStore
@@ -1150,10 +1154,13 @@ class ProviderClient:
         and no MCP servers (hop, notebooks, browser…) — only the tools mybot
         grants explicitly. One --settings blob carries this plus, when the
         Bash sandbox is on, the sandbox policy."""
-        settings: dict[str, Any] = {"disableClaudeAiConnectors": True}
+        # Also none of the owner's own Claude setup: no ~/.claude settings
+        # (their allow-rules, hooks), no CLAUDE.md, and no auto-memory, which
+        # would otherwise persist notes from one asker's turn into the next.
+        settings: dict[str, Any] = {"disableClaudeAiConnectors": True, "autoMemoryEnabled": False}
         if sandbox:
             settings.update(json.loads(self._claude_sandbox_settings_json()))
-        return ["--strict-mcp-config", "--settings", json.dumps(settings)]
+        return ["--strict-mcp-config", "--setting-sources", "", "--settings", json.dumps(settings)]
 
     def _run_claude(
         self,
@@ -1202,9 +1209,7 @@ class ProviderClient:
         # NOTE: prompt goes via stdin, NOT as a positional arg — the variadic
         # --allowedTools/--append flags would otherwise swallow it.
 
-        env = os.environ.copy()
-        if tool_env:
-            env.update(tool_env)
+        env = agent_subprocess_env(tool_env)
 
         # Run from the runtime workspace, not the repo: the sandbox implicitly
         # trusts the working directory, and the repo (code, .env, state) must
@@ -1270,9 +1275,7 @@ class ProviderClient:
         allowed.extend(extra_tools or [])
         if allowed:
             cmd.extend(["--allowedTools", *allowed])
-        env = os.environ.copy()
-        if tool_env:
-            env.update(tool_env)
+        env = agent_subprocess_env(tool_env)
         proc = subprocess.run(
             cmd, input=message, capture_output=True, text=True, env=env,
             cwd=str(Path(self.config.codex_cwd).expanduser()), timeout=timeout,
@@ -1465,9 +1468,7 @@ class ProviderClient:
             cmd.append(backend_session_id)
         cmd.append(prompt)
 
-        env = os.environ.copy()
-        if tool_env:
-            env.update(tool_env)
+        env = agent_subprocess_env(tool_env)
         proc = subprocess.run(cmd, capture_output=True, text=True, env=env, timeout=timeout)
         if proc.returncode != 0:
             stderr = normalize_text(proc.stderr, 1500)
@@ -1717,6 +1718,60 @@ class PersonRegistry:
             log.warning("person gist write failed for actor %s", actor_id, exc_info=True)
 
 
+# The agent CLIs (and every shell command a model runs) see only these from
+# the server's environment. The server process holds bot tokens and API keys
+# (.env, .discord.env, .slack.env are exported by the launchers); a guest who
+# talks the agent into `env` must find none of them.
+AGENT_ENV_ALLOW = {
+    "PATH", "HOME", "USER", "LOGNAME", "SHELL", "TMPDIR", "TERM", "LANG", "TZ",
+    "CODEX_HOME", "CLAUDE_CONFIG_DIR", "XDG_CONFIG_HOME", "XDG_CACHE_HOME",
+}
+
+
+def agent_subprocess_env(tool_env: dict[str, str] | None = None) -> dict[str, str]:
+    extra = {
+        name.strip()
+        for name in os.environ.get("MYBOT_AGENT_ENV_PASSTHROUGH", "").split(",")
+        if name.strip()
+    }
+    env = {
+        key: value
+        for key, value in os.environ.items()
+        if key in AGENT_ENV_ALLOW or key in extra or key.startswith("LC_")
+    }
+    if tool_env:
+        env.update(tool_env)
+    return env
+
+
+# ---------------------------------------------------------------- API auth
+# Nothing on this port is served without a key. Two kinds:
+#  - the local API key (~/.mybot/api-key, 0600): held by the bridges, the menu
+#    app and the owner's own tools. Its holder may say who is asking.
+#  - a per-request agent grant: minted for one answer agent, bound to that
+#    asker's actor and scope, valid only for the tool's read endpoints. The
+#    request body cannot widen it — a guest who talks the agent into curl
+#    still gets exactly the guest's view.
+# The agent's sandbox cannot read ~/.mybot, so it never sees the API key.
+SHARED_CHANNEL_VIEWER = "shared-channel"
+
+
+def attributed_turn(author_label: str, actor_id: str, message: str) -> str:
+    """"[Name · id] text" for a shared-channel turn. Display names are chosen
+    by their holders, so brackets are stripped from the name and from the
+    start of the text — nobody can type their way into looking like the
+    owner — and the platform id rides along as the stable identity."""
+    name = re.sub(r"[\[\]·]", "", author_label).strip() or "someone"
+    body = re.sub(r"^\s*\[", "(", message)
+    return f"[{name} · {actor_id}] {body}"
+OPEN_PATHS = {"/health", "/memory/import-batch", "/memory/sync-status"}  # sync has its own tokens
+AGENT_GRANT_PATHS = {
+    "/trajectory/search", "/trajectory/read", "/trajectory/sql",
+    "/trajectory/index/stats", "/memory/search",
+}
+AGENT_GRANT_TTL_SECONDS = 4 * 3600
+
+
 class _TimedTrace(list):
     """Stamps each search-trace entry with seconds since the search began,
     writing through to the caller's list."""
@@ -1745,6 +1800,9 @@ class AppState:
         self._identity_error = ""
         self.provider = ProviderClient(config)
         self.sync_auth = SyncAuthStore(config.sync_tokens_path)
+        self.api_key = load_or_create_api_key()
+        self.agent_grants: dict[str, dict[str, Any]] = {}
+        self.agent_grants_lock = threading.Lock()
         self.memory_store = SemanticMemoryStore(
             db_path=config.memory_db_path,
             model_name=config.embedding_model_name,
@@ -1790,13 +1848,30 @@ class AppState:
     def ensure_runtime_tool_wrapper(self) -> None:
         codex_cwd = Path(self.config.codex_cwd).expanduser().resolve()
         codex_cwd.mkdir(parents=True, exist_ok=True)
+        # Earlier askers' retrieval logs (queries, source titles) left in the
+        # agent-readable workspace by older builds.
+        for stale in (codex_cwd / ".mybot" / "retrieval_budgets").glob("*"):
+            if stale.is_file() and time.time() - stale.stat().st_mtime > 3 * 3600:
+                try:
+                    stale.unlink()
+                except OSError:
+                    pass
 
         source = Path(__file__).resolve().parent.parent / "scripts" / "mybot_tool.py"
-        destination = Path(self.config.mybot_tool_path).expanduser().resolve()
+        # Not resolve(): the agent can write here, and a planted symlink must
+        # be replaced, never followed (else we'd overwrite its target).
+        destination = Path(os.path.abspath(Path(self.config.mybot_tool_path).expanduser()))
         if destination == source:
             return
 
+        if destination.parent.is_symlink():
+            destination.parent.unlink()
         destination.parent.mkdir(parents=True, exist_ok=True)
+        if destination.is_symlink() or (destination.exists() and not destination.is_file()):
+            if destination.is_dir() and not destination.is_symlink():
+                shutil.rmtree(destination)
+            else:
+                destination.unlink()
         source_text = source.read_text(encoding="utf-8")
         try:
             existing_text = destination.read_text(encoding="utf-8")
@@ -1834,12 +1909,22 @@ class AppState:
         self.trajectory_lookup.clear()
         return result
 
-    def prompt_history_hits(self, query: str, *, limit: int = 6, after: str = "", before: str = "", source_name: str = "") -> list[dict[str, Any]]:
+    def prompt_history_hits(
+        self, query: str, *, viewer_id: str, limit: int = 6, after: str = "", before: str = "", source_name: str = ""
+    ) -> list[dict[str, Any]]:
+        """Typed-prompt matches, minus prompts from owner-private sessions
+        unless the owner alone will read them."""
         try:
-            return self.prompt_history.search(query, limit=limit, after=after, before=before, source_name=source_name)
+            hits = self.prompt_history.search(query, limit=limit, after=after, before=before, source_name=source_name)
         except Exception as exc:  # pragma: no cover - never let the side index break a turn
             log.warning("prompt history search failed: %s", exc)
             return []
+        if self.actor_is_owner(viewer_id):
+            return hits
+        return [
+            hit for hit in hits
+            if not self.access_config.is_private_workdir(str(hit.get("source_name") or ""), str(hit.get("cwd") or ""))
+        ]
 
     def refresh_trajectory_chunk_index(self, *, include_vectors: bool = False) -> dict[str, Any]:
         result = self.trajectory_chunk_index.refresh_changed(
@@ -2430,8 +2515,18 @@ class AppState:
         return "\n".join(lines)
 
     def actor_is_owner(self, actor_id: str) -> bool:
-        owner_id = normalize_text(self.config.imported_owner_actor_id, 128)
-        return bool(owner_id) and normalize_text(actor_id, 128) == owner_id
+        """The owner's id on any transport: MEMORY_IMPORTED_OWNER_ID plus
+        MYBOT_OWNER_ACTOR_IDS (comma-separated, e.g. their Slack U… id)."""
+        actor = normalize_text(actor_id, 128)
+        if not actor:
+            return False
+        owner_ids = {normalize_text(self.config.imported_owner_actor_id, 128)}
+        owner_ids |= {
+            normalize_text(value, 128)
+            for value in os.environ.get("MYBOT_OWNER_ACTOR_IDS", "").split(",")
+        }
+        owner_ids.discard("")
+        return actor in owner_ids
 
     def trajectory_payload_is_private(self, payload: dict[str, Any]) -> bool:
         metadata = payload.get("metadata") if isinstance(payload.get("metadata"), dict) else {}
@@ -2470,9 +2565,12 @@ class AppState:
             # (default), teammates query the owner's history through it —
             # that's the collaboration point. Set GUEST_OWNER_ACCESS=false to
             # restrict trajectory lookup to the owner themself.
-            return self.config.guest_owner_access or normalize_text(actor_id, 128) == owner_id
+            return self.config.guest_owner_access or self.actor_is_owner(actor_id)
         if memory_scope == "target_user":
-            return normalize_text(target_user_id or "", 128) == owner_id
+            # Same gate: naming the owner as the target is not a way around
+            # GUEST_OWNER_ACCESS=false.
+            return (self.config.guest_owner_access or self.actor_is_owner(actor_id)) and \
+                normalize_text(target_user_id or "", 128) == owner_id
         return False
 
     def collect_trajectory_candidates(
@@ -3140,10 +3238,16 @@ class AppState:
         retrieval_budget_log_path: str | None = None,
         budget_seconds: float | None = None,
     ) -> dict[str, str]:
+        # The tool sits in the agent-writable workspace; restore it before
+        # every turn so one asker's agent can't plant code for the next.
+        self.ensure_runtime_tool_wrapper()
         env = {
             "MYBOT_TOOL_BASE_URL": f"http://{self.config.host}:{self.config.port}",
             "MYBOT_TOOL_ACTOR_ID": actor_id,
             "MYBOT_TOOL_MEMORY_SCOPE": memory_scope,
+            "MYBOT_TOOL_TOKEN": self.mint_agent_grant(
+                actor_id=actor_id, memory_scope=memory_scope, target_user_id=target_user_id
+            ),
         }
         if target_user_id:
             env["MYBOT_TOOL_TARGET_USER_ID"] = target_user_id
@@ -3156,6 +3260,32 @@ class AppState:
                 max(10.0, min(float(budget_seconds), self.retrieval_budget_ceiling()))
             )
         return env
+
+    def mint_agent_grant(self, *, actor_id: str, memory_scope: str, target_user_id: str | None) -> str:
+        token = "agt_" + secrets.token_urlsafe(24)
+        now = time.time()
+        with self.agent_grants_lock:
+            for stale in [t for t, g in self.agent_grants.items() if g["expires"] < now]:
+                del self.agent_grants[stale]
+            self.agent_grants[token] = {
+                "actor_id": actor_id,
+                "memory_scope": memory_scope,
+                "target_user_id": target_user_id,
+                "expires": now + AGENT_GRANT_TTL_SECONDS,
+            }
+        return token
+
+    def resolve_credential(self, credential: str) -> tuple[str, dict[str, Any] | None]:
+        """("key", None) for the API key, ("grant", grant) for a live agent
+        grant, ("none", None) otherwise."""
+        if credential and hmac.compare_digest(credential, self.api_key):
+            return "key", None
+        if credential.startswith("agt_"):
+            with self.agent_grants_lock:
+                grant = self.agent_grants.get(credential)
+            if grant and grant["expires"] >= time.time():
+                return "grant", grant
+        return "none", None
 
     @staticmethod
     def retrieval_budget_ceiling() -> float:
@@ -3188,6 +3318,12 @@ class AppState:
                     continue
                 if isinstance(record, dict):
                     budgets.append(record)
+        # Read once, then gone: the log sits in the agent-readable workspace,
+        # and a later asker's agent must not find this one's queries there.
+        try:
+            path.unlink()
+        except OSError:
+            pass
         return budgets
 
     def sources_from_retrieval_budgets(
@@ -3458,8 +3594,7 @@ class AppState:
         threading.Thread(target=delayed, daemon=True, name="owner-identity-onboarding").start()
 
     def is_owner_actor(self, actor_id: str) -> bool:
-        owner_id = normalize_text(self.config.imported_owner_actor_id, 128)
-        return bool(owner_id) and normalize_text(actor_id, 128) == owner_id
+        return self.actor_is_owner(actor_id)
 
     # Conduct policy per surface. "social" = asked through a chat bridge
     # (Discord/Slack: other people can be on the other end); "local" = the
@@ -3601,7 +3736,11 @@ class AppState:
         channel_kind: str = "",
         channel_label: str = "",
         carry_forward: str = "",
+        viewer_id: str | None = None,
     ) -> tuple[str, list[dict[str, Any]], bool]:
+        # viewer_id: whose visibility rules apply to what goes into the answer.
+        # It differs from actor_id when the owner asks in a shared channel.
+        viewer_id = viewer_id or actor_id
         sections: list[str] = []
         workspace_prompt = self.workspace.render()
         if workspace_prompt:
@@ -3738,7 +3877,7 @@ class AppState:
                 "hit list or rephrase the search — do not settle for the best already-open candidate."
             )
             instant = self.strip_private_trajectory_payloads(
-                self.trajectory_chunk_index.instant_hits(query, limit=10), actor_id
+                self.trajectory_chunk_index.instant_hits(query, limit=10), viewer_id
             )
             if instant:
                 hit_lines = [
@@ -3758,7 +3897,7 @@ class AppState:
                         f"{normalize_text(hit['title'], 100)} ({normalize_text(hit['cwd'], 80)})"
                     )
                 sections.append("\n".join(hit_lines))
-            prompt_hits = self.prompt_history_hits(query, limit=6)
+            prompt_hits = self.prompt_history_hits(query, viewer_id=viewer_id, limit=6)
             if prompt_hits:
                 prompt_lines = [
                     "## Prompt History Hits",
@@ -3777,18 +3916,22 @@ class AppState:
                 sections.append("\n".join(prompt_lines))
         elif use_memory and trajectory_allowed:
             sections.append(f"## Trajectory Memory Overview\n{self.trajectory_overview()}")
-            sections.append(f"## Recent Trajectory Catalog\n{self.recent_trajectory_catalog()}")
+            # The catalog lists session titles with no private filtering.
+            if self.actor_is_owner(viewer_id):
+                sections.append(f"## Recent Trajectory Catalog\n{self.recent_trajectory_catalog()}")
 
         memory_sources: list[dict[str, Any]] = []
         if use_memory and not self.config.agentic_tool_routing:
             memory_sources = self.memory_store.search(
                 query=query,
-                actor_id=actor_id,
+                actor_id=viewer_id,
                 memory_scope=memory_scope,
                 target_user_id=target_user_id,
                 limit=match_limit,
             )
-            memory_sources = self.filter_sources_by_visibility(memory_sources)
+            memory_sources = self.strip_private_trajectory_payloads(
+                self.filter_sources_by_visibility(memory_sources), viewer_id
+            )
 
         if memory_sources:
             lines = ["## Retrieved Memory"]
@@ -3882,8 +4025,41 @@ class AppState:
 class ChatHandler(BaseHTTPRequestHandler):
     server: "StandaloneServer"
 
+    def _credential(self) -> str:
+        header = self.headers.get("Authorization", "")
+        if header.lower().startswith("bearer "):
+            return header[7:].strip()
+        if self.headers.get("X-Mybot-Key"):
+            return self.headers.get("X-Mybot-Key", "").strip()
+        # The browser control page carries the key in its URL (?key=), which
+        # the menu app opens; its own fetches send the header.
+        query = urllib.parse.parse_qs(self.path.split("?", 1)[1] if "?" in self.path else "")
+        return (query.get("key") or [""])[0]
+
+    def _authorize(self, body: dict[str, Any] | None) -> bool:
+        """Gate every request; an agent grant also pins who is asking."""
+        path = self.path.split("?", 1)[0]
+        if path in OPEN_PATHS:
+            return True
+        kind, grant = self.server.state.resolve_credential(self._credential())
+        if kind == "key":
+            return True
+        if kind == "grant" and grant is not None and body is not None and path in AGENT_GRANT_PATHS:
+            for field in ("actor_id", "user", "memory_scope", "target_user_id"):
+                body.pop(field, None)
+            body["actor_id"] = grant["actor_id"]
+            body["memory_scope"] = grant["memory_scope"]
+            if grant.get("target_user_id"):
+                body["target_user_id"] = grant["target_user_id"]
+            return True
+        log.warning("refused %s %s: %s", self.command, path, "agent grant outside its endpoints" if kind == "grant" else "no valid key")
+        self.respond_json(401, {"ok": False, "error": "unauthorized: this endpoint needs the mybot API key"})
+        return False
+
     def do_GET(self) -> None:  # noqa: N802
         path = self.path.split("?", 1)[0]
+        if not self._authorize(None):
+            return
         if path in {"/gui", "/gui/"}:
             self.respond_html(200, GUI_HTML)
             return
@@ -3992,6 +4168,8 @@ class ChatHandler(BaseHTTPRequestHandler):
                 log.exception("failed to send 500 response for %s", self.path)
 
     def _dispatch_post(self, body: dict[str, Any]) -> None:
+        if not self._authorize(body):
+            return
         if self.path == "/chat":
             self.handle_chat(body)
             return
@@ -4235,11 +4413,16 @@ class ChatHandler(BaseHTTPRequestHandler):
         if channel_kind == "group" and author_label:
             # Attributed turns keep a shared channel session readable when
             # several people talk to the bot in the same conversation.
-            message = f"[{author_label}] {message}"
+            message = attributed_turn(author_label, actor_id, message)
 
         sessions = self.server.state.sessions
         config = self.server.state.config
         is_group = channel_kind == "group"
+        # An answer in a shared channel is read by everyone there: even when
+        # the owner asks, it draws only on what a teammate could see.
+        viewer_id = (
+            SHARED_CHANNEL_VIEWER if is_group and self.server.state.actor_is_owner(actor_id) else actor_id
+        )
         # Stable logical key per surface; the router maps it to a rolling active
         # storage key (idle rollover). Freshness is the router's job now, so we
         # don't append a timestamp here.
@@ -4310,6 +4493,7 @@ class ChatHandler(BaseHTTPRequestHandler):
                 channel_kind=channel_kind,
                 channel_label=channel_label,
                 carry_forward=carry_forward if not summary_text else "",
+                viewer_id=viewer_id,
             )
         except ValueError as exc:
             return None, (400, str(exc))
@@ -4330,7 +4514,7 @@ class ChatHandler(BaseHTTPRequestHandler):
             except (TypeError, ValueError):
                 budget_seconds = None
         tool_env = self.server.state.tool_env_for_request(
-            actor_id=actor_id,
+            actor_id=viewer_id,
             memory_scope=memory_scope,
             target_user_id=target_user_id,
             retrieval_budget_log_path=str(retrieval_budget_log_path) if retrieval_budget_log_path else None,
@@ -4511,7 +4695,7 @@ class ChatHandler(BaseHTTPRequestHandler):
 
         def emit(event: dict[str, Any]) -> None:
             try:
-                self.wfile.write(f"data: {json.dumps(event)}\n\n".encode("utf-8"))
+                self.wfile.write(f"data: {self._outbound(json.dumps(event))}\n\n".encode("utf-8"))
                 self.wfile.flush()
             except (BrokenPipeError, OSError):
                 raise _ClientGone()
@@ -4712,7 +4896,7 @@ class ChatHandler(BaseHTTPRequestHandler):
                     "mode": "full_scan",
                     "matches": matches,
                     "prompt_history": self.server.state.prompt_history_hits(
-                        query, limit=8, after=after, before=before, source_name=source_filter
+                        query, viewer_id=actor_id, limit=8, after=after, before=before, source_name=source_filter
                     ),
                 },
             )
@@ -4738,7 +4922,7 @@ class ChatHandler(BaseHTTPRequestHandler):
         # Typed-prompt matches ride along: they survive transcript deletion and
         # pin work to a day + session even when no chunk matched.
         response["prompt_history"] = self.server.state.prompt_history_hits(
-            query, limit=8, after=after, before=before, source_name=source_filter
+            query, viewer_id=actor_id, limit=8, after=after, before=before, source_name=source_filter
         )
         if after or before or source_filter:
             response["filters"] = {
@@ -5033,6 +5217,11 @@ class ChatHandler(BaseHTTPRequestHandler):
         if not actor_id:
             self.respond_json(400, {"ok": False, "error": "actor_id is required"})
             return
+        # Shared notes reach every later asker's context; only the owner may
+        # write them (a teammate's note would be an injection channel).
+        if scope == "shared" and not self.server.state.actor_is_owner(actor_id):
+            self.respond_json(403, {"ok": False, "error": "only the owner can store shared memory"})
+            return
         try:
             record = self.server.state.memory_store.promote_memory(
                 actor_id=actor_id,
@@ -5141,7 +5330,7 @@ class ChatHandler(BaseHTTPRequestHandler):
         author_label = normalize_text(
             str(body.get("author_label") or body.get("actor_display_name") or ""), 80
         )
-        content = f"[{author_label}] {message}" if author_label else message
+        content = attributed_turn(author_label, actor_id, message) if author_label else message
         # Rotate the observe log before it grows unbounded. Deep channel history
         # is not the durable memory (person registry + !remember are), so the
         # old transcript is archived and observation continues in a fresh file.
@@ -5224,8 +5413,13 @@ class ChatHandler(BaseHTTPRequestHandler):
             actor_id,
         )
 
+    def _outbound(self, text: str) -> str:
+        """Every byte the server sends passes here: credentials found in
+        transcripts (and the server's own key) never leave, whoever asked."""
+        return extra_literal_secrets(redact_text(text), [self.server.state.api_key])
+
     def respond_json(self, status: int, payload: dict[str, Any]) -> None:
-        encoded = json.dumps(payload, indent=2).encode("utf-8")
+        encoded = self._outbound(json.dumps(payload, indent=2)).encode("utf-8")
         self.send_response(status)
         self.send_header("Content-Type", "application/json")
         self.send_header("Content-Length", str(len(encoded)))
