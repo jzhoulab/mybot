@@ -61,6 +61,10 @@ final class AppModel: ObservableObject {
     @Published var pulsesLoaded = false
     @Published var pulseEngine = "claude"
     @Published var pulseLaunching: Set<String> = []
+    // team sharing review
+    @Published var sharing = SharingState()
+    @Published var showSharing = false
+    private var sharingPoll: DispatchWorkItem?
     @Published var pulseDate = ""                       // the day shown
     @Published var pulseDates: [String] = []            // days on file, newest first
     @Published var pulseRunning: [String: String] = [:] // engine -> stage while today's is written
@@ -143,6 +147,7 @@ final class AppModel: ObservableObject {
         refreshConnections()
         initLoginItem()
         ensureServerRunning()
+        loadSharing()
         timer = Timer.scheduledTimer(withTimeInterval: 15, repeats: true) { [weak self] _ in
             Task { @MainActor in
                 guard let self, self.busyMessage == nil else { return }  // don't shift numbers mid-op
@@ -863,6 +868,65 @@ final class AppModel: ObservableObject {
         openThread(key: key)
         askDraft = "About “\(title)”: "
         mode = .ask
+    }
+
+    // MARK: team sharing
+
+    var sharingUndecided: Int { sharing.projects.filter { $0.level == nil }.count }
+
+    func loadSharing() {
+        SharingClient(config: config).load { [weak self] state in
+            guard let self, let state else { return }
+            self.applySharing(state)
+        }
+    }
+
+    private func applySharing(_ state: SharingState) {
+        sharing = state
+        // While the agent is reviewing, check back so suggestions appear.
+        sharingPoll?.cancel()
+        if state.reviewing {
+            let poll = DispatchWorkItem { [weak self] in self?.loadSharing() }
+            sharingPoll = poll
+            DispatchQueue.main.asyncAfter(deadline: .now() + 15, execute: poll)
+        }
+    }
+
+    /// Optimistic, like the project review: the row moves at once, the
+    /// server reconciles.
+    func decideSharing(_ key: String, level: String) {
+        guard SharingLevel.all.contains(level) else { return }
+        if let i = sharing.projects.firstIndex(where: { $0.key == key }) { sharing.projects[i].level = level }
+        SharingClient(config: config).post(["action": "decide", "key": key, "level": level]) { [weak self] state in
+            guard let self else { return }
+            if let state { self.applySharing(state) } else { self.lastError = "Couldn't save the sharing choice" }
+            if level == "exclude" { self.reload(force: true) }
+        }
+    }
+
+    func acceptSharingSuggestions(_ keys: [String]) {
+        for key in keys {
+            if let i = sharing.projects.firstIndex(where: { $0.key == key }) {
+                sharing.projects[i].level = sharing.projects[i].suggestion?.level
+            }
+        }
+        SharingClient(config: config).post(["action": "accept", "keys": keys]) { [weak self] state in
+            guard let self else { return }
+            if let state { self.applySharing(state) }
+            self.reload(force: true)
+        }
+    }
+
+    func setSessionPrivate(_ ref: String, isPrivate: Bool) {
+        SharingClient(config: config).post(["action": "session", "ref": ref, "private": isPrivate]) { [weak self] state in
+            if let state { self?.applySharing(state) }
+        }
+    }
+
+    func runSharingReview() {
+        SharingClient(config: config).post(["action": "review"]) { [weak self] _ in
+            self?.loadSharing()
+        }
     }
 
     // MARK: chat threads (Ask history)

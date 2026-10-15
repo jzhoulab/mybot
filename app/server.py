@@ -31,6 +31,7 @@ from app.auth import SyncAuthStore
 from app.gui import GUI_HTML, build_gui_state
 from app.api_auth import load_or_create_api_key
 from app.redact import extra_literal_secrets, redact_text
+from app.sharing_review import LEVELS, SharingPolicy, SharingReviewer, project_key
 from app.logging_setup import get_logger
 from app.semantic_memory import SemanticMemoryStore, VALID_MEMORY_SCOPES, parse_tags
 from app.prompt_history import PromptHistoryStore
@@ -1801,6 +1802,17 @@ class AppState:
         self.provider = ProviderClient(config)
         self.sync_auth = SyncAuthStore(config.sync_tokens_path)
         self.api_key = load_or_create_api_key()
+        # Which projects teammates may ask about (owner decisions, enforced),
+        # and the agent that suggests them.
+        self.sharing = SharingPolicy(
+            Path(config.state_dir) / "sharing.json",
+            mode=os.environ.get("TEAM_SHARING", "reviewed").strip().lower(),
+        )
+        self.sharing_reviewer = SharingReviewer(
+            self,
+            path=Path(config.state_dir) / "sharing_review.json",
+            model=os.environ.get("SHARING_REVIEW_MODEL", "sonnet").strip() or "sonnet",
+        )
         self.agent_grants: dict[str, dict[str, Any]] = {}
         self.agent_grants_lock = threading.Lock()
         self.memory_store = SemanticMemoryStore(
@@ -1924,6 +1936,10 @@ class AppState:
         return [
             hit for hit in hits
             if not self.access_config.is_private_workdir(str(hit.get("source_name") or ""), str(hit.get("cwd") or ""))
+            and not self.sharing.hidden_from_team(
+                str(hit.get("source_name") or ""), str(hit.get("cwd") or ""),
+                f"{hit.get('source_name')}:{hit.get('session_id')}",
+            )
         ]
 
     def refresh_trajectory_chunk_index(self, *, include_vectors: bool = False) -> dict[str, Any]:
@@ -2514,6 +2530,69 @@ class AppState:
                 lines.append(f"- [{tool}][{updated_at}] {title}")
         return "\n".join(lines)
 
+    def apply_sharing_decision(self, key: str, level: str) -> None:
+        source_name, _, cwd = key.partition(":")
+        if level not in LEVELS or not source_name or not cwd:
+            raise ValueError("need a project key (source:cwd) and a level: team, owner or exclude")
+        self.sharing.decide(key, level)
+        if level == "exclude":
+            self.update_scope(action="exclude", source_name=source_name, kind="workdir", value=cwd)
+        # A sharing decision is also the project's index review.
+        self.review_project(source_name=source_name, cwd=cwd, decision="exclude" if level == "exclude" else "keep")
+
+    def sharing_overview(self) -> dict[str, Any]:
+        """Every indexed project with the owner's level and the agent's
+        suggestion, for the menu app's sharing review."""
+        decided = self.sharing.snapshot()
+        suggestions = self.sharing_reviewer.suggestions()["projects"]
+        try:
+            projects = self.sharing_reviewer.projects()
+        except Exception:  # pragma: no cover
+            projects = []
+        titles: dict[str, str] = {}
+        flagged_refs = [
+            flagged["ref"] for s in suggestions.values() for flagged in s.get("private_sessions") or []
+        ]
+        if flagged_refs:
+            try:
+                with self.sharing_reviewer._connect() as conn:
+                    marks = ",".join("?" for _ in flagged_refs)
+                    for row in conn.execute(
+                        f"SELECT source_ref, MAX(title) t FROM trajectory_chunks WHERE source_ref IN ({marks}) GROUP BY source_ref",
+                        flagged_refs,
+                    ):
+                        titles[row["source_ref"]] = str(row["t"] or "")
+            except Exception:  # pragma: no cover
+                pass
+        rows = []
+        for project in projects:
+            key = project_key(project["source_name"], project["cwd"])
+            suggestion = suggestions.get(key)
+            if suggestion:
+                suggestion = {
+                    **suggestion,
+                    "private_sessions": [
+                        {**f, "title": titles.get(f["ref"], ""), "private": f["ref"] in decided["private_sessions"]}
+                        for f in suggestion.get("private_sessions") or []
+                    ],
+                }
+            rows.append({
+                "key": key,
+                "source": project["source_name"],
+                "cwd": project["cwd"],
+                "sessions": project["sessions"],
+                "last": project["last"],
+                "level": (decided["projects"].get(key) or {}).get("level"),
+                "suggestion": suggestion,
+            })
+        return {
+            "ok": True,
+            "mode": self.sharing.mode,
+            "projects": rows,
+            "private_sessions": decided["private_sessions"],
+            "reviewer": self.sharing_reviewer.status,
+        }
+
     def actor_is_owner(self, actor_id: str) -> bool:
         """The owner's id on any transport: MEMORY_IMPORTED_OWNER_ID plus
         MYBOT_OWNER_ACTOR_IDS (comma-separated, e.g. their Slack U… id)."""
@@ -2537,7 +2616,14 @@ class AppState:
         # effect immediately, not at next re-index.
         source_name = str(payload.get("source_name") or metadata.get("tool") or "")
         cwd = str(payload.get("cwd") or metadata.get("cwd") or "")
-        return bool(source_name and cwd) and self.access_config.is_private_workdir(source_name, cwd)
+        if bool(source_name and cwd) and self.access_config.is_private_workdir(source_name, cwd):
+            return True
+        # Team sharing: a session is visible to teammates only inside a
+        # project the owner shared. Fails closed — no cwd, no share.
+        ref = str(payload.get("source_ref") or payload.get("parent_source_ref") or "")
+        if ref.startswith(("claude:", "codex:")) or source_name in ("claude", "codex"):
+            return self.sharing.hidden_from_team(source_name, cwd, ref.split("#", 1)[0])
+        return False
 
     def strip_private_trajectory_payloads(
         self, payloads: list[dict[str, Any]], actor_id: str
@@ -4078,6 +4164,9 @@ class ChatHandler(BaseHTTPRequestHandler):
                 "latest_text": latest[0].read_text() if latest else "",
             })
             return
+        if path == "/sharing":
+            self.respond_json(200, self.server.state.sharing_overview())
+            return
         if path == "/briefing/latest":
             # ?date=YYYY-MM-DD revisits an earlier day; without it, the
             # newest day any engine has. "dates" lists every day on file.
@@ -4172,6 +4261,9 @@ class ChatHandler(BaseHTTPRequestHandler):
             return
         if self.path == "/chat":
             self.handle_chat(body)
+            return
+        if self.path == "/sharing":
+            self.handle_sharing(body)
             return
         if self.path == "/chat/stream":
             self.handle_chat_stream(body)
@@ -5210,6 +5302,40 @@ class ChatHandler(BaseHTTPRequestHandler):
             return
         self.respond_json(200, {"ok": True, "trajectory": result})
 
+    def handle_sharing(self, body: dict[str, Any]) -> None:
+        """Owner decisions on team sharing. Only the API key reaches here."""
+        state = self.server.state
+        action = str(body.get("action") or "")
+        try:
+            if action == "review":
+                started = state.sharing_reviewer.run_async()
+                self.respond_json(202, {"ok": True, "started": started})
+                return
+            if action == "decide":
+                state.apply_sharing_decision(str(body.get("key") or ""), str(body.get("level") or ""))
+            elif action == "accept":
+                # Accept the agent's suggestions for these projects (and the
+                # sessions it flagged inside them).
+                suggestions = state.sharing_reviewer.suggestions()["projects"]
+                for key in body.get("keys") or []:
+                    suggestion = suggestions.get(str(key))
+                    if suggestion:
+                        state.apply_sharing_decision(str(key), suggestion["level"])
+                        for flagged in suggestion.get("private_sessions") or []:
+                            state.sharing.set_session_private(flagged["ref"], True, reason=flagged.get("reason", ""))
+            elif action == "session":
+                state.sharing.set_session_private(
+                    str(body.get("ref") or ""), coerce_bool(body.get("private"), True),
+                    reason=str(body.get("reason") or "owner"),
+                )
+            else:
+                self.respond_json(400, {"ok": False, "error": "action must be review, decide, accept or session"})
+                return
+        except ValueError as exc:
+            self.respond_json(400, {"ok": False, "error": str(exc)})
+            return
+        self.respond_json(200, state.sharing_overview())
+
     def handle_memory_promote(self, body: dict[str, Any]) -> None:
         actor_id = normalize_text(str(body.get("actor_id") or body.get("user") or ""), 128)
         scope = normalize_text(str(body.get("scope") or "private"), 32).lower()
@@ -5603,6 +5729,19 @@ def main() -> None:
         print("Refreshed stale trajectory chunk index before startup")
     state.refresh_prompt_history()
     state.start_trajectory_index_background_refresh()
+
+    def sharing_review_loop() -> None:
+        # New projects (and ones that grew a lot) get a sharing suggestion
+        # within the hour; the owner confirms in the menu app.
+        time.sleep(120)
+        while True:
+            try:
+                state.sharing_reviewer.run()
+            except Exception:  # pragma: no cover - best effort
+                log.exception("sharing review loop")
+            time.sleep(3600)
+
+    threading.Thread(target=sharing_review_loop, name="sharing-review-loop", daemon=True).start()
     # Decode the embedding matrix off the request path: the first semantic
     # search otherwise pays tens of seconds out of the agent's retrieval budget.
     state.trajectory_chunk_index.warm_vector_cache_async()

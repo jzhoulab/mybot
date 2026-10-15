@@ -51,7 +51,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
 // MARK: - Design helpers
 
-private enum Palette {
+enum Palette {
     // Drawn from the bunny icon: crisp neutrals carry the UI, ONE confident
     // teal-blue (the icon's gradient) marks everything interactive, and status
     // hues stay small — dots, icons, and single words, never colored slabs.
@@ -307,11 +307,15 @@ struct ContentView: View {
                         AskView(model: model)
                     } else if model.mode == .pulse {
                         PulseView(model: model)
+                    } else if model.showSharing {
+                        SharingView(model: model)
                     } else {
                         controls
                         projectScroll
                         if model.selecting {
                             batchBar
+                        } else if model.sharingUndecided > 0 {
+                            sharingBar
                         } else if !model.newProjects.isEmpty {
                             newProjectsBar
                         }
@@ -519,6 +523,33 @@ struct ContentView: View {
             }
         }
         .frame(maxHeight: .infinity)
+    }
+
+    // MARK: team sharing
+    /// Projects not yet reviewed for team sharing (they stay yours alone until
+    /// you decide). Replaces the new-project card: deciding a level is also
+    /// the project's review.
+    private var sharingBar: some View {
+        Button { model.showSharing = true } label: {
+            HStack(spacing: 6) {
+                Image(systemName: "person.2.badge.key").font(.system(size: 12)).foregroundStyle(Palette.accent)
+                VStack(alignment: .leading, spacing: 1) {
+                    Text("\(model.sharingUndecided) project\(model.sharingUndecided == 1 ? "" : "s") to review for team sharing")
+                        .font(.system(size: 12, weight: .bold))
+                    Text("Teammates see only what you share — suggestions are ready")
+                        .font(.system(size: 10)).foregroundStyle(.secondary)
+                }
+                Spacer()
+                Image(systemName: "chevron.right").font(.system(size: 10, weight: .semibold)).foregroundStyle(.secondary)
+            }
+            .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
+        .padding(12)
+        .background(RoundedRectangle(cornerRadius: 12, style: .continuous).fill(Color.primary.opacity(0.05)))
+        .overlay(RoundedRectangle(cornerRadius: 12, style: .continuous).strokeBorder(Palette.accent.opacity(0.35)))
+        .padding(.horizontal, 12).padding(.vertical, 6)
+        .onAppear { model.loadSharing() }
     }
 
     // MARK: new projects
