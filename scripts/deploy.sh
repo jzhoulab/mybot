@@ -73,10 +73,12 @@ if $SERVICES; then
   # the day's pulse is lost), so let a running one finish first.
   if [[ "${MYBOT_DEPLOY_WAIT_FOR_PULSE:-true}" == "true" ]]; then
     for i in $(seq 1 120); do
-      RUNNING="$(curl -fsS --max-time 3 -H "Authorization: Bearer $(cat "$HOME/.mybot/api-key" 2>/dev/null)" \
+      # Every engine's run state; if the server can't answer (busy, or
+      # mid-start), keep waiting — "no answer" is not "no pulse running".
+      RUNNING="$(curl -fsS --max-time 15 -H "Authorization: Bearer $(cat "$HOME/.mybot/api-key" 2>/dev/null)" \
         http://127.0.0.1:8788/briefing/latest 2>/dev/null \
-        | python3 -c "import json,sys; print(','.join(json.load(sys.stdin).get('running') or {}))" 2>/dev/null || true)"
-      [[ -z "$RUNNING" ]] && break
+        | python3 -c "import json,sys; r=json.load(sys.stdin)['running']; print(','.join(r) or 'none')" 2>/dev/null || echo unknown)"
+      [[ "$RUNNING" == "none" ]] && break
       [[ $i == 1 ]] && echo "  waiting for the morning pulse ($RUNNING) to finish before restarting (MYBOT_DEPLOY_WAIT_FOR_PULSE=false skips)"
       sleep 30
     done
