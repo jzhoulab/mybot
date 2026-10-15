@@ -72,7 +72,7 @@ if $SERVICES; then
   # A restart kills an in-flight morning pulse (its agents are orphaned and
   # the day's pulse is lost), so let a running one finish first.
   if [[ "${MYBOT_DEPLOY_WAIT_FOR_PULSE:-true}" == "true" ]]; then
-    for i in $(seq 1 60); do
+    for i in $(seq 1 120); do
       RUNNING="$(curl -fsS --max-time 3 -H "Authorization: Bearer $(cat "$HOME/.mybot/api-key" 2>/dev/null)" \
         http://127.0.0.1:8788/briefing/latest 2>/dev/null \
         | python3 -c "import json,sys; print(','.join(json.load(sys.stdin).get('running') or {}))" 2>/dev/null || true)"
