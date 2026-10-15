@@ -578,8 +578,8 @@ class DiscordBridgeClient(discord.Client):
             return
 
         log.info(
-            "message received: author=%s channel=%s len=%d preview=%r",
-            message.author.id, getattr(message.channel, "id", "?"), len(text), text[:80],
+            "message received: author=%s channel=%s len=%d",  # no content: logs outlive chats
+            message.author.id, getattr(message.channel, "id", "?"), len(text),
         )
         handled = await self._handle_command_message(message, text)
         if handled:
