@@ -48,3 +48,7 @@ macapp/.dist/
 
 # --- OS -----------------------------------------------------------------------
 .DS_Store
+
+# Local backups of real configs (they hold real paths)
+config/*.bak*
+config/*.json.bak*
