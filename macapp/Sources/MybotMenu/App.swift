@@ -534,9 +534,9 @@ struct ContentView: View {
             HStack(spacing: 6) {
                 Image(systemName: "person.2.badge.key").font(.system(size: 12)).foregroundStyle(Palette.accent)
                 VStack(alignment: .leading, spacing: 1) {
-                    Text("\(model.sharingUndecided) project\(model.sharingUndecided == 1 ? "" : "s") to review for team sharing")
+                    Text("\(model.sharingUndecided) project\(model.sharingUndecided == 1 ? "" : "s") to review — index & team sharing")
                         .font(.system(size: 12, weight: .bold))
-                    Text("Teammates see only what you share — suggestions are ready")
+                    Text("Suggestions are ready: share, keep to yourself, or exclude")
                         .font(.system(size: 10)).foregroundStyle(.secondary)
                 }
                 Spacer()

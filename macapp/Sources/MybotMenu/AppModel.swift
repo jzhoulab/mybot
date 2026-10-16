@@ -923,8 +923,8 @@ final class AppModel: ObservableObject {
         }
     }
 
-    func runSharingReview() {
-        SharingClient(config: config).post(["action": "review"]) { [weak self] _ in
+    func runSharingReview(all: Bool = false) {
+        SharingClient(config: config).post(["action": "review", "all": all]) { [weak self] _ in
             self?.loadSharing()
         }
     }

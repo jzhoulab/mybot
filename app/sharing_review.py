@@ -33,6 +33,16 @@ log = get_logger("mybot.sharing", "server.log")
 
 LEVELS = ("team", "owner", "exclude")
 
+# Cheap prefilter for the review digest, not a decision: the agent judges.
+_SENSITIVE_WORDS = (
+    "grant", "r01", "r21", "r35", "nih", "nsf", "specific aims", "research strategy", "biosketch",
+    "budget", "proposal", "resubmission", "tax", "receipt", "reimburs", "salary", "offer letter",
+    "tenure", "promotion", "recommendation", "reference letter", "visa", "green card", "immigration",
+    "mortgage", "insurance", "doctor", "medical", "kid", "baby", "daughter",
+    "son's", "wife", "husband", "family", "student evaluation", "grading", "peer review", "referee",
+    "reviewer comments", "confidential", "personal",
+)
+
 
 def _now() -> str:
     return datetime.now(timezone.utc).isoformat()
@@ -152,14 +162,17 @@ the owner's own typed requests. Suggest one level:
 work the owner would normally discuss with collaborators.
 - "owner": keep it to the owner. Personal life, family, health, money, taxes, immigration, housing; \
 job searches, tenure/promotion files, salaries, HR; grading, student evaluations, recommendation \
-letters, admissions; confidential peer review of others' papers or grants; personal email and \
-correspondence; anything about specific people's private matters. Also mixed or unclear projects.
+letters, admissions; confidential peer review of others' papers or grants; the owner's own grant \
+and funding applications (NIH/NSF/foundation proposals, specific aims, research strategy, budgets, \
+biosketches, progress reports, resubmission responses); personal email and correspondence; anything \
+about specific people's private matters. Also mixed or unclear projects.
 - "exclude": noise not worth indexing — throwaway scratch dirs, automated test runs, generated \
 agent workspaces with no human work.
 When in doubt between team and owner, choose owner.
 
 Also flag individual sessions inside a project you'd mark "team" that look personal or confidential \
-by the same rules (e.g. a tax question asked from a work folder). Use the session refs shown.
+by the same rules (e.g. a tax question asked from a work folder, or grant writing inside a code \
+repo). Use the session refs shown.
 
 Reply with ONLY a JSON array, one object per project, in the order given:
 [{"key": "<project key>", "level": "team|owner|exclude", "confidence": "high|medium|low", \
@@ -217,6 +230,27 @@ class SharingReviewer:
         ).fetchall()
         lines = [f"### {project_key(source, cwd)}", f"sessions: {project['sessions']}", "titles:"]
         lines += [f"- {row['source_ref']}: {(row['title'] or '')[:110]}" for row in sessions]
+        # Older sessions fall outside the recent window above; surface any
+        # whose title or the owner's prompts hit a sensitive word so the
+        # agent can still flag them.
+        recent = {row["source_ref"] for row in sessions}
+        clause = " OR ".join(["lower(title) LIKE ?"] * len(_SENSITIVE_WORDS))
+        flagged = conn.execute(
+            f"""SELECT source_ref, MAX(title) AS title FROM trajectory_chunks
+                WHERE source_name = ? AND cwd = ? AND ({clause}) GROUP BY source_ref LIMIT 25""",
+            (source, cwd, *[f"%{w}%" for w in _SENSITIVE_WORDS]),
+        ).fetchall()
+        prompt_clause = " OR ".join(["lower(text) LIKE ?"] * len(_SENSITIVE_WORDS))
+        flagged_prompts = conn.execute(
+            f"""SELECT session_id, substr(text, 1, 180) AS t FROM prompt_history
+                WHERE source_name = ? AND cwd = ? AND ({prompt_clause}) ORDER BY ts DESC LIMIT 15""",
+            (source, cwd, *[f"%{w}%" for w in _SENSITIVE_WORDS]),
+        ).fetchall()
+        extra = [f"- {row['source_ref']}: {(row['title'] or '')[:110]}" for row in flagged if row["source_ref"] not in recent]
+        extra += [f"- {source}:{row['session_id']}: (request) {' '.join(str(row['t']).split())}" for row in flagged_prompts]
+        if extra:
+            lines.append("older sessions with possibly sensitive words (check these):")
+            lines += extra
         if prompts:
             lines.append("owner's requests:")
             lines += [f"- {source}:{row['session_id']}: {' '.join(str(row['t']).split())}" for row in prompts]
@@ -239,20 +273,27 @@ class SharingReviewer:
             out.append(project)
         return out
 
-    def run_async(self) -> bool:
+    def run_async(self, *, full: bool = False) -> bool:
         if self.status.get("running"):
             return False
-        threading.Thread(target=self.run, name="sharing-review", daemon=True).start()
+        threading.Thread(target=self.run, kwargs={"full": full}, name="sharing-review", daemon=True).start()
         return True
 
-    def run(self, limit: int | None = None) -> dict[str, Any]:
+    def run(self, limit: int | None = None, *, full: bool = False) -> dict[str, Any]:
+        """full: re-suggest every project the owner hasn't decided (after the
+        review rules change), not only new or grown ones."""
         with self._lock:
             if self.status.get("running"):
                 return self.status
             self.status = {"running": True, "started_at": _now(), "done": 0}
         try:
             data = self.suggestions()
-            todo = self.pending(data)[: limit or None]
+            if full:
+                decided = self.state.sharing.snapshot()["projects"]
+                todo = [p for p in self.projects() if project_key(p["source_name"], p["cwd"]) not in decided]
+            else:
+                todo = self.pending(data)
+            todo = todo[: limit or None]
             self.status["total"] = len(todo)
             access = self.state.access_config
             agent_batch: list[dict[str, Any]] = []
@@ -302,7 +343,7 @@ class SharingReviewer:
                             {"ref": str(s.get("ref")), "reason": str(s.get("reason") or "")[:200]}
                             for s in result.get("private_sessions") or []
                             if isinstance(s, dict) and str(s.get("ref") or "").startswith(("claude:", "codex:"))
-                        ][:20],
+                        ][:50],
                         "at": _now(),
                     }
                     self.status["done"] += 1

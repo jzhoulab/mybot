@@ -1756,6 +1756,19 @@ def agent_subprocess_env(tool_env: dict[str, str] | None = None) -> dict[str, st
 # The agent's sandbox cannot read ~/.mybot, so it never sees the API key.
 SHARED_CHANNEL_VIEWER = "shared-channel"
 
+_TITLE_KEYS = ("title", "session_title", "codex_index_title", "thread_name")
+
+
+def _without_titles(payload: dict[str, Any]) -> dict[str, Any]:
+    """A session title is the owner's first prompt word for word — the
+    owner's to see, meaningless to a teammate. Teammates get the content
+    of shared sessions, not their titles."""
+    out = {k: v for k, v in payload.items() if k not in _TITLE_KEYS}
+    metadata = out.get("metadata")
+    if isinstance(metadata, dict):
+        out["metadata"] = {k: v for k, v in metadata.items() if k not in _TITLE_KEYS}
+    return out
+
 
 def attributed_turn(author_label: str, actor_id: str, message: str) -> str:
     """"[Name · id] text" for a shared-channel turn. Display names are chosen
@@ -2634,7 +2647,7 @@ class AppState:
         owner-only outright."""
         if self.actor_is_owner(actor_id):
             return payloads
-        return [p for p in payloads if not self.trajectory_payload_is_private(p)]
+        return [_without_titles(p) for p in payloads if not self.trajectory_payload_is_private(p)]
 
     def can_use_local_trajectory_lookup(
         self,
@@ -5263,9 +5276,11 @@ class ChatHandler(BaseHTTPRequestHandler):
             if not self.server.state.source_allowed_by_visibility(window):
                 self.respond_json(403, {"ok": False, "error": "trajectory is hidden by visibility policy"})
                 return
-            if not self.server.state.strip_private_trajectory_payloads([window], actor_id):
+            visible = self.server.state.strip_private_trajectory_payloads([window], actor_id)
+            if not visible:
                 self.respond_json(403, {"ok": False, "error": "trajectory is private to the owner"})
                 return
+            window = visible[0]
             self.respond_json(200, {"ok": True, "trajectory": window})
             return
         source = self.server.state.memory_store.get_trajectory_source(
@@ -5306,9 +5321,11 @@ class ChatHandler(BaseHTTPRequestHandler):
         if not self.server.state.source_allowed_by_visibility(result):
             self.respond_json(403, {"ok": False, "error": "trajectory is hidden by visibility policy"})
             return
-        if not self.server.state.strip_private_trajectory_payloads([result], actor_id):
+        visible = self.server.state.strip_private_trajectory_payloads([result], actor_id)
+        if not visible:
             self.respond_json(403, {"ok": False, "error": "trajectory is private to the owner"})
             return
+        result = visible[0]
         self.respond_json(200, {"ok": True, "trajectory": result})
 
     def handle_sharing(self, body: dict[str, Any]) -> None:
@@ -5317,7 +5334,7 @@ class ChatHandler(BaseHTTPRequestHandler):
         action = str(body.get("action") or "")
         try:
             if action == "review":
-                started = state.sharing_reviewer.run_async()
+                started = state.sharing_reviewer.run_async(full=coerce_bool(body.get("all")))
                 self.respond_json(202, {"ok": True, "started": started})
                 return
             if action == "decide":

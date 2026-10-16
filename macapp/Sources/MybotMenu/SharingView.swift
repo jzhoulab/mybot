@@ -129,7 +129,10 @@ struct SharingView: View {
             ScrollView {
                 VStack(alignment: .leading, spacing: 14) {
                     intro
-                    section("To decide", undecided)
+                    suggestedSection("team", "Suggested for your team")
+                    suggestedSection("owner", "Suggested only for you")
+                    suggestedSection("exclude", "Suggested to exclude from the index")
+                    section("To decide", undecided.filter { $0.suggestion == nil })
                     section("Shared with your team", model.sharing.projects.filter { $0.level == "team" })
                     section("Only you", model.sharing.projects.filter { $0.level == "owner" })
                     section("Excluded", model.sharing.projects.filter { $0.level == "exclude" })
@@ -151,8 +154,8 @@ struct SharingView: View {
                 Text("Reviewing \(model.sharing.reviewDone)/\(model.sharing.reviewTotal)")
                     .font(.system(size: 10)).foregroundStyle(.secondary)
             } else {
-                Button { model.runSharingReview() } label: { Image(systemName: "sparkles") }
-                    .buttonStyle(.plain).help("Ask the agent to review projects again")
+                Button { model.runSharingReview(all: true) } label: { Image(systemName: "sparkles") }
+                    .buttonStyle(.plain).help("Ask the agent to review every undecided project again")
             }
         }
         .padding(.horizontal, 12).padding(.vertical, 8)
@@ -160,7 +163,7 @@ struct SharingView: View {
 
     private var intro: some View {
         VStack(alignment: .leading, spacing: 8) {
-            Text("Teammates can ask your bot only about projects you share. An agent read each project's session titles and your requests and suggests a level; nothing changes until you choose.")
+            Text("Which of your projects mybot indexes, and which teammates can ask about. An agent read each project's session titles and your requests and suggests: Team (teammates can ask), Only me (indexed, yours alone), or Exclude (not indexed). Nothing changes until you accept.")
                 .font(.system(size: 11)).foregroundStyle(.secondary)
                 .fixedSize(horizontal: false, vertical: true)
             if !acceptable.isEmpty {
@@ -174,6 +177,28 @@ struct SharingView: View {
                 }
                 .buttonStyle(.plain)
                 .help("Apply each suggested level, and make the flagged sessions private")
+            }
+        }
+    }
+
+    /// Undecided projects the agent put at one level, adoptable in one click.
+    @ViewBuilder
+    private func suggestedSection(_ level: String, _ title: String) -> some View {
+        let projects = undecided.filter { $0.suggestion?.level == level }
+        if !projects.isEmpty {
+            VStack(alignment: .leading, spacing: 6) {
+                HStack {
+                    Text("\(title.uppercased()) · \(projects.count)")
+                        .font(.system(size: 9.5, weight: .heavy)).tracking(0.5).foregroundStyle(.secondary)
+                    Spacer()
+                    Button("Accept these \(projects.count)") {
+                        model.acceptSharingSuggestions(projects.map(\.key))
+                    }
+                    .font(.system(size: 10.5, weight: .semibold)).buttonStyle(.plain)
+                    .foregroundStyle(Palette.accent)
+                    .help("Apply this suggestion to every project in this group")
+                }
+                ForEach(projects) { row($0) }
             }
         }
     }
