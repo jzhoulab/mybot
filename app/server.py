@@ -1763,10 +1763,11 @@ def _without_titles(payload: dict[str, Any]) -> dict[str, Any]:
     """A session title is the owner's first prompt word for word — the
     owner's to see, meaningless to a teammate. Teammates get the content
     of shared sessions, not their titles."""
-    out = {k: v for k, v in payload.items() if k not in _TITLE_KEYS}
+    # Blank, not drop: callers index payload["title"] directly.
+    out = {k: ("" if k in _TITLE_KEYS else v) for k, v in payload.items()}
     metadata = out.get("metadata")
     if isinstance(metadata, dict):
-        out["metadata"] = {k: v for k, v in metadata.items() if k not in _TITLE_KEYS}
+        out["metadata"] = {k: ("" if k in _TITLE_KEYS else v) for k, v in metadata.items()}
     return out
 
 
