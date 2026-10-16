@@ -38,6 +38,31 @@ def _now() -> str:
     return datetime.now(timezone.utc).isoformat()
 
 
+_CATCH_ALL_NAMES = {"code", "documents", "desktop", "downloads", "projects", "src", "work", "tmp"}
+
+
+def is_catch_all_dir(cwd: str) -> bool:
+    """Folders sessions get started from for anything at all — the home dir,
+    ~/Code itself, Downloads, temp dirs, an agent's own config dir. A project
+    there is not one project, so it is never suggested for the team."""
+    path = Path(os.path.expanduser((cwd or "").strip() or "/")).resolve(strict=False)
+    home = Path.home().resolve()
+    if path in (Path("/"), home) or str(path).startswith(("/private/tmp", "/private/var/", "/tmp")):
+        return True
+    if path.parent == home and path.name.lower() in _CATCH_ALL_NAMES:
+        return True
+    try:
+        rel = path.relative_to(home)
+    except ValueError:
+        return False
+    return bool(rel.parts) and rel.parts[0].startswith((".claude", ".codex"))
+
+
+def _session_id(ref: str) -> str:
+    """claude:<uuid>#3, <uuid>, codex:<uuid> all name the same session."""
+    return ref.split("#", 1)[0].rsplit(":", 1)[-1].strip().lower()
+
+
 def project_key(source_name: str, cwd: str) -> str:
     return f"{(source_name or '').strip().lower()}:{(cwd or '').strip()}"
 
@@ -87,10 +112,13 @@ class SharingPolicy:
         """True when a teammate must not see this session."""
         with self._lock:
             data = self._load()
-            if session_ref and session_ref in data["private_sessions"]:
+            if session_ref and _session_id(session_ref) in {_session_id(r) for r in data["private_sessions"]}:
                 return True
             if self.mode == "open":
                 return False
+            if is_catch_all_dir(cwd):
+                # Never shared, whatever was decided: anything can start there.
+                return True
             entry = data["projects"].get(project_key(source_name, cwd))
         return (entry or {}).get("level") != "team"
 
@@ -205,7 +233,8 @@ class SharingReviewer:
             seen = data["projects"].get(key)
             if key in decided and seen:
                 continue
-            if seen and int(project["sessions"]) < int(seen.get("sessions") or 0) + 5:
+            stale_catch_all = bool(seen) and seen.get("level") != "owner" and is_catch_all_dir(project["cwd"])
+            if seen and not stale_catch_all and int(project["sessions"]) < int(seen.get("sessions") or 0) + 5:
                 continue
             out.append(project)
         return out
@@ -237,6 +266,14 @@ class SharingReviewer:
                     data["projects"][key] = {
                         "level": "owner", "confidence": "high", "sessions": project["sessions"],
                         "reason": "Private chat home or agent workspace — kept to you.",
+                        "private_sessions": [], "at": _now(),
+                    }
+                    self.status["done"] += 1
+                    continue
+                if is_catch_all_dir(project["cwd"]):
+                    data["projects"][key] = {
+                        "level": "owner", "confidence": "high", "sessions": project["sessions"],
+                        "reason": "A catch-all folder (home, ~/Code, Downloads, temp) where any kind of session starts — kept to you.",
                         "private_sessions": [], "at": _now(),
                     }
                     self.status["done"] += 1

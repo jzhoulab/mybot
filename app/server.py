@@ -3721,7 +3721,9 @@ class AppState:
                 "or non-work activities — nor such details about other people who appear in the "
                 "sessions. If a question asks for that, decline in one sentence and offer to help "
                 "with the project or science side instead. When unsure whether something is "
-                "personal, leave it out."
+                "personal, leave it out. When declining, don't confirm whether such sessions "
+                "exist, when they happened or which folder they're in, and don't list nearby "
+                "personal matches — say only that it's outside what you can share."
             )
         if str(policy.get("scope") or "projects_and_science") == "projects_and_science":
             lines.append(
@@ -3832,7 +3834,9 @@ class AppState:
         if workspace_prompt:
             sections.append(workspace_prompt)
 
-        owner_profile = self.get_owner_profile()
+        # The profile is written for the owner ("my/our" grounding) and can
+        # carry personal context, so only the owner's own private view gets it.
+        owner_profile = self.get_owner_profile() if self.actor_is_owner(viewer_id) else ""
         if owner_profile:
             sections.append(
                 "## Who You Serve (Owner Profile)\n"
