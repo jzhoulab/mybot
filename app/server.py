@@ -2171,6 +2171,7 @@ class AppState:
         account_name: str = "default",
         kind: str = "",
         value: str = "",
+        reconcile: bool = True,
     ) -> dict[str, Any]:
         """Mutate the access policy, persist it, reload live, and reconcile the
         index. Exclusions purge immediately; re-inclusions kick a re-index."""
@@ -2214,6 +2215,9 @@ class AppState:
 
         save_access_config(config)
         self.reload_access_config()
+        if not reconcile:
+            # A batch (accepting many review suggestions) purges once at the end.
+            return {"ok": True, "action": action, "deferred": True}
         purge = self.purge_index_to_policy()
         # A re-inclusion or a visibility loosening can make sessions newly
         # visible; re-index them in the background so they come back.
@@ -2543,15 +2547,29 @@ class AppState:
                 lines.append(f"- [{tool}][{updated_at}] {title}")
         return "\n".join(lines)
 
-    def apply_sharing_decision(self, key: str, level: str) -> None:
+    def apply_sharing_decision(self, key: str, level: str, *, reconcile: bool = True) -> None:
         source_name, _, cwd = key.partition(":")
         if level not in LEVELS or not source_name or not cwd:
             raise ValueError("need a project key (source:cwd) and a level: team, owner or exclude")
         self.sharing.decide(key, level)
         if level == "exclude":
-            self.update_scope(action="exclude", source_name=source_name, kind="workdir", value=cwd)
-        # A sharing decision is also the project's index review.
-        self.review_project(source_name=source_name, cwd=cwd, decision="exclude" if level == "exclude" else "keep")
+            self.update_scope(action="exclude", source_name=source_name, kind="workdir", value=cwd,
+                              reconcile=reconcile)
+        # A sharing decision is also the project's index review (the scope
+        # change above already did the exclude, so don't repeat it).
+        if reconcile:
+            self.review_project(source_name=source_name, cwd=cwd, decision="keep")
+        else:
+            self.mark_project_reviewed(source_name, cwd)
+
+    def mark_project_reviewed(self, source_name: str, cwd: str) -> None:
+        key = f"{(source_name or '').strip().lower()}:{(cwd or '').strip()}"
+        with self.known_projects_lock:
+            data = self._load_known_projects()
+            entry = data.get("projects", {}).get(key)
+            if entry is not None:
+                entry["reviewed"] = True
+                self._save_known_projects(data)
 
     def sharing_overview(self) -> dict[str, Any]:
         """Every indexed project with the owner's level and the agent's
@@ -5343,12 +5361,18 @@ class ChatHandler(BaseHTTPRequestHandler):
                 # Accept the agent's suggestions for these projects (and the
                 # sessions it flagged inside them).
                 suggestions = state.sharing_reviewer.suggestions()["projects"]
+                excluded = False
                 for key in body.get("keys") or []:
                     suggestion = suggestions.get(str(key))
                     if suggestion:
-                        state.apply_sharing_decision(str(key), suggestion["level"])
+                        # One index purge for the whole batch, not one per project.
+                        state.apply_sharing_decision(str(key), suggestion["level"], reconcile=False)
+                        excluded = excluded or suggestion["level"] == "exclude"
                         for flagged in suggestion.get("private_sessions") or []:
                             state.sharing.set_session_private(flagged["ref"], True, reason=flagged.get("reason", ""))
+                if excluded:
+                    state.purge_index_to_policy()
+                state.detect_new_projects()
             elif action == "session":
                 state.sharing.set_session_private(
                     str(body.get("ref") or ""), coerce_bool(body.get("private"), True),
