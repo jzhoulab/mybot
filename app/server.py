@@ -1759,16 +1759,22 @@ SHARED_CHANNEL_VIEWER = "shared-channel"
 _TITLE_KEYS = ("title", "session_title", "codex_index_title", "thread_name")
 
 
-def _without_titles(payload: dict[str, Any]) -> dict[str, Any]:
+_TITLE_HEADER = re.compile(r"Title: .*?(?= Source: |\n|$)")
+
+
+def _without_titles(payload: Any) -> Any:
     """A session title is the owner's first prompt word for word — the
     owner's to see, meaningless to a teammate. Teammates get the content
-    of shared sessions, not their titles."""
-    # Blank, not drop: callers index payload["title"] directly.
-    out = {k: ("" if k in _TITLE_KEYS else v) for k, v in payload.items()}
-    metadata = out.get("metadata")
-    if isinstance(metadata, dict):
-        out["metadata"] = {k: ("" if k in _TITLE_KEYS else v) for k, v in metadata.items()}
-    return out
+    of shared sessions, not their titles: title fields are blanked (not
+    dropped — callers index payload["title"]) and the "Title: …" header that
+    starts every indexed chunk's text is masked, at any depth."""
+    if isinstance(payload, dict):
+        return {k: ("" if k in _TITLE_KEYS else _without_titles(v)) for k, v in payload.items()}
+    if isinstance(payload, list):
+        return [_without_titles(v) for v in payload]
+    if isinstance(payload, str) and "Title: " in payload:
+        return _TITLE_HEADER.sub("Title: (owner-only)", payload)
+    return payload
 
 
 def attributed_turn(author_label: str, actor_id: str, message: str) -> str:
@@ -3751,7 +3757,9 @@ class AppState:
                 "owner — health, family, relationships, finances, home address or whereabouts, "
                 "personal contacts, accounts and credentials, private messages, email, calendar, "
                 "or non-work activities — nor such details about other people who appear in the "
-                "sessions. If a question asks for that, decline in one sentence and offer to help "
+                "sessions. The owner's grant and funding applications are confidential too: their "
+                "aims, strategy text, budgets, reviews and status, even when they turn up inside a "
+                "work session (e.g. a writing tool tested on a real proposal). If a question asks for that, decline in one sentence and offer to help "
                 "with the project or science side instead. When unsure whether something is "
                 "personal, leave it out. When declining, don't confirm whether such sessions "
                 "exist, when they happened or which folder they're in, and don't list nearby "
