@@ -840,11 +840,18 @@ def _discover_codex() -> dict[str, Any] | None:
         cmd = alt if os.path.exists(alt) else cmd
     if not (shutil.which(cmd) or os.path.exists(cmd)):
         return None
-    # codex doesn't enumerate these in --help; use its documented effort set + the
-    # configured/default model.
-    model = os.environ.get("CODEX_MODEL", "gpt-5.5")
-    return {"backend": "codex_cli", "command": cmd, "models": [model],
-            "efforts": ["low", "medium", "high", "xhigh"]}
+    # codex doesn't enumerate models in --help; it keeps the account's catalog
+    # in ~/.codex/models_cache.json, which follows new releases on its own.
+    from app.model_catalog import codex_default_model, codex_models
+
+    catalog = codex_models()
+    default = codex_default_model()
+    if all(m["slug"] != default for m in catalog):
+        catalog.insert(0, {"slug": default, "label": default, "efforts": ["low", "medium", "high", "xhigh"]})
+    return {"backend": "codex_cli", "command": cmd, "models": [m["slug"] for m in catalog],
+            "efforts": catalog[0]["efforts"],
+            "model_efforts": {m["slug"]: m["efforts"] for m in catalog},
+            "model_labels": {m["slug"]: m["label"] for m in catalog}}
 
 
 def _capabilities() -> dict[str, Any]:
@@ -870,10 +877,10 @@ def cmd_capabilities(_args: argparse.Namespace) -> dict[str, Any]:
     presets = []
     for b in caps["backends"]:
         for model in b["models"]:
-            for effort in b["efforts"]:
+            for effort in (b.get("model_efforts") or {}).get(model, b["efforts"]):
                 presets.append({
                     "id": _preset_id(b["backend"], model, effort),
-                    "label": _label_for(b["backend"], model, effort),
+                    "label": _label_for(b["backend"], (b.get("model_labels") or {}).get(model, model), effort),
                     "backend": b["backend"], "model": model, "thinking": effort,
                 })
     return {"ok": True, "capabilities": caps, "presets": presets}
