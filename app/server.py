@@ -5202,6 +5202,11 @@ class ChatHandler(BaseHTTPRequestHandler):
         ):
             self.respond_json(403, {"ok": False, "error": "local trajectory index stats are not allowed for this actor/scope"})
             return
+        if not self.server.state.actor_is_owner(actor_id):
+            # Corpus size and per-project counts describe the owner's whole
+            # history, shared or not.
+            self.respond_json(403, {"ok": False, "error": "index stats are owner-only"})
+            return
         self.respond_json(
             200,
             {
