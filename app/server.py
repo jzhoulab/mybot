@@ -30,6 +30,7 @@ from typing import Any
 from app.auth import SyncAuthStore
 from app.gui import GUI_HTML, build_gui_state
 from app.api_auth import load_or_create_api_key
+from app.model_catalog import codex_default_model
 from app.redact import extra_literal_secrets, redact_text
 from app.sharing_review import LEVELS, SharingPolicy, SharingReviewer, project_key
 from app.logging_setup import get_logger
@@ -1112,7 +1113,7 @@ class ProviderClient:
             model = str(override.get("model") or self.config.claude_model)
             thinking = str(override.get("thinking") or self.config.claude_thinking)
         elif backend == "codex_cli":
-            model = str(override.get("model") or self.config.model_name or "gpt-5.5")
+            model = str(override.get("model") or self.config.model_name or codex_default_model())
             thinking = str(override.get("thinking") or self.config.codex_reasoning_effort)
         else:
             model = str(override.get("model") or self.config.model_name or "")
@@ -5671,7 +5672,7 @@ def load_config(args: argparse.Namespace) -> AppConfig:
     # codex ignores ~/.codex/config.toml here (--ignore-user-config), so default
     # to the latest model explicitly instead of codex's built-in fallback.
     if provider_backend == "codex_cli" and model_name is None:
-        model_name = os.environ.get("CODEX_MODEL", "gpt-5.5").strip() or None
+        model_name = codex_default_model() or None
 
     sync_tokens_path = os.environ.get("SYNC_TOKENS_PATH", "").strip() or args.sync_tokens_path
     if sync_tokens_path != args.sync_tokens_path and not os.path.exists(sync_tokens_path):
