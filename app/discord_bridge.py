@@ -367,9 +367,9 @@ class DiscordBridgeClient(discord.Client):
         self.tree = app_commands.CommandTree(self)
         self.safe_mentions = discord.AllowedMentions.none()
         self.chat_buffers: dict[str, ChatRequestBuffer] = {}
-        # The team channel the owner connected in the menu app (from the
-        # server), and bots there the owner blocked from relaying.
-        self.team_channel_id: int | None = None
+        # The team channels the owner connected in the menu app (from the
+        # server), and bots the owner blocked from relaying.
+        self.team_channel_ids: set[int] = set()
         self.blocked_bot_ids: set[int] = set()
         self.relay_limiter = relay_protocol.RateLimiter()
         self._register_commands()
@@ -488,16 +488,19 @@ class DiscordBridgeClient(discord.Client):
     # -- team channel ------------------------------------------------------
 
     def _channel_view(self, data: dict[str, Any]) -> None:
-        connected = data.get("connected") if isinstance(data, dict) else None
-        previous = self.team_channel_id
-        cid = str((connected or {}).get("channel_id") or "")
-        self.team_channel_id = int(cid) if cid.isdigit() else None
+        if not isinstance(data, dict) or "channels" not in data:
+            return
+        previous = self.team_channel_ids
+        self.team_channel_ids = {
+            int(c["channel_id"]) for c in data.get("channels") or []
+            if isinstance(c, dict) and str(c.get("channel_id") or "").isdigit()
+        }
         self.blocked_bot_ids = {int(b) for b in data.get("blocked_bots") or [] if str(b).isdigit()}
-        if self.team_channel_id and self.team_channel_id != previous:
-            self.loop.create_task(self._backfill_team_channel())
+        for channel_id in self.team_channel_ids - previous:
+            self.loop.create_task(self._backfill_team_channel(channel_id))
 
     def _in_team_channel(self, channel: Any) -> bool:
-        return bool(self.team_channel_id) and getattr(channel, "id", None) == self.team_channel_id
+        return getattr(channel, "id", None) in self.team_channel_ids
 
     def _relay_trusted(self, message: discord.Message) -> bool:
         """Bots allowed to relay asks to us: the configured siblings anywhere,
@@ -551,15 +554,18 @@ class DiscordBridgeClient(discord.Client):
         }
 
     async def _feed(self, messages: list[discord.Message]) -> None:
-        if not messages or not self.team_channel_id:
-            return
-        await self.api.channel_call("/channel/feed", {
-            "platform": "discord", "channel_id": str(self.team_channel_id),
-            "messages": [self._feed_row(m) for m in messages],
-        })
+        by_channel: dict[int, list[discord.Message]] = {}
+        for m in messages:
+            if self._in_team_channel(m.channel):
+                by_channel.setdefault(m.channel.id, []).append(m)
+        for channel_id, batch in by_channel.items():
+            await self.api.channel_call("/channel/feed", {
+                "platform": "discord", "channel_id": str(channel_id),
+                "messages": [self._feed_row(m) for m in batch],
+            })
 
-    async def _backfill_team_channel(self) -> None:
-        channel = self.get_channel(self.team_channel_id or 0)
+    async def _backfill_team_channel(self, channel_id: int) -> None:
+        channel = self.get_channel(channel_id)
         if channel is None:
             return
         try:

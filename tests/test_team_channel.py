@@ -68,9 +68,10 @@ class TeamChannelTest(unittest.TestCase):
     def test_connect_requires_a_reported_channel(self) -> None:
         self.assertFalse(self.channel.connect("discord", "777")["ok"])
         view = self.channel.connect("discord", "555")
-        self.assertEqual(view["connected"]["session_key"], "discord-guild-1-channel-555")
-        self.assertEqual(self.channel.outbox("discord")["connected"]["channel_id"], "555")
-        self.assertIsNone(self.channel.outbox("slack")["connected"])
+        self.assertEqual(view["current"], "discord:555")
+        self.assertEqual(view["channels"][0]["session_key"], "discord-guild-1-channel-555")
+        self.assertEqual([c["channel_id"] for c in self.channel.outbox("discord")["channels"]], ["555"])
+        self.assertEqual(self.channel.outbox("slack")["channels"], [])
 
     def test_feed_ignores_other_channels(self) -> None:
         self.channel.connect("discord", "555")
@@ -152,6 +153,46 @@ class TeamChannelTest(unittest.TestCase):
         again = TeamChannel(self.tmp.name)
         self.assertEqual([m["text"] for m in again.view()["messages"]], ["morning"])
 
+    def test_several_channels_across_platforms(self) -> None:
+        self.channel.sync({"platform": "slack", "self_id": "UB", "self_name": "jian-mybot",
+                           "channels": [{"id": "C1", "name": "lab"}]})
+        self.channel.connect("discord", "555")
+        view = self.channel.connect("slack", "C1")
+        self.assertEqual(view["current"], "slack:C1")
+        self.assertEqual([c["key"] for c in view["channels"]], ["discord:555", "slack:C1"])
+        self.assertEqual([c["channel_id"] for c in self.channel.outbox("slack")["channels"]], ["C1"])
+
+        # Each channel keeps its own feed and unread count.
+        self._feed({"id": "1", "author_id": "300", "author_name": "Alex", "text": "discord msg"})
+        self.channel.feed({"platform": "slack", "channel_id": "C1", "messages": [
+            {"id": "9.1", "author_id": "U7", "author_name": "Sam", "text": "slack msg"}]}, owner_name="Jian")
+        unread = {c["key"]: c["unread"] for c in self.channel.view()["channels"]}
+        self.assertEqual(unread, {"discord:555": 1, "slack:C1": 1})
+        slack = self.channel.view(channel="slack:C1", read=True)
+        self.assertEqual([m["text"] for m in slack["messages"]], ["slack msg"])
+        unread = {c["key"]: c["unread"] for c in self.channel.view()["channels"]}
+        self.assertEqual(unread, {"discord:555": 1, "slack:C1": 0})
+
+        # A post goes to the channel it was written in, in that platform's form.
+        self.channel.post("hello lab", [], owner_name="Jian", owner_actor_id="U0", channel="slack:C1")
+        item = self.channel.outbox("slack")["items"][0]
+        self.assertEqual((item["channel_id"], item["text"]), ("C1", "*Jian* (via jian-mybot): hello lab"))
+        self.assertEqual(self.channel.outbox("discord")["items"], [])
+        self.assertFalse(self.channel.post("x", [], owner_name="Jian", owner_actor_id="1", channel="slack:C9")["ok"])
+
+        self.channel.disconnect("discord:555")
+        self.assertEqual([c["key"] for c in self.channel.view()["channels"]], ["slack:C1"])
+
+    def test_old_single_channel_config_migrates(self) -> None:
+        import json
+        from pathlib import Path
+        path = Path(self.tmp.name) / "team_channel.json"
+        data = json.loads(path.read_text())
+        data.pop("channels")
+        data["connected"] = {"platform": "discord", "channel_id": "555", "name": "team"}
+        path.write_text(json.dumps(data))
+        self.assertEqual([c["key"] for c in TeamChannel(self.tmp.name).view()["channels"]], ["discord:555"])
+
     def test_block_bot(self) -> None:
         self.channel.connect("discord", "555")
         self.channel.set_blocked("200", True)
@@ -165,7 +206,7 @@ class DiscordRelayTrustTest(unittest.TestCase):
         from app.discord_bridge import DiscordBridgeClient
 
         fake = SimpleNamespace(
-            config=SimpleNamespace(sibling_bot_ids={11}), blocked_bot_ids={33}, team_channel_id=555,
+            config=SimpleNamespace(sibling_bot_ids={11}), blocked_bot_ids={33}, team_channel_ids={555},
         )
         fake._in_team_channel = lambda ch: DiscordBridgeClient._in_team_channel(fake, ch)
 

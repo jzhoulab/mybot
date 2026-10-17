@@ -37,6 +37,10 @@ struct ChannelInfo: Identifiable, Hashable {
     let channelId: String
     let name: String
     let guild: String
+    var unread = 0
+
+    /// Sidebar section: the Discord server, or the Slack workspace.
+    var workspace: String { guild.isEmpty ? platform.capitalized : guild }
 }
 
 struct ChannelWaiting: Identifiable, Hashable {
@@ -49,7 +53,8 @@ struct ChannelWaiting: Identifiable, Hashable {
 /// The team channel (one shared Discord/Slack channel) as the menu app sees
 /// it: the bridge mirrors it to the server, this polls the server.
 final class ChannelModel: ObservableObject {
-    @Published var connected: ChannelInfo?
+    @Published var channels: [ChannelInfo] = []     // connected, in order
+    @Published var current = ""                      // key of the channel shown
     @Published var available: [ChannelInfo] = []
     @Published var bridges: [String] = []
     @Published var messages: [ChannelMessage] = []
@@ -63,7 +68,13 @@ final class ChannelModel: ObservableObject {
     private var timer: Timer?
     private var inFlight = false
 
-    init(config: MybotConfig) { self.config = config }
+    init(config: MybotConfig) {
+        self.config = config
+        current = UserDefaults.standard.string(forKey: "teamChannel") ?? ""
+    }
+
+    var connected: ChannelInfo? { channels.first { $0.id == current } }
+    var unconnected: [ChannelInfo] { available.filter { a in !channels.contains { $0.id == a.id } } }
 
     private func url(_ query: String = "") -> URL {
         var comps = URLComponents(url: config.guiURL, resolvingAgainstBaseURL: false)!
@@ -83,12 +94,17 @@ final class ChannelModel: ObservableObject {
     func refresh(full: Bool = false) {
         guard !inFlight else { return }
         inFlight = true
-        var request = URLRequest(url: url(full ? "" : "after=\(seq)"))
+        let channel = current.addingPercentEncoding(withAllowedCharacters: .urlQueryAllowed) ?? ""
+        let shown = timer != nil ? "&read=1" : ""
+        var request = URLRequest(url: url("channel=\(channel)\(shown)" + (full ? "" : "&after=\(seq)")))
         request.timeoutInterval = 10
+        let asked = current
         MybotHTTP.session.dataTask(with: request) { [weak self] data, _, _ in
             let obj = data.flatMap { try? JSONSerialization.jsonObject(with: $0) as? [String: Any] }
             DispatchQueue.main.async {
                 guard let self else { return }
+                // A reply for a channel the user already left behind is stale.
+                guard asked == self.current else { return }
                 self.inFlight = false
                 if let obj { self.apply(obj, full: full) }
             }
@@ -97,8 +113,10 @@ final class ChannelModel: ObservableObject {
 
     private func apply(_ obj: [String: Any], full: Bool) {
         loaded = true
-        let previous = connected
-        connected = (obj["connected"] as? [String: Any]).map(Self.channel)
+        let previous = current
+        channels = ((obj["channels"] as? [[String: Any]]) ?? []).map(Self.channel)
+        current = (obj["current"] as? String) ?? ""
+        if !current.isEmpty { UserDefaults.standard.set(current, forKey: "teamChannel") }
         available = ((obj["available"] as? [[String: Any]]) ?? []).map(Self.channel)
         bridges = ((obj["bridges"] as? [String: Any]) ?? [:]).keys.sorted()
         members = ((obj["members"] as? [[String: Any]]) ?? []).map {
@@ -111,7 +129,7 @@ final class ChannelModel: ObservableObject {
                            name: ($0["name"] as? String) ?? "")
         }
         let incoming = ((obj["messages"] as? [[String: Any]]) ?? []).map(Self.message)
-        if full || previous?.id != connected?.id {
+        if full || previous != current {
             messages = incoming
         } else if !incoming.isEmpty {
             let known = Set(messages.map(\.id))
@@ -126,7 +144,8 @@ final class ChannelModel: ObservableObject {
     private static func channel(_ c: [String: Any]) -> ChannelInfo {
         ChannelInfo(platform: (c["platform"] as? String) ?? "discord",
                     channelId: (c["channel_id"] as? String) ?? (c["id"] as? String) ?? "",
-                    name: (c["name"] as? String) ?? "", guild: (c["guild"] as? String) ?? "")
+                    name: (c["name"] as? String) ?? "", guild: (c["guild"] as? String) ?? "",
+                    unread: (c["unread"] as? Int) ?? 0)
     }
 
     private static func message(_ m: [String: Any]) -> ChannelMessage {
@@ -152,8 +171,22 @@ final class ChannelModel: ObservableObject {
         }.resume()
     }
 
+    func select(_ key: String) {
+        guard key != current else { return }
+        current = key   // optimistic
+        if let i = channels.firstIndex(where: { $0.id == key }) { channels[i].unread = 0 }
+        messages = []
+        members = []
+        waiting = []
+        seq = 0
+        UserDefaults.standard.set(key, forKey: "teamChannel")
+        inFlight = false
+        refresh(full: true)
+    }
+
     func connect(_ channel: ChannelInfo) {
-        connected = channel   // optimistic
+        if !channels.contains(where: { $0.id == channel.id }) { channels.append(channel) }   // optimistic
+        current = channel.id
         messages = []
         post(["action": "connect", "platform": channel.platform, "channel_id": channel.channelId]) { [weak self] obj in
             guard let self else { return }
@@ -162,10 +195,13 @@ final class ChannelModel: ObservableObject {
         }
     }
 
-    func disconnect() {
-        connected = nil
-        messages = []
-        post(["action": "disconnect"]) { [weak self] obj in if let obj { self?.apply(obj, full: true) } }
+    func disconnect(_ key: String) {
+        channels.removeAll { $0.id == key }
+        if current == key { current = channels.first?.id ?? ""; messages = [] }
+        post(["action": "disconnect", "channel": key]) { [weak self] obj in
+            guard let self, obj != nil else { return }
+            self.refresh(full: true)
+        }
     }
 
     func setBlocked(_ member: ChannelMember, _ blocked: Bool) {
@@ -187,7 +223,7 @@ final class ChannelModel: ObservableObject {
             authorName: me?.name ?? "mybot", isBot: true, isSelf: true,
             onBehalf: ownerName.isEmpty ? "You" : ownerName, text: clean, replyTo: replyTo,
             relayKind: "", local: false, pending: true))
-        let body: [String: Any] = ["action": "post", "text": clean, "reply_to": replyTo,
+        let body: [String: Any] = ["action": "post", "text": clean, "reply_to": replyTo, "channel": current,
                                    "mention_ids": mentions(in: clean).map(\.id)]
         post(body) { [weak self] obj in
             guard let self else { return }
@@ -214,20 +250,126 @@ struct ChannelView: View {
     @State private var showMembers = false
     @FocusState private var focused: Bool
 
+    @State private var showAdd = false
+
     var body: some View {
-        VStack(spacing: 0) {
-            if let connected = channel.connected {
-                header(connected)
-                Divider().opacity(0.3)
-                messageList
-                Divider().opacity(0.3)
-                composer
-            } else {
+        Group {
+            if channel.channels.isEmpty {
                 connectList
+            } else {
+                HStack(spacing: 0) {
+                    sidebar
+                    Divider().opacity(0.4)
+                    VStack(spacing: 0) {
+                        if let connected = channel.connected {
+                            header(connected)
+                            Divider().opacity(0.3)
+                            messageList
+                            Divider().opacity(0.3)
+                            composer
+                        } else {
+                            Spacer()
+                        }
+                    }
+                }
             }
         }
         .onAppear { channel.start(); focused = true }
         .onDisappear { channel.stop() }
+        .onChange(of: channel.current) { replyTo = nil; input = "" }
+    }
+
+    // MARK: sidebar
+
+    /// Connected channels grouped by Discord server / Slack workspace, with
+    /// unread counts, like Slack's channel list.
+    private var sidebar: some View {
+        let groups = Dictionary(grouping: channel.channels, by: \.workspace)
+        let order = channel.channels.map(\.workspace).reduce(into: [String]()) { if !$0.contains($1) { $0.append($1) } }
+        return VStack(alignment: .leading, spacing: 0) {
+            ScrollView {
+                VStack(alignment: .leading, spacing: 10) {
+                    ForEach(order, id: \.self) { workspace in
+                        VStack(alignment: .leading, spacing: 1) {
+                            Text(workspace).font(.system(size: 9.5, weight: .heavy)).foregroundStyle(.secondary)
+                                .lineLimit(1).padding(.horizontal, 6).padding(.bottom, 2)
+                            ForEach(groups[workspace] ?? []) { c in sidebarRow(c) }
+                        }
+                    }
+                }
+                .padding(.horizontal, 6).padding(.vertical, 8)
+            }
+            Divider().opacity(0.3)
+            Button { showAdd.toggle() } label: {
+                HStack(spacing: 5) {
+                    Image(systemName: "plus").font(.system(size: 10, weight: .bold))
+                    Text("Add channel").font(.system(size: 11, weight: .medium))
+                    Spacer()
+                }
+                .foregroundStyle(.secondary).padding(.horizontal, 12).padding(.vertical, 8)
+                .contentShape(Rectangle())
+            }
+            .buttonStyle(.plain)
+            .popover(isPresented: $showAdd, arrowEdge: .trailing) { addPopover }
+        }
+        .frame(width: 136)
+        .background(Color.primary.opacity(0.035))
+    }
+
+    private func sidebarRow(_ c: ChannelInfo) -> some View {
+        let selected = c.id == channel.current
+        return Button { channel.select(c.id) } label: {
+            HStack(spacing: 4) {
+                Image(systemName: "number").font(.system(size: 9.5, weight: .semibold))
+                    .foregroundStyle(selected ? Color.white.opacity(0.85) : .secondary)
+                Text(c.name).font(.system(size: 11.5, weight: c.unread > 0 ? .bold : .regular)).lineLimit(1)
+                Spacer(minLength: 2)
+                if c.unread > 0 && !selected {
+                    Text(c.unread > 99 ? "99+" : "\(c.unread)").font(.system(size: 9, weight: .bold))
+                        .padding(.horizontal, 5).padding(.vertical, 1)
+                        .background(Capsule().fill(Palette.bad)).foregroundStyle(.white)
+                }
+            }
+            .foregroundStyle(selected ? Color.white : Color.primary)
+            .padding(.horizontal, 6).padding(.vertical, 4)
+            .background(RoundedRectangle(cornerRadius: 6, style: .continuous)
+                .fill(selected ? Palette.accent : Color.clear))
+            .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
+        .contextMenu {
+            Button("Leave #\(c.name)") { channel.disconnect(c.id) }
+        }
+        .help(c.platform.capitalized + (c.guild.isEmpty ? "" : " · \(c.guild)"))
+    }
+
+    private var addPopover: some View {
+        VStack(alignment: .leading, spacing: 6) {
+            Text("ADD A TEAM CHANNEL").font(.system(size: 9.5, weight: .heavy)).tracking(0.5).foregroundStyle(.secondary)
+            if channel.unconnected.isEmpty {
+                Text("Every channel your bot can post in is already here. Invite it to another channel on Discord or Slack and it shows up within a few minutes.")
+                    .font(.system(size: 10.5)).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
+            } else {
+                ScrollView {
+                    VStack(alignment: .leading, spacing: 2) {
+                        ForEach(channel.unconnected) { c in
+                            Button { channel.connect(c); showAdd = false } label: {
+                                HStack(spacing: 6) {
+                                    Image(systemName: "number").font(.system(size: 10)).foregroundStyle(.secondary)
+                                    Text(c.name).font(.system(size: 11.5, weight: .medium))
+                                    Spacer(minLength: 8)
+                                    Text(c.workspace).font(.system(size: 9.5)).foregroundStyle(.secondary).lineLimit(1)
+                                }
+                                .padding(.horizontal, 6).padding(.vertical, 4).contentShape(Rectangle())
+                            }
+                            .buttonStyle(.plain)
+                        }
+                    }
+                }
+                .frame(maxHeight: 260)
+            }
+        }
+        .padding(12).frame(width: 280)
     }
 
     // MARK: header
@@ -253,13 +395,7 @@ struct ChannelView: View {
             .help("People and bots in this channel")
             .popover(isPresented: $showMembers, arrowEdge: .bottom) { membersPopover }
             Menu {
-                ForEach(channel.available.filter { $0.id != c.id }) { other in
-                    Button("Switch to #\(other.name)" + (other.guild.isEmpty ? "" : " (\(other.guild))")) {
-                        channel.connect(other)
-                    }
-                }
-                Divider()
-                Button("Disconnect channel") { channel.disconnect() }
+                Button("Leave #\(c.name)") { channel.disconnect(c.id) }
             } label: {
                 Image(systemName: "ellipsis.circle").font(.system(size: 12))
             }
@@ -300,7 +436,7 @@ struct ChannelView: View {
         ScrollView {
             VStack(alignment: .leading, spacing: 10) {
                 Text("Team channel").font(.system(size: 13, weight: .bold))
-                Text("Pick the shared Discord or Slack channel where your team and their mybots talk. You'll see it here, and you can @mention a teammate's bot to ask it, or yours to have it answer. Everything in the channel is public to its members, so your bot answers there with what teammates may see.")
+                Text("Pick the shared Discord or Slack channels where your team and their mybots talk; add as many as you like. You'll see it here, and you can @mention a teammate's bot to ask it, or yours to have it answer. Everything in the channel is public to its members, so your bot answers there with what teammates may see.")
                     .font(.system(size: 11)).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
                 if !channel.loaded {
                     ProgressView().controlSize(.small)

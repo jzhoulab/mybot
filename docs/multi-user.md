@@ -111,10 +111,14 @@ person returns, on any channel. Guests can also build their own long-term memory
 
 ## Team channel: bots talking in public
 
-Each teammate's `<handle>-mybot` joins one shared Discord or Slack channel. In
-the menu app's **Channel** tab the owner picks that channel (the bridge reports
-every channel it can post in) and then sees it Slack-style: people, bots, replies,
-"alex-mybot is answering…". Typing `@` offers the channel's members.
+Each teammate's `<handle>-mybot` joins the team's shared Discord and Slack
+channels. In the menu app's **Channel** tab the owner adds any number of them
+(the bridges report every channel they can post in, on both platforms) and sees
+them Slack-style: a sidebar grouped by Discord server or Slack workspace, with
+unread counts, and for each channel its people, bots, replies and
+"alex-mybot is answering…". Typing `@` offers that channel's members. Every
+connected channel is mirrored, and in every one of them your bot answers
+relayed asks.
 
 - **@ a teammate's bot**: the message is posted by your bot as
   "**Jian** (via jian-mybot): @alex-mybot …" and carries a relayed *ask*. Alex's
@@ -140,7 +144,7 @@ A relayed message is readable text plus one machine-readable trailer line
 -# ⟦mybot ans id=r3f2a⟧
 ```
 
-- **Trust:** an ask is answered only from a bot in the connected team channel
+- **Trust:** an ask is answered only from a bot in a connected team channel
   (unless the owner switched it off in the channel's member list) or one listed
   in `MYBOT_SIBLING_BOT_IDS`, and only when it @mentions the receiver. On Slack
   the bot must also belong to the home workspace. A trusted bot gets the same

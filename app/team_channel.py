@@ -1,7 +1,8 @@
-"""The team channel: one shared Discord/Slack channel the owner connects, where
-teammates and their mybot instances talk in public.
+"""Team channels: the shared Discord/Slack channels the owner connects, where
+teammates and their mybot instances talk in public. Any number, across both
+platforms; each keeps its own feed and unread count.
 
-The bridge mirrors that channel here (POST /channel/feed) and reports which
+The bridge mirrors those channels here (POST /channel/feed) and reports which
 channels it can see (POST /channel/sync). The menu app reads the feed and
 posts through it (GET/POST /channel): the bridge picks posts up from
 /channel/outbox and sends them as this bot, on the owner's behalf. An @mention
@@ -50,7 +51,11 @@ class TeamChannel:
             data = json.loads(self.config_path.read_text())
         except (OSError, ValueError):
             data = {}
-        data.setdefault("connected", None)
+        # Connected channels: [{platform, channel_id, name, guild, session_key,
+        # label, since, read_seq}]. Older files held a single "connected".
+        if "channels" not in data:
+            data["channels"] = [data["connected"]] if data.get("connected") else []
+        data.pop("connected", None)
         data.setdefault("blocked_bots", [])
         data.setdefault("platforms", {})   # platform -> {self_id, self_name, channels, updated}
         return data
@@ -114,20 +119,27 @@ class TeamChannel:
                 "self_id": _clean(body.get("self_id"), 40), "self_name": _clean(body.get("self_name"), 100),
                 "channels": channels[:200], "updated": _now(),
             }
-            connected = self._config.get("connected")
-            if connected and connected.get("platform") == platform:
-                for ch in channels:   # keep the session key/label current
-                    if ch["id"] == connected.get("channel_id"):
-                        connected.update({k: ch[k] for k in ("name", "guild", "session_key", "label") if ch[k]})
+            reported = {ch["id"]: ch for ch in channels}
+            for connected in self._config["channels"]:   # keep session keys/labels current
+                ch = reported.get(connected["channel_id"]) if connected["platform"] == platform else None
+                if ch:
+                    connected.update({k: ch[k] for k in ("name", "guild", "session_key", "label") if ch[k]})
             self._save_config()
             return self.bridge_view(platform)
 
+    def _connected(self, platform: str, channel_id: str) -> dict[str, Any] | None:
+        return next((c for c in self._config["channels"]
+                     if c["platform"] == platform and c["channel_id"] == channel_id), None)
+
+    def _by_key(self, key: str) -> dict[str, Any] | None:
+        platform, _, channel_id = (key or "").partition(":")
+        return self._connected(platform, channel_id)
+
     def bridge_view(self, platform: str) -> dict[str, Any]:
-        connected = self._config.get("connected")
-        mine = connected if connected and connected.get("platform") == platform else None
+        mine = [c for c in self._config["channels"] if c["platform"] == platform]
         return {
             "ok": True,
-            "connected": mine,
+            "channels": mine,
             "blocked_bots": list(self._config.get("blocked_bots") or []),
         }
 
@@ -137,9 +149,8 @@ class TeamChannel:
         channel_id = _clean(body.get("channel_id"), 40)
         added = 0
         with self._lock:
-            connected = self._config.get("connected") or {}
-            if connected.get("platform") != platform or connected.get("channel_id") != channel_id:
-                return {"ok": True, "added": 0, "ignored": "not the connected channel"}
+            if self._connected(platform, channel_id) is None:
+                return {"ok": True, "added": 0, "ignored": "not a connected channel"}
             self_id = (self._config["platforms"].get(platform) or {}).get("self_id", "")
             feed = self._feed(platform, channel_id)
             known = {r.get("id") for r in feed}
@@ -218,32 +229,43 @@ class TeamChannel:
 
     # -- menu app side --
 
-    def view(self, *, after: int = 0) -> dict[str, Any]:
+    def _unread(self, channel: dict[str, Any]) -> int:
+        feed = self._feed(channel["platform"], channel["channel_id"])
+        read = int(channel.get("read_seq") or 0)
+        return sum(1 for r in feed if int(r.get("seq") or 0) > read and not r.get("is_self") and not r.get("local"))
+
+    def view(self, *, channel: str = "", after: int = 0, read: bool = False) -> dict[str, Any]:
+        """The menu app's view: every connected channel (with unread counts)
+        and the messages of one of them (`channel` = "platform:id", default
+        the first). `read` marks that channel read up to now."""
         with self._lock:
-            connected = self._config.get("connected")
             platforms = self._config.get("platforms") or {}
-            available = [
-                {**ch, "platform": p}
-                for p, info in platforms.items() for ch in info.get("channels") or []
-            ]
+            current = self._by_key(channel) or (self._config["channels"][0] if self._config["channels"] else None)
             out: dict[str, Any] = {
-                "ok": True, "connected": connected, "available": available,
+                "ok": True,
+                "available": [{**ch, "platform": p} for p, info in platforms.items() for ch in info.get("channels") or []],
                 "bridges": {p: {"self_id": i.get("self_id"), "self_name": i.get("self_name"),
                                 "updated": i.get("updated")} for p, i in platforms.items()},
+                "current": f"{current['platform']}:{current['channel_id']}" if current else "",
                 "messages": [], "members": [], "waiting": [], "seq": self._seq,
             }
-            if not connected:
-                return out
-            platform, channel_id = connected["platform"], connected["channel_id"]
-            feed = self._feed(platform, channel_id)
-            out["messages"] = [r for r in feed if int(r.get("seq") or 0) > after][-200:]
-            out["members"] = self._members(platform, feed)
-            now = _now()
-            for request_id, w in list(self._waiting.items()):
-                if now - w["created"] > ASK_TIMEOUT_SECONDS or not w["bots"]:
-                    self._waiting.pop(request_id, None)
-                    continue
-                out["waiting"] += [{"request_id": request_id, "bot_id": b, "name": n} for b, n in w["bots"].items()]
+            if current is not None:
+                platform, channel_id = current["platform"], current["channel_id"]
+                feed = self._feed(platform, channel_id)
+                out["messages"] = [r for r in feed if int(r.get("seq") or 0) > after][-200:]
+                out["members"] = self._members(platform, feed)
+                if read and feed and int(feed[-1].get("seq") or 0) > int(current.get("read_seq") or 0):
+                    current["read_seq"] = int(feed[-1].get("seq") or 0)
+                    self._save_config()
+                now = _now()
+                for request_id, w in list(self._waiting.items()):
+                    if now - w["created"] > ASK_TIMEOUT_SECONDS or not w["bots"]:
+                        self._waiting.pop(request_id, None)
+                        continue
+                    if w.get("channel") == out["current"]:
+                        out["waiting"] += [{"request_id": request_id, "bot_id": b, "name": n} for b, n in w["bots"].items()]
+            out["channels"] = [{**c, "key": f"{c['platform']}:{c['channel_id']}", "unread": self._unread(c)}
+                               for c in self._config["channels"]]
             out["seq"] = self._seq
             return out
 
@@ -275,15 +297,18 @@ class TeamChannel:
             match = next((c for c in info.get("channels") or [] if c["id"] == channel_id), None)
             if match is None:
                 return {"ok": False, "error": "the bridge hasn't reported that channel"}
-            self._config["connected"] = {"platform": platform, "channel_id": channel_id, **{
-                k: match[k] for k in ("name", "guild", "session_key", "label")}, "since": _now()}
-            self._save_config()
-        return self.view()
+            if self._connected(platform, channel_id) is None:
+                self._config["channels"].append({"platform": platform, "channel_id": channel_id, **{
+                    k: match[k] for k in ("name", "guild", "session_key", "label")}, "since": _now(), "read_seq": 0})
+                self._save_config()
+        return self.view(channel=f"{platform}:{channel_id}")
 
-    def disconnect(self) -> dict[str, Any]:
+    def disconnect(self, key: str) -> dict[str, Any]:
         with self._lock:
-            self._config["connected"] = None
-            self._save_config()
+            target = self._by_key(key)
+            if target is not None:
+                self._config["channels"].remove(target)
+                self._save_config()
         return self.view()
 
     def set_blocked(self, bot_id: str, blocked: bool) -> dict[str, Any]:
@@ -295,16 +320,16 @@ class TeamChannel:
         return self.view()
 
     def post(self, text: str, mention_ids: list[str], *, owner_name: str, owner_actor_id: str,
-             reply_to: str = "") -> dict[str, Any]:
+             reply_to: str = "", channel: str = "") -> dict[str, Any]:
         """Queue the owner's message for the channel. `text` names people as
         @Name; `mention_ids` are the members picked in the composer."""
         text = (text or "").strip()[:3500]
         if not text:
             return {"ok": False, "error": "empty message"}
         with self._lock:
-            connected = self._config.get("connected")
+            connected = self._by_key(channel) or (self._config["channels"][0] if not channel and self._config["channels"] else None)
             if not connected:
-                return {"ok": False, "error": "no team channel connected"}
+                return {"ok": False, "error": "that channel isn't connected"}
             platform, channel_id = connected["platform"], connected["channel_id"]
             info = self._config["platforms"].get(platform) or {}
             self_id, self_name = info.get("self_id", ""), info.get("self_name") or "mybot"
@@ -321,7 +346,8 @@ class TeamChannel:
             body = relay_protocol.on_behalf_prefix(platform, owner_name, self_name) + wire
             if bots:
                 body += relay_protocol.trailer(platform, "ask", request_id, actor_id=owner_actor_id, name=owner_name)
-                self._waiting[request_id] = {"bots": {b["id"]: b["name"] for b in bots}, "created": _now()}
+                self._waiting[request_id] = {"bots": {b["id"]: b["name"] for b in bots}, "created": _now(),
+                                             "channel": f"{platform}:{channel_id}"}
             item = {
                 "id": f"p{int(_now() * 1000)}-{len(self._outbox)}", "platform": platform,
                 "channel_id": channel_id, "text": body, "mention_ids": [m["id"] for m in picked],
@@ -335,5 +361,6 @@ class TeamChannel:
             }
             self._outbox.append(item)
             if asks_self:
-                self._waiting[f"self-{item['id']}"] = {"bots": {self_id: self_name}, "created": _now()}
+                self._waiting[f"self-{item['id']}"] = {"bots": {self_id: self_name}, "created": _now(),
+                                                       "channel": f"{platform}:{channel_id}"}
         return {"ok": True, "queued": item["id"], "relay_id": request_id}

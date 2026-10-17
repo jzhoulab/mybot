@@ -4257,7 +4257,10 @@ class ChatHandler(BaseHTTPRequestHandler):
             channel = self.server.state.team_channel
             if path == "/channel":
                 after = (query.get("after") or ["0"])[0]
-                self.respond_json(200, channel.view(after=int(after) if after.isdigit() else 0))
+                self.respond_json(200, channel.view(
+                    channel=(query.get("channel") or [""])[0], after=int(after) if after.isdigit() else 0,
+                    read=(query.get("read") or [""])[0] == "1",
+                ))
             else:
                 self.respond_json(200, channel.outbox((query.get("platform") or ["discord"])[0]))
             return
@@ -5402,17 +5405,18 @@ class ChatHandler(BaseHTTPRequestHandler):
         if action == "connect":
             result = channel.connect(str(body.get("platform") or "discord"), str(body.get("channel_id") or ""))
         elif action == "disconnect":
-            result = channel.disconnect()
+            result = channel.disconnect(str(body.get("channel") or ""))
         elif action in {"block", "unblock"}:
             result = channel.set_blocked(str(body.get("bot_id") or ""), action == "block")
         elif action == "post":
-            connected = channel.view().get("connected") or {}
+            key = str(body.get("channel") or "")
             result = channel.post(
                 str(body.get("text") or ""),
                 [str(m) for m in body.get("mention_ids") or []],
                 owner_name=state.owner_name() or "the owner",
-                owner_actor_id=state.owner_actor_for(connected.get("platform") or "discord"),
+                owner_actor_id=state.owner_actor_for(key.partition(":")[0] or "discord"),
                 reply_to=str(body.get("reply_to") or ""),
+                channel=key,
             )
         else:
             result = {"ok": False, "error": f"unknown action {action!r}"}
