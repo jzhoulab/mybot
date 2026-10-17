@@ -39,6 +39,7 @@ from __future__ import annotations
 import json
 import os
 import re
+import shlex
 import sqlite3
 import threading
 import time
@@ -857,9 +858,15 @@ class BriefingRunner:
                              "The message is ready to paste there."}
         agent = "codex" if self.engine == "gpt" else "claude"
         name = f"pulse-{date[5:].replace('-', '')}-{self.engine}-{action_id}"
-        spawn = self._hopa(["tool", "hopx_spawn_agent", json.dumps({
-            "name": name, "agent": agent, "cwd": action.get("cwd") or str(Path.home() / "Code"),
-        })], timeout=180)
+        source = source_session(self.state.config.trajectory_index_db_path, str(action.get("source_ref") or ""))
+        if source:
+            name = resumed_session_name(source)
+        spec: dict[str, Any] = {"name": name, "agent": agent, "cwd": action.get("cwd") or str(Path.home() / "Code")}
+        # Not open in hop: reopen the item's own conversation, so the
+        # follow-up lands in the exact session it's about.
+        if source:
+            spec.update({"agent": "custom", "command": _resume_command(source), "cwd": source["cwd"] or spec["cwd"]})
+        spawn = self._hopa(["tool", "hopx_spawn_agent", json.dumps(spec)], timeout=180)
         if not spawn.get("ok"):
             raise RuntimeError(f"hop spawn failed: {spawn}")
         terminal = str(spawn.get("terminal_id") or name)
@@ -873,6 +880,8 @@ class BriefingRunner:
             raise RuntimeError(f"hop send failed: {sent}")
         action["spawned"] = {
             "terminal": name, "terminal_id": terminal, "session": spawn.get("sessionName"),
+            "routed": "resumed" if source else "new",
+            "resumes": f"{source['agent']}:{source['session_id']}" if source else "",
             "at": datetime.now(timezone.utc).isoformat(),
         }
         path.write_text(json.dumps(data, indent=1, default=str))
@@ -996,6 +1005,76 @@ HOP_ASSET_ROOTS = [
 PULSE_TASK_DIR = Path.home() / ".mybot" / "pulse-tasks"
 
 
+def source_session(db_path: str | Path, source_ref: str) -> dict[str, Any] | None:
+    """The pulse item's own conversation, resolvable from an abbreviated ref
+    ("claude:2099f0a8…"): {agent, session_id, cwd, env} — enough to resume it
+    exactly where it was, with the CLI home it lives under."""
+    source, _, ident = (source_ref or "").partition(":")
+    ident = ident.rstrip("…. ").lower()
+    if source not in ("claude", "codex") or len(ident) < 8 or not re.fullmatch(r"[0-9a-f-]+", ident):
+        return None
+    try:
+        with sqlite3.connect(f"file:{db_path}?mode=ro", uri=True, timeout=30) as conn:
+            # A range, not LIKE: it uses the index on this big table.
+            row = conn.execute(
+                "SELECT session_id, file_path, cwd FROM trajectory_chunks WHERE source_name = ? "
+                "AND session_id >= ? AND session_id < ? ORDER BY updated_at DESC LIMIT 1",
+                (source, ident, ident + "g"),
+            ).fetchone()
+    except sqlite3.Error:
+        return None
+    if not row:
+        return None
+    session_id, file_path, cwd = str(row[0]), Path(str(row[1] or "")), str(row[2] or "")
+    # The conversation's own cwd, from its transcript (Claude resumes a
+    # session only from the folder it was recorded in).
+    try:
+        with file_path.open() as handle:
+            for _, line in zip(range(60), handle):
+                try:
+                    rec = json.loads(line)
+                except ValueError:
+                    continue
+                payload = rec.get("payload") if isinstance(rec, dict) else None
+                found = (rec.get("cwd") if isinstance(rec, dict) else "") or \
+                    (payload.get("cwd") if isinstance(payload, dict) else "")
+                if found:
+                    cwd = str(found)
+                    break
+    except OSError:
+        pass
+    # Which CLI home it lives under (~/.claude_fable, a second CODEX_HOME …).
+    env = {}
+    parts = file_path.parts
+    if source == "claude" and "projects" in parts:
+        home = Path(*parts[: parts.index("projects")])
+        if home != Path.home() / ".claude":
+            env["CLAUDE_CONFIG_DIR"] = str(home)
+    if source == "codex":
+        for marker in ("sessions", "archived_sessions"):
+            if marker in parts:
+                home = Path(*parts[: parts.index(marker)])
+                if home != Path.home() / ".codex":
+                    env["CODEX_HOME"] = str(home)
+                break
+    return {"agent": source, "session_id": session_id, "cwd": cwd if Path(cwd).is_dir() else "", "env": env}
+
+
+def resumed_session_name(session: dict[str, Any]) -> str:
+    return f"resume-{session['agent']}-{session['session_id'][:8]}"
+
+
+def _resume_command(session: dict[str, Any], prompt: str = "") -> str:
+    """Reopen that exact conversation (with `prompt` as the next turn)."""
+    env = "".join(f"{k}={shlex.quote(v)} " for k, v in sorted(session["env"].items()))
+    sid = shlex.quote(session["session_id"])
+    if session["agent"] == "codex":
+        cmd = f"{env}command codex --dangerously-bypass-approvals-and-sandbox resume {sid}"
+    else:
+        cmd = f"{env}command claude --resume {sid} --permission-mode bypassPermissions"
+    return f"{cmd} {prompt}" if prompt else cmd
+
+
 def _launch_command(engine: str, task_path: Path) -> str:
     # The phone creates a hop session in the item's folder and types this
     # one line. The task itself lives in a file, so nothing long or quoted
@@ -1019,7 +1098,8 @@ def discord_dm_channel(state: Any) -> str:
 HOP_HISTORY_DAYS = 14
 
 
-def _hop_pulse(engine: str, latest: dict[str, Any], sessions: dict[str, dict[str, Any]]) -> dict[str, Any]:
+def _hop_pulse(engine: str, latest: dict[str, Any], sessions: dict[str, dict[str, Any]],
+              db_path: str | Path | None = None) -> dict[str, Any]:
     """One engine's pulse as the phone reads it, with launchable follow-ups."""
     actions = []
     for action in latest.get("actions") or []:
@@ -1033,10 +1113,19 @@ def _hop_pulse(engine: str, latest: dict[str, Any], sessions: dict[str, dict[str
             "id": action["id"],
             "label": action.get("label") or "Follow up",
             "cwd": action.get("cwd") or str(Path.home() / "Code"),
-            # Last resort only: a fresh session running this command.
+            # When no live session holds the item: a new hop session that
+            # resumes the item's own conversation, else a fresh agent.
             "session_name": f"pulse-{latest['date'][5:].replace('-', '')}-{engine}-{action['id']}",
             "command": _launch_command(engine, task_path),
         }
+        source = source_session(db_path, str(action.get("source_ref") or "")) if db_path else None
+        if source:
+            entry["command"] = _resume_command(source, f"\"$(cat '{task_path}')\"")
+            entry["cwd"] = source["cwd"] or entry["cwd"]
+            entry["resumes"] = f"{source['agent']}:{source['session_id']}"
+            # One hop session per conversation, never two resumes of it: once
+            # it runs, hop sees it live and later items become messages to it.
+            entry["session_name"] = resumed_session_name(source)
         # Preferred: the live hop session already holding this item's
         # conversation gets a one-line message pointing at the task.
         target = hop_target_named(str(action.get("hop_session") or ""), sessions) or \
@@ -1074,7 +1163,8 @@ def publish_for_hop(runners: dict[str, "BriefingRunner"]) -> dict[str, Any]:
             except (OSError, ValueError):
                 pulse = None
             if pulse:
-                day_pulses.append(_hop_pulse(engine, pulse, sessions))
+                db_path = getattr(getattr(runner.state, "config", None), "trajectory_index_db_path", None)
+                day_pulses.append(_hop_pulse(engine, pulse, sessions, db_path))
         if day_pulses:
             days.append({"date": date, "pulses": day_pulses})
     pulses = days[0]["pulses"] if days else []
