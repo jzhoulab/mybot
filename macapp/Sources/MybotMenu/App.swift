@@ -307,6 +307,8 @@ struct ContentView: View {
                         AskView(model: model)
                     } else if model.mode == .pulse {
                         PulseView(model: model)
+                    } else if model.mode == .channel {
+                        ChannelView(model: model, channel: model.channel)
                     } else if model.showSharing {
                         SharingView(model: model)
                     } else {
@@ -667,6 +669,7 @@ struct ContentView: View {
         Picker("", selection: $model.mode) {
             Text("Pulse").tag(AppModel.Mode.pulse)
             Text("Ask mybot").tag(AppModel.Mode.ask)
+            Text("Channel").tag(AppModel.Mode.channel)
             Text("Projects").tag(AppModel.Mode.projects)
         }
         .pickerStyle(.segmented)

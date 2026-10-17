@@ -109,34 +109,54 @@ person returns, on any channel. Guests can also build their own long-term memory
   allowlist = reply anywhere, observe nowhere).
 - Raw `<@id>` mentions are resolved to `@DisplayName` before storage.
 
-## Cross-bot relay (ask a teammate's bot)
+## Team channel: bots talking in public
 
-Teammates already query each other's bots directly: a human @mentions
-`alice-mybot` in a shared channel and it answers, guest-scoped, about Alice's
-owner's work. That needs no relay — it's the default human→bot path.
+Each teammate's `<handle>-mybot` joins one shared Discord or Slack channel. In
+the menu app's **Channel** tab the owner picks that channel (the bridge reports
+every channel it can post in) and then sees it Slack-style: people, bots, replies,
+"alex-mybot is answering…". Typing `@` offers the channel's members.
 
-The **relay** exists so one bot can ask another *on a human's behalf* (the
-foundation for asking a teammate's bot from inside the menu app, with
-Discord/Slack as the wire — no custom mesh, hosting, or VPN). Design:
+- **@ a teammate's bot**: the message is posted by your bot as
+  "**Jian** (via jian-mybot): @alex-mybot …" and carries a relayed *ask*. Alex's
+  bot answers in the channel, as a reply.
+- **@ your own bot**: it answers in the channel. That's public, so it answers with
+  what teammates may see, not your private view.
+- **No mention**: just a message to the channel, posted by your bot for you.
 
-- A relay message carries a machine-readable envelope
-  (`⟦mybot ask id=… actor=… name=…⟧ <question>` / `⟦mybot ans id=…⟧ <answer>`)
-  so the receiver can tell an **ask** from an **answer**, recover the asking
-  human's identity for guest-scoped retrieval, and correlate the reply.
-- `MYBOT_SIBLING_BOT_IDS` lists the Discord user ids of trusted sibling bots.
-  Only their relay-tagged, mention-addressed messages bypass the usual
-  bot-author filter; everything else from bots is still ignored. Empty = off.
-- **Loop guards:** a bot answers *asks* only (never treats an *answer* as a new
-  ask), only when addressed to it, and its reply is tagged as an *answer* — so
-  no bot-to-bot loop forms.
-- The receiver answers as the asking human (`actor_id` from the envelope, guest
-  scope, a per-asker `relay-<guild>-<actor>` session).
+The bridge mirrors the channel to the server (`POST /channel/feed`, history
+backfilled on connect), so the tab can show it and your bot keeps other bots'
+answers as context.
 
-**Status:** the receiver side (answer a relayed ask, with identity + loop
-guards) is implemented and unit-tested; the live bot↔bot round-trip needs ≥2
-bot instances in a shared server to exercise. Still to build: the **sender** —
-a menu-app "ask a teammate" UI + a server endpoint that posts the relay ask and
-correlates the tagged answer back to the app.
+### Relay protocol (`app/relay_protocol.py`)
+
+A relayed message is readable text plus one machine-readable trailer line
+(Discord renders `-#` as small grey text; Slack gets `_italics_`):
+
+```
+**Jian** (via jian-mybot): @alex-mybot did the nightly run finish?
+-# ⟦mybot ask id=r3f2a actor=<owner's platform id> name=Jian⟧
+
+(reply) The nightly run finished at 04:10 …
+-# ⟦mybot ans id=r3f2a⟧
+```
+
+- **Trust:** an ask is answered only from a bot in the connected team channel
+  (unless the owner switched it off in the channel's member list) or one listed
+  in `MYBOT_SIBLING_BOT_IDS`, and only when it @mentions the receiver. On Slack
+  the bot must also belong to the home workspace. A trusted bot gets the same
+  teammate view any human in that channel already gets.
+- **Identity:** the claimed asker is namespaced under the sending bot
+  (`relay-<bot>-<actor>`), so a relay can never claim the owner, and it gets its
+  own relay session.
+- **Loop guards:** only asks are answered and an answer is never treated as an
+  ask. A bot never asks on its own, only for a human. The trailer counts only as
+  the last line of a message the bridge composed: model output has relay markers
+  neutralized before posting. At most 6 asks per sending bot per minute.
+- **Old form:** `<@id> ⟦mybot ask …⟧ question` is still accepted.
+
+`scripts/run_test_sibling_bridge.sh` runs a second Discord bot against the same
+server for a live round trip (with `MYBOT_TEAM_CHANNEL=false`, so only the
+primary bridge drives the Channel tab).
 
 ## Connecting a chat platform (guided setup)
 
@@ -213,7 +233,8 @@ transport-neutral twin of the Discord bridge and needs **no server changes**:
   only), `!new`/`!reset` (DMs only — a channel's conversation is shared). An `eyes`
   reaction acknowledges receipt while the answer runs.
 - Who it talks to: DMs, plus only the channels in `SLACK_ALLOWED_CHANNEL_IDS`
-  (empty = DMs only; being invited to a channel is not consent to answer it), and
+  (empty = DMs only; being invited to a channel is not consent to answer it) and
+  the team channel connected in the menu app, and
   only full members of its own workspace — no Slack Connect users from other
   organizations, no guest accounts unless `SLACK_ALLOW_GUEST_ACCOUNTS=true`. It
   observes only allowed channels.

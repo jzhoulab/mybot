@@ -8,6 +8,7 @@ import asyncio
 import json
 import os
 import re
+import time
 import urllib.error
 import urllib.request
 from dataclasses import dataclass
@@ -22,6 +23,7 @@ except ImportError as exc:  # pragma: no cover - import guard for runtime only
         "discord.py is required. Install it with: python3 -m pip install -U discord.py"
     ) from exc
 
+from app import relay_protocol
 from app.api_auth import authorize
 from app.logging_setup import get_logger
 
@@ -91,53 +93,21 @@ def command_argument(text: str, prefix: str) -> str | None:
     return None
 
 
-# -- Bot-to-bot relay envelope --------------------------------------------
-# When one mybot instance asks another on a human's behalf, it posts a message
-# carrying a machine-readable marker so the receiving bot can (a) tell it's a
-# relayed ASK vs an ANSWER (the loop guard — a bot answers asks but never treats
-# an answer as a new ask), (b) recover the asking human's identity for
-# guest-scoped retrieval, and (c) correlate the reply. Rare bracket delimiters
-# keep it from colliding with normal prose.
-_RELAY_OPEN, _RELAY_CLOSE = "⟦", "⟧"  # ⟦ ⟧
-_RELAY_RE = re.compile(
-    r"(?:<@!?\d+>\s*)*" + _RELAY_OPEN + r"mybot (ask|ans)([^" + _RELAY_CLOSE + r"]*)"
-    + _RELAY_CLOSE + r"\s?(.*)",
-    re.DOTALL,
-)
+# -- Bot-to-bot relay ----------------------------------------------------
+# The envelope format and the rules live in app/relay_protocol.py (shared
+# with the Slack bridge and the server).
 
 
 def build_relay_ask(*, request_id: str, actor_id: str, display_name: str, question: str) -> str:
-    from urllib.parse import quote
-    name = quote(display_name or "", safe="")
-    return f"{_RELAY_OPEN}mybot ask id={request_id} actor={actor_id} name={name}{_RELAY_CLOSE} {question}"
+    return question + relay_protocol.trailer("discord", "ask", request_id, actor_id=actor_id, name=display_name)
 
 
 def build_relay_answer(*, request_id: str, answer: str) -> str:
-    return f"{_RELAY_OPEN}mybot ans id={request_id}{_RELAY_CLOSE} {answer}"
+    return relay_protocol.neutralize(answer) + relay_protocol.trailer("discord", "ans", request_id)
 
 
 def parse_relay(text: str) -> dict[str, Any] | None:
-    """Parse a relay envelope, tolerating leading @mentions. Returns
-    {kind: 'ask'|'ans', id, actor_id, name, body} or None if not a relay."""
-    from urllib.parse import unquote
-    # Anchored: an envelope buried inside ordinary bot output (e.g. a model
-    # coaxed into quoting one) is not a relay.
-    match = _RELAY_RE.match((text or "").strip())
-    if not match:
-        return None
-    kind, fields_raw, body = match.group(1), match.group(2), match.group(3)
-    fields: dict[str, str] = {}
-    for token in fields_raw.split():
-        if "=" in token:
-            key, value = token.split("=", 1)
-            fields[key] = value
-    return {
-        "kind": kind,
-        "id": fields.get("id", ""),
-        "actor_id": fields.get("actor", ""),
-        "name": unquote(fields.get("name", "")),
-        "body": (body or "").strip(),
-    }
+    return relay_protocol.parse(text)
 
 
 @dataclass
@@ -227,6 +197,27 @@ class ChatbotApi:
             return [item for item in items or [] if isinstance(item, dict)]
 
         return await asyncio.to_thread(_get)
+
+    async def channel_call(self, path: str, payload: dict[str, Any] | None = None) -> dict[str, Any]:
+        """The team channel endpoints (GET when payload is None). Never raises:
+        the channel mirror is best-effort and must not take the bridge down."""
+        def _call() -> dict[str, Any]:
+            url = f"{self.config.chatbot_base_url.rstrip('/')}{path}"
+            if payload is None:
+                request = urllib.request.Request(url=url, method="GET")
+                authorize(request)
+                try:
+                    with urllib.request.urlopen(request, timeout=15) as response:
+                        parsed = json.loads(response.read().decode("utf-8"))
+                except (urllib.error.URLError, json.JSONDecodeError, OSError):
+                    return {}
+                return parsed if isinstance(parsed, dict) else {}
+            try:
+                return self._post_json(path, payload)
+            except RuntimeError:
+                return {}
+
+        return await asyncio.to_thread(_call)
 
     async def outbox_ack(self, item_id: str, channel_id: str = "") -> None:
         await asyncio.to_thread(self._post_json, "/outbox/ack", {"id": item_id, "channel_id": channel_id})
@@ -376,6 +367,11 @@ class DiscordBridgeClient(discord.Client):
         self.tree = app_commands.CommandTree(self)
         self.safe_mentions = discord.AllowedMentions.none()
         self.chat_buffers: dict[str, ChatRequestBuffer] = {}
+        # The team channel the owner connected in the menu app (from the
+        # server), and bots there the owner blocked from relaying.
+        self.team_channel_id: int | None = None
+        self.blocked_bot_ids: set[int] = set()
+        self.relay_limiter = relay_protocol.RateLimiter()
         self._register_commands()
 
     def _register_commands(self) -> None:
@@ -489,8 +485,158 @@ class DiscordBridgeClient(discord.Client):
                 log.warning("outbox delivery failed: %s", exc)
             await asyncio.sleep(60)
 
+    # -- team channel ------------------------------------------------------
+
+    def _channel_view(self, data: dict[str, Any]) -> None:
+        connected = data.get("connected") if isinstance(data, dict) else None
+        previous = self.team_channel_id
+        cid = str((connected or {}).get("channel_id") or "")
+        self.team_channel_id = int(cid) if cid.isdigit() else None
+        self.blocked_bot_ids = {int(b) for b in data.get("blocked_bots") or [] if str(b).isdigit()}
+        if self.team_channel_id and self.team_channel_id != previous:
+            self.loop.create_task(self._backfill_team_channel())
+
+    def _in_team_channel(self, channel: Any) -> bool:
+        return bool(self.team_channel_id) and getattr(channel, "id", None) == self.team_channel_id
+
+    def _relay_trusted(self, message: discord.Message) -> bool:
+        """Bots allowed to relay asks to us: the configured siblings anywhere,
+        and any bot in the owner's connected team channel unless blocked. Those
+        bots' asks get the same teammate view any human there gets."""
+        author = message.author.id
+        if author in self.blocked_bot_ids:
+            return False
+        return author in self.config.sibling_bot_ids or self._in_team_channel(message.channel)
+
+    async def _sync_loop(self) -> None:
+        """Tell the server who this bot is and where it can post, so the menu
+        app can offer those channels to connect."""
+        await self.wait_until_ready()
+        while not self.is_closed():
+            try:
+                channels = []
+                for guild in self.guilds:
+                    for ch in guild.text_channels:
+                        perms = ch.permissions_for(guild.me)
+                        if not (perms.view_channel and perms.send_messages):
+                            continue
+                        channels.append({
+                            "id": str(ch.id), "name": ch.name, "guild": guild.name,
+                            "session_key": self._session_key_for_channel(user_id=0, channel=ch),
+                            "label": self._channel_kind_label(ch)[1],
+                        })
+                name = await self.api.fetch_bot_name()
+                assert self.user is not None
+                data = await self.api.channel_call("/channel/sync", {
+                    "platform": "discord", "self_id": str(self.user.id),
+                    "self_name": name or self.user.display_name, "channels": channels,
+                })
+                if data:
+                    self._channel_view(data)
+            except Exception as exc:
+                log.warning("team channel sync failed: %s", exc)
+            await asyncio.sleep(300)
+
+    def _feed_row(self, message: discord.Message) -> dict[str, Any]:
+        reference = getattr(message, "reference", None)
+        return {
+            "id": str(message.id),
+            "ts": message.created_at.timestamp(),
+            "author_id": str(message.author.id),
+            "author_name": message.author.display_name,
+            "is_bot": bool(message.author.bot),
+            "text": self._resolve_mentions(message, message.content or ""),
+            "reply_to": str(getattr(reference, "message_id", "") or ""),
+            "mention_ids": [str(m.id) for m in message.mentions],
+        }
+
+    async def _feed(self, messages: list[discord.Message]) -> None:
+        if not messages or not self.team_channel_id:
+            return
+        await self.api.channel_call("/channel/feed", {
+            "platform": "discord", "channel_id": str(self.team_channel_id),
+            "messages": [self._feed_row(m) for m in messages],
+        })
+
+    async def _backfill_team_channel(self) -> None:
+        channel = self.get_channel(self.team_channel_id or 0)
+        if channel is None:
+            return
+        try:
+            history = [m async for m in channel.history(limit=60)]
+        except (discord.Forbidden, discord.HTTPException) as exc:
+            log.info("team channel backfill unavailable: %s", exc)
+            return
+        await self._feed(list(reversed(history)))
+
+    async def _team_channel_loop(self) -> None:
+        """Post what the owner wrote in the menu app's channel view."""
+        await self.wait_until_ready()
+        while not self.is_closed():
+            try:
+                data = await self.api.channel_call("/channel/outbox?platform=discord")
+                if data:
+                    self._channel_view(data)
+                for item in data.get("items") or []:
+                    await self._post_team_item(item)
+            except Exception as exc:
+                log.warning("team channel delivery failed: %s", exc)
+            await asyncio.sleep(2)
+
+    async def _post_team_item(self, item: dict[str, Any]) -> None:
+        item_id = str(item.get("id") or "")
+        channel = self.get_channel(int(item.get("channel_id") or 0))
+        if channel is None:
+            await self.api.channel_call("/channel/outbox/ack", {"id": item_id, "error": "channel not visible to the bot"})
+            return
+        reference = None
+        reply_to = str(item.get("reply_to") or "")
+        if reply_to.isdigit():
+            reference = discord.MessageReference(message_id=int(reply_to), channel_id=channel.id, fail_if_not_exists=False)
+        # Ping exactly who the owner picked; an ask must really mention the
+        # receiving bot or its bridge won't treat it as addressed.
+        mentions = discord.AllowedMentions(
+            everyone=False, roles=False, replied_user=False,
+            users=[discord.Object(id=int(m)) for m in item.get("mention_ids") or [] if str(m).isdigit()],
+        )
+        try:
+            sent = await channel.send(str(item.get("text") or "")[:2000], allowed_mentions=mentions, reference=reference)
+        except discord.HTTPException as exc:
+            await self.api.channel_call("/channel/outbox/ack", {"id": item_id, "error": str(exc)[:300]})
+            return
+        await self.api.channel_call("/channel/outbox/ack", {"id": item_id, "message_id": str(sent.id)})
+        await self._feed([sent])
+        ask = item.get("answer_self")
+        if isinstance(ask, dict) and ask.get("question"):
+            self.loop.create_task(self._answer_owner_in_channel(item_id, sent, ask))
+
+    async def _answer_owner_in_channel(self, item_id: str, sent: discord.Message, ask: dict[str, Any]) -> None:
+        """The owner @mentioned this bot from the menu app: answer in the
+        channel, as a reply. It's public, so it gets teammate-level data."""
+        owner = str(ask.get("actor_id") or "")
+        owner_int = int(owner) if owner.isdigit() else 0
+        try:
+            async with sent.channel.typing():
+                result = await self.api.chat(
+                    actor_id=owner, user_key=self._user_key(owner_int) if owner_int else f"discord-user-{owner}",
+                    session_key=self._session_key_for_channel(user_id=owner_int, channel=sent.channel),
+                    message=str(ask["question"])[:4000], memory_scope="private",
+                    display_name=str(ask.get("name") or ""), channel_kind="group",
+                    channel_label=self._channel_kind_label(sent.channel)[1],
+                )
+            answer = result.get("text") or "(empty response)"
+        except Exception as exc:
+            log.exception("owner channel answer failed")
+            answer = f"(couldn't answer: {exc})"
+        await self._send_channel_text(sent.channel, relay_protocol.neutralize(answer), reference=sent)
+        await self.api.channel_call("/channel/outbox/ack", {"id": item_id, "answered": True})
+
     async def setup_hook(self) -> None:
         self.loop.create_task(self._outbox_loop())
+        # Off for a test sibling sharing this server (scripts/run_test_sibling_bridge.sh).
+        if env_bool("MYBOT_TEAM_CHANNEL", True):
+            self.loop.create_task(self._sync_loop())
+            self.loop.create_task(self._team_channel_loop())
         if self.config.command_guild_id:
             guild = discord.Object(id=self.config.command_guild_id)
             self.tree.copy_global_to(guild=guild)
@@ -547,16 +693,20 @@ class DiscordBridgeClient(discord.Client):
         log.info("session resumed after reconnect")
 
     async def on_message(self, message: discord.Message) -> None:
-        # A trusted sibling mybot relaying a human's question gets answered
-        # instead of being dropped by the usual bot-author filter below.
-        if (
-            self.user is not None
-            and message.author.id != self.user.id
-            and message.author.id in self.config.sibling_bot_ids
-        ):
-            await self._handle_relay(message)
-            return
+        # Mirror the team channel (every author, this bot included) for the
+        # menu app's channel view.
+        if self._in_team_channel(message.channel):
+            await self._feed([message])
         if message.author.bot:
+            if self.user is None or message.author.id == self.user.id:
+                return
+            # A trusted mybot relaying a human's question gets answered; other
+            # bot chatter there is kept as context, never answered.
+            relay = relay_protocol.parse(message.content or "")
+            if relay and relay["kind"] == "ask" and self._relay_trusted(message):
+                await self._handle_relay(message, relay)
+            elif message.guild is not None and self._in_team_channel(message.channel):
+                await self._maybe_observe_message(message, relay_protocol.strip(message.content or ""))
             return
         if not self.config.enable_message_content:
             return
@@ -596,6 +746,8 @@ class DiscordBridgeClient(discord.Client):
         whole server just because the allowlist is empty (= all allowed)."""
         if not self.config.observe_channels or not self.config.group_sessions:
             return False
+        if self._in_team_channel(channel):
+            return True
         channel_id = getattr(channel, "id", None)
         parent_id = getattr(channel, "parent_id", None)
         explicit = self.config.allowed_channel_ids | self.config.auto_reply_channel_ids
@@ -621,30 +773,29 @@ class DiscordBridgeClient(discord.Client):
         except Exception:
             log.exception("failed to observe channel message author=%s", message.author.id)
 
-    async def _handle_relay(self, message: discord.Message) -> None:
-        """Answer a relayed ASK from a trusted sibling mybot, as the asking
-        human (guest scope). Loop guards: only ASKs are answered (ANSWERs and
-        non-relay bot chatter are ignored), and only when addressed to us — so a
-        bot never treats another bot's answer as a new question."""
-        relay = parse_relay(message.content or "")
-        if relay is None or relay["kind"] != "ask":
-            return
+    async def _handle_relay(self, message: discord.Message, relay: dict[str, Any]) -> None:
+        """Answer a relayed ASK from a trusted mybot, as the asking human
+        (teammate view), in public. Loop guards: only ASKs are answered (an
+        ANSWER never is), only when it mentions us, and our reply is tagged as
+        an ANSWER — so no bot-to-bot loop forms (app/relay_protocol.py)."""
         if self.user is None or self.user not in message.mentions:
             return
         # The sending bot only CLAIMS who is asking, so the claim is namespaced
         # under that bot: it can never equal the owner (or anyone local) and
         # always gets a teammate's view — even "actor=<owner id>".
-        claimed = re.sub(r"[^\w.-]", "", relay["actor_id"] or "")[:64]
-        actor_id = f"relay-{message.author.id}-{claimed}" if claimed else ""
-        question = normalize_text(relay["body"])[:4000]
+        actor_id = relay_protocol.relay_actor(str(message.author.id), relay["actor_id"])
+        question = normalize_text(self._resolve_mentions(message, self._strip_bot_mentions(relay["body"])))[:4000]
         if not actor_id or not question:
+            return
+        if not self.relay_limiter.allow(str(message.author.id), time.monotonic()):
+            log.warning("relay rate limit: dropping ask id=%s from bot %s", relay["id"], message.author.id)
             return
         guild_id = getattr(message.guild, "id", "dm")
         try:
             async with message.channel.typing():
                 result = await self.api.chat(
                     actor_id=actor_id,
-                    user_key=self._user_key(actor_id),
+                    user_key=f"discord-user-{actor_id}",
                     # Per-asker relay session, separate from that human's own
                     # conversations with their own bot.
                     session_key=f"relay-{guild_id}-{actor_id}",
@@ -658,10 +809,15 @@ class DiscordBridgeClient(discord.Client):
         except Exception as exc:
             log.exception("relay answer failed id=%s actor=%s", relay["id"], actor_id)
             answer = f"(couldn't answer: {exc})"
-        # Reply tagged as an ANSWER (never an ask) mentioning the asking bot, so
-        # its bridge can correlate by id and no loop forms.
-        payload = f"<@{message.author.id}> " + build_relay_answer(request_id=relay["id"], answer=answer)
-        await self._send_channel_text(message.channel, payload, reference=message)
+        # A reply to the ask, tagged as an ANSWER with the ask's id; the
+        # trailer goes on the last chunk only.
+        chunks = split_for_discord(relay_protocol.neutralize(answer), limit=1800)
+        chunks[-1] += relay_protocol.trailer("discord", "ans", relay["id"])
+        for index, chunk in enumerate(chunks):
+            kwargs: dict[str, Any] = {"allowed_mentions": self.safe_mentions}
+            if index == 0:
+                kwargs["reference"] = message.to_reference(fail_if_not_exists=False)
+            await message.channel.send(chunk, **kwargs)
 
     async def _handle_command_message(self, message: discord.Message, text: str) -> bool:
         if text.lower() in {"!new", "!reset"}:
@@ -912,6 +1068,7 @@ class DiscordBridgeClient(discord.Client):
         return "\n".join(lines)
 
     async def _send_chat_response(self, request: PendingChatRequest, text: str) -> None:
+        text = relay_protocol.neutralize(text)
         if request.interaction is not None:
             await self._send_interaction_text(request.interaction, text)
             return
@@ -1038,7 +1195,7 @@ class DiscordBridgeClient(discord.Client):
         return self._channel_allowed(channel)
 
     def _channel_allowed(self, channel: discord.abc.MessageableChannel) -> bool:
-        if getattr(channel, "guild", None) is None:
+        if getattr(channel, "guild", None) is None or self._in_team_channel(channel):
             return True
         if not self.config.allowed_channel_ids:
             return True
@@ -1109,7 +1266,15 @@ class DiscordBridgeClient(discord.Client):
         the stored transcript read like human conversation."""
         for member in message.mentions:
             text = re.sub(rf"<@!?{member.id}>", f"@{member.display_name}", text)
-        return text
+
+        def other(match: re.Match) -> str:
+            # Mentions sent without a ping aren't in message.mentions.
+            uid = int(match.group(1))
+            guild = message.guild
+            member = (guild.get_member(uid) if guild else None) or self.get_user(uid)
+            return f"@{member.display_name}" if member else match.group(0)
+
+        return re.sub(r"<@!?(\d+)>", other, text)
 
     async def _handle_message_reset(self, message: discord.Message) -> None:
         try:

@@ -33,6 +33,7 @@ from app.api_auth import load_or_create_api_key
 from app.model_catalog import codex_default_model
 from app.redact import extra_literal_secrets, redact_text
 from app.sharing_review import LEVELS, SharingPolicy, SharingReviewer, project_key
+from app.team_channel import TeamChannel
 from app.logging_setup import get_logger
 from app.semantic_memory import SemanticMemoryStore, VALID_MEMORY_SCOPES, parse_tags
 from app.prompt_history import PromptHistoryStore
@@ -1829,6 +1830,8 @@ class AppState:
             Path(config.state_dir) / "sharing.json",
             mode=os.environ.get("TEAM_SHARING", "reviewed").strip().lower(),
         )
+        # The shared Discord/Slack channel where teammates' bots talk.
+        self.team_channel = TeamChannel(config.state_dir)
         self.sharing_reviewer = SharingReviewer(
             self,
             path=Path(config.state_dir) / "sharing_review.json",
@@ -3721,6 +3724,16 @@ class AppState:
     def is_owner_actor(self, actor_id: str) -> bool:
         return self.actor_is_owner(actor_id)
 
+    def owner_actor_for(self, platform: str) -> str:
+        """The owner's user id on one transport (Discord ids are numeric,
+        Slack's start with U/W), for relayed asks made on their behalf."""
+        ids = [normalize_text(self.config.imported_owner_actor_id, 128)]
+        ids += [normalize_text(v, 128) for v in os.environ.get("MYBOT_OWNER_ACTOR_IDS", "").split(",")]
+        for actor in filter(None, ids):
+            if (platform == "discord") == actor.isdigit():
+                return actor
+        return next(filter(None, ids), "owner")
+
     # Conduct policy per surface. "social" = asked through a chat bridge
     # (Discord/Slack: other people can be on the other end); "local" = the
     # owner's own clients (menu app, CLI, GUI). Both default to the same
@@ -4239,6 +4252,15 @@ class ChatHandler(BaseHTTPRequestHandler):
                 200, {"ok": True, "date": date, "dates": dates, "pulses": pulses, "running": running}
             )
             return
+        if path in {"/channel", "/channel/outbox"}:
+            query = urllib.parse.parse_qs(self.path.split("?", 1)[1] if "?" in self.path else "")
+            channel = self.server.state.team_channel
+            if path == "/channel":
+                after = (query.get("after") or ["0"])[0]
+                self.respond_json(200, channel.view(after=int(after) if after.isdigit() else 0))
+            else:
+                self.respond_json(200, channel.outbox((query.get("platform") or ["discord"])[0]))
+            return
         if path == "/outbox":
             query = urllib.parse.parse_qs(self.path.split("?", 1)[1] if "?" in self.path else "")
             platform = (query.get("platform") or ["discord"])[0]
@@ -4375,6 +4397,9 @@ class ChatHandler(BaseHTTPRequestHandler):
                 self.respond_json(400, {"ok": False, "error": str(exc)})
                 return
             self.respond_json(200, result)
+            return
+        if self.path.startswith("/channel"):
+            self.handle_channel(body)
             return
         if self.path == "/outbox/ack":
             runner = self.server.state.briefing
@@ -5355,6 +5380,43 @@ class ChatHandler(BaseHTTPRequestHandler):
             return
         result = visible[0]
         self.respond_json(200, {"ok": True, "trajectory": result})
+
+    def handle_channel(self, body: dict[str, Any]) -> None:
+        """The team channel: bridge mirroring (/channel/sync, /channel/feed,
+        /channel/outbox/ack) and the menu app's view of it (/channel)."""
+        state = self.server.state
+        channel = state.team_channel
+        if self.path == "/channel/sync":
+            self.respond_json(200, channel.sync(body))
+            return
+        if self.path == "/channel/feed":
+            self.respond_json(200, channel.feed(body, owner_name=state.owner_name()))
+            return
+        if self.path == "/channel/outbox/ack":
+            self.respond_json(200, channel.outbox_ack(body))
+            return
+        if self.path != "/channel":
+            self.respond_json(404, {"ok": False, "error": "not found"})
+            return
+        action = str(body.get("action") or "")
+        if action == "connect":
+            result = channel.connect(str(body.get("platform") or "discord"), str(body.get("channel_id") or ""))
+        elif action == "disconnect":
+            result = channel.disconnect()
+        elif action in {"block", "unblock"}:
+            result = channel.set_blocked(str(body.get("bot_id") or ""), action == "block")
+        elif action == "post":
+            connected = channel.view().get("connected") or {}
+            result = channel.post(
+                str(body.get("text") or ""),
+                [str(m) for m in body.get("mention_ids") or []],
+                owner_name=state.owner_name() or "the owner",
+                owner_actor_id=state.owner_actor_for(connected.get("platform") or "discord"),
+                reply_to=str(body.get("reply_to") or ""),
+            )
+        else:
+            result = {"ok": False, "error": f"unknown action {action!r}"}
+        self.respond_json(200 if result.get("ok") else 400, result)
 
     def handle_sharing(self, body: dict[str, Any]) -> None:
         """Owner decisions on team sharing. Only the API key reaches here."""

@@ -13,8 +13,10 @@ app-level token (xapp-...) with connections:write.
 
 from __future__ import annotations
 
+import html
 import os
 import re
+import threading
 import time
 import json
 import urllib.error
@@ -29,6 +31,7 @@ except ImportError as exc:  # pragma: no cover - import guard for runtime only
         "slack_bolt is required. Install it with: python3 -m pip install -U slack_bolt"
     ) from exc
 
+from app import relay_protocol
 from app.api_auth import authorize
 from app.logging_setup import get_logger
 
@@ -172,6 +175,28 @@ class ChatbotApi:
     def promote_memory(self, *, actor_id: str, scope: str, text: str) -> dict[str, Any]:
         return self._post("/memory/promote", {"actor_id": actor_id, "scope": scope, "text": text})
 
+    def channel_call(self, path: str, payload: dict[str, Any] | None = None) -> dict[str, Any]:
+        """Team channel endpoints (GET when payload is None); never raises."""
+        try:
+            if payload is not None:
+                return self._post(path, payload)
+            request = urllib.request.Request(url=f"{self.base_url}{path}", method="GET")
+            authorize(request)
+            with urllib.request.urlopen(request, timeout=15) as response:
+                parsed = json.loads(response.read().decode("utf-8"))
+            return parsed if isinstance(parsed, dict) else {}
+        except (RuntimeError, urllib.error.URLError, OSError, ValueError):
+            return {}
+
+    def bot_name(self) -> str:
+        try:
+            request = urllib.request.Request(url=f"{self.base_url}/health", method="GET")
+            authorize(request)
+            with urllib.request.urlopen(request, timeout=10) as response:
+                return str(json.loads(response.read().decode("utf-8")).get("bot_name") or "")
+        except (urllib.error.URLError, OSError, ValueError):
+            return ""
+
 
 class SlackBridge:
     def __init__(self, *, api: ChatbotApi, observe_channels: bool, group_sessions: bool) -> None:
@@ -192,9 +217,50 @@ class SlackBridge:
         }
         # Slack guest accounts (single/multi-channel guests) are outsiders.
         self.allow_guest_accounts = env_bool("SLACK_ALLOW_GUEST_ACCOUNTS", False)
+        # The team channel the owner connected in the menu app (from the
+        # server) — connecting it is consent to answer and listen there.
+        self.team_channel_id = ""
+        self.blocked_bots: set[str] = set()
+        self.sibling_bots = {
+            v.strip() for v in os.environ.get("MYBOT_SIBLING_BOT_IDS", "").split(",") if v.strip()
+        }
+        self.relay_limiter = relay_protocol.RateLimiter()
 
     def channel_allowed(self, channel_id: str, is_dm: bool) -> bool:
-        return is_dm or channel_id in self.allowed_channels
+        return is_dm or channel_id in self.allowed_channels or channel_id == self.team_channel_id
+
+    def channel_view(self, data: dict[str, Any]) -> None:
+        if not data:
+            return
+        self.team_channel_id = str((data.get("connected") or {}).get("channel_id") or "")
+        self.blocked_bots = {str(b) for b in data.get("blocked_bots") or []}
+
+    def relay_trusted(self, event: dict) -> bool:
+        """Mybot instances of this workspace that may relay asks: listed
+        siblings anywhere, any home-team bot in the team channel unless
+        blocked. Slack Connect bots from other organizations never."""
+        sender = event.get("user") or ""
+        team = (event.get("bot_profile") or {}).get("team_id") or event.get("team") or ""
+        if not sender or sender in self.blocked_bots:
+            return False
+        if self.team_id and team and team != self.team_id:
+            return False
+        return sender in self.sibling_bots or (event.get("channel") or "") == self.team_channel_id
+
+    def feed_row(self, client, event: dict) -> dict[str, Any]:
+        author = event.get("user") or event.get("bot_id") or ""
+        is_bot = bool(event.get("bot_id"))
+        name = (event.get("bot_profile") or {}).get("name") if is_bot else ""
+        return {
+            "id": event.get("ts") or "",
+            "ts": float(event.get("ts") or 0),
+            "author_id": author,
+            "author_name": name or self.display_name(client, author),
+            "is_bot": is_bot,
+            "text": html.unescape(self.resolve_mentions(client, event.get("text") or "", keep_self=True)),
+            "reply_to": event.get("thread_ts") if event.get("thread_ts") != event.get("ts") else "",
+            "mention_ids": re.findall(r"<@([A-Z0-9]+)", event.get("text") or ""),
+        }
 
     def member_allowed(self, client, event: dict) -> bool:
         """Only full members of this workspace: no Slack Connect users from
@@ -253,12 +319,12 @@ class SlackBridge:
         self._channel_cache[channel_id] = label
         return label
 
-    def resolve_mentions(self, client, text: str) -> str:
+    def resolve_mentions(self, client, text: str, *, keep_self: bool = False) -> str:
         """<@U123> / <@U123|name> -> @DisplayName, and strip the bot's own
         mention so the model sees clean prose."""
         def repl(match: re.Match) -> str:
             uid = match.group(1)
-            if uid == self.bot_user_id:
+            if uid == self.bot_user_id and not keep_self:
                 return " "
             return f"@{self.display_name(client, uid)}"
 
@@ -333,10 +399,48 @@ def build_bridge() -> tuple[App, SlackBridge, str]:
             return "Started a fresh conversation."
         return None
 
+    def answer_relay(event: dict, client, relay: dict) -> None:
+        """A trusted mybot asked us on a human's behalf: answer in public, in
+        the ask's thread, tagged as an ANSWER (app/relay_protocol.py)."""
+        sender = event.get("user") or ""
+        if f"<@{bridge.bot_user_id}" not in (event.get("text") or ""):
+            return
+        actor_id = relay_protocol.relay_actor(sender, relay["actor_id"])
+        question = normalize_text(bridge.resolve_mentions(client, relay["body"]))[:4000]
+        if not actor_id or not question or not bridge.relay_limiter.allow(sender, time.monotonic()):
+            return
+        channel_id = event.get("channel") or ""
+        try:
+            result = api.chat(
+                actor_id=actor_id, user_key=f"slack-user-{actor_id}",
+                session_key=f"relay-{bridge.team_id or 'team'}-{actor_id}", message=question,
+                display_name=relay.get("name") or "", channel_kind="group",
+                channel_label=bridge.channel_label(client, channel_id),
+            )
+            answer = result.get("text") or "(empty response)"
+        except Exception as exc:
+            log.exception("relay answer failed id=%s", relay["id"])
+            answer = f"(couldn't answer: {exc})"
+        chunks = split_for_slack(relay_protocol.neutralize(answer), limit=3300)
+        chunks[-1] += relay_protocol.trailer("slack", "ans", relay["id"])
+        for chunk in chunks:
+            client.chat_postMessage(channel=channel_id, text=chunk, thread_ts=event.get("thread_ts") or event.get("ts"))
+
     @app.event("message")
     def on_message(event, say, client, logger):  # noqa: ANN001
-        # Ignore our own messages, bot messages, and edits/deletes/joins.
-        if event.get("bot_id") or event.get("subtype"):
+        if event.get("subtype") not in (None, "bot_message", "thread_broadcast"):
+            return  # edits, deletes, joins
+        if event.get("channel") and event.get("channel") == bridge.team_channel_id:
+            api.channel_call("/channel/feed", {
+                "platform": "slack", "channel_id": bridge.team_channel_id,
+                "messages": [bridge.feed_row(client, event)],
+            })
+        if event.get("bot_id"):
+            if event.get("user") == bridge.bot_user_id:
+                return
+            relay = relay_protocol.parse(event.get("text") or "")
+            if relay and relay["kind"] == "ask" and bridge.relay_trusted(event):
+                answer_relay(event, client, relay)
             return
         user_id = event.get("user") or ""
         if not user_id or user_id == bridge.bot_user_id:
@@ -393,12 +497,100 @@ def build_bridge() -> tuple[App, SlackBridge, str]:
                 channel_kind="dm" if is_dm else "group",
                 channel_label="" if is_dm else bridge.channel_label(client, channel_id),
             )
-            reply(say, result.get("text") or "(empty response)", thread_ts=reply_thread)
+            reply(say, relay_protocol.neutralize(result.get("text") or "(empty response)"), thread_ts=reply_thread)
         except Exception as exc:
             log.exception("chat failed for user=%s", user_id)
             reply(say, f"Sorry — I couldn't answer that ({exc}). Please try again.", thread_ts=reply_thread)
 
     return app, bridge, app_token
+
+
+def sync_team_channel(app: App, bridge: SlackBridge) -> None:
+    """Tell the server who this bot is and which channels it's in."""
+    channels = []
+    cursor = None
+    for _ in range(10):
+        page = app.client.users_conversations(types="public_channel,private_channel", limit=200, cursor=cursor)
+        for ch in page.get("channels") or []:
+            channels.append({
+                "id": ch["id"], "name": ch.get("name") or ch["id"], "guild": "",
+                "session_key": f"slack-{bridge.team_id or 'team'}-channel-{ch['id']}",
+                "label": f"#{ch.get('name') or ch['id']}",
+            })
+        cursor = (page.get("response_metadata") or {}).get("next_cursor")
+        if not cursor:
+            break
+    previous = bridge.team_channel_id
+    bridge.channel_view(bridge.api.channel_call("/channel/sync", {
+        "platform": "slack", "self_id": bridge.bot_user_id,
+        "self_name": bridge.api.bot_name() or "mybot", "channels": channels,
+    }))
+    if bridge.team_channel_id and bridge.team_channel_id != previous:
+        backfill_team_channel(app, bridge)
+
+
+def backfill_team_channel(app: App, bridge: SlackBridge) -> None:
+    try:
+        history = app.client.conversations_history(channel=bridge.team_channel_id, limit=60)
+    except Exception as exc:
+        log.info("team channel backfill unavailable: %s", exc)
+        return
+    events = [{**m, "channel": bridge.team_channel_id} for m in reversed(history.get("messages") or [])]
+    bridge.api.channel_call("/channel/feed", {
+        "platform": "slack", "channel_id": bridge.team_channel_id,
+        "messages": [bridge.feed_row(app.client, e) for e in events if not e.get("subtype") or e.get("bot_id")],
+    })
+
+
+def post_team_item(app: App, bridge: SlackBridge, item: dict[str, Any]) -> None:
+    """Post what the owner wrote in the menu app's channel view."""
+    api = bridge.api
+    item_id = str(item.get("id") or "")
+    channel_id = str(item.get("channel_id") or "")
+    reply_to = str(item.get("reply_to") or "") or None
+    try:
+        sent = app.client.chat_postMessage(channel=channel_id, text=str(item.get("text") or "")[:3900], thread_ts=reply_to)
+    except Exception as exc:
+        api.channel_call("/channel/outbox/ack", {"id": item_id, "error": str(exc)[:300]})
+        return
+    ts = sent.get("ts") or ""
+    api.channel_call("/channel/outbox/ack", {"id": item_id, "message_id": ts})
+    ask = item.get("answer_self")
+    if not (isinstance(ask, dict) and ask.get("question")):
+        return
+    owner = str(ask.get("actor_id") or "")
+    try:
+        result = api.chat(
+            actor_id=owner, user_key=bridge.user_key(owner),
+            session_key=f"slack-{bridge.team_id or 'team'}-thread-{ts}", message=str(ask["question"])[:4000],
+            display_name=str(ask.get("name") or ""), channel_kind="group",
+            channel_label=bridge.channel_label(app.client, channel_id),
+        )
+        answer = result.get("text") or "(empty response)"
+    except Exception as exc:
+        answer = f"(couldn't answer: {exc})"
+    for chunk in split_for_slack(relay_protocol.neutralize(answer)):
+        app.client.chat_postMessage(channel=channel_id, text=chunk, thread_ts=ts)
+    api.channel_call("/channel/outbox/ack", {"id": item_id, "answered": True})
+
+
+def team_channel_loop(app: App, bridge: SlackBridge) -> None:
+    last_sync = 0.0
+    while True:
+        try:
+            if time.time() - last_sync > 300:
+                sync_team_channel(app, bridge)
+                last_sync = time.time()
+            data = bridge.api.channel_call("/channel/outbox?platform=slack")
+            previous = bridge.team_channel_id
+            bridge.channel_view(data)
+            if bridge.team_channel_id and bridge.team_channel_id != previous:
+                backfill_team_channel(app, bridge)
+            for item in data.get("items") or []:
+                post_team_item(app, bridge, item)
+        except Exception as exc:
+            log.warning("team channel loop: %s", exc)
+        time.sleep(2)
 
 
 def main() -> None:
@@ -407,6 +599,7 @@ def main() -> None:
     bridge.bot_user_id = auth.get("user_id") or ""
     bridge.team_id = auth.get("team_id") or ""
     log.info("logged in as %s (bot user %s, team %s)", auth.get("user"), bridge.bot_user_id, bridge.team_id)
+    threading.Thread(target=team_channel_loop, args=(app, bridge), daemon=True, name="team-channel").start()
     SocketModeHandler(app, app_token).start()
 
 

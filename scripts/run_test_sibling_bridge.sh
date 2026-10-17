@@ -30,6 +30,8 @@ set +a
 : "${PRIMARY_BOT_ID:?set PRIMARY_BOT_ID to the primary bot's Discord user id}"
 export MYBOT_SIBLING_BOT_IDS="$PRIMARY_BOT_ID"
 export DISCORD_SET_GUILD_NICKNAME=false
+# The primary bridge owns the menu app's team channel; this one only answers.
+export MYBOT_TEAM_CHANNEL=false
 export CHATBOT_BASE_URL="${CHATBOT_BASE_URL:-http://127.0.0.1:8788}"
 
 echo "Starting TEST sibling bridge -> $CHATBOT_BASE_URL (siblings: $MYBOT_SIBLING_BOT_IDS)"

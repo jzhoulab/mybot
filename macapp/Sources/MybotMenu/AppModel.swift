@@ -53,7 +53,7 @@ final class AppModel: ObservableObject {
     private let maxDegradedHoldSeconds: TimeInterval = 180
 
     // ---- ask (search + chat) ----
-    enum Mode { case projects, ask, pulse }
+    enum Mode { case projects, ask, pulse, channel }
     @Published var mode: Mode = .pulse
 
     // morning pulse
@@ -137,6 +137,8 @@ final class AppModel: ObservableObject {
     @Published var trajectoryOmitted = 0
 
     let config = MybotConfig.shared
+    /// The team channel view's state; kept across tab switches.
+    lazy var channel = ChannelModel(config: config)
     private var timer: Timer?
 
     func start() {
