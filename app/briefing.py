@@ -836,8 +836,8 @@ class BriefingRunner:
                 f"(Follow-up launched from mybot's morning pulse, {date}.)\n\n{action['prompt']}\n"
             )
         live = hop_agent_sessions()
-        target = hop_target_named(str(action.get("hop_session") or ""), live) or \
-            hop_target_for(str(action.get("source_ref") or ""), live)
+        target = hop_target_for(str(action.get("source_ref") or ""), live) or \
+            hop_target_named(str(action.get("hop_session") or ""), live)
         if target:
             message = pulse_message(date, str(action.get("label") or "Follow up"), task_path)
             sent = self._hopa(["tool", "hopx_send_and_wait", json.dumps({
@@ -1127,9 +1127,10 @@ def _hop_pulse(engine: str, latest: dict[str, Any], sessions: dict[str, dict[str
             # it runs, hop sees it live and later items become messages to it.
             entry["session_name"] = resumed_session_name(source)
         # Preferred: the live hop session already holding this item's
-        # conversation gets a one-line message pointing at the task.
-        target = hop_target_named(str(action.get("hop_session") or ""), sessions) or \
-            hop_target_for(str(action.get("source_ref") or ""), sessions)
+        # conversation gets a one-line message pointing at the task. The
+        # source session is the fact; the agent's hop_session name a guess.
+        target = hop_target_for(str(action.get("source_ref") or ""), sessions) or \
+            hop_target_named(str(action.get("hop_session") or ""), sessions)
         if target:
             entry["target_internal_name"] = target["internal_name"]
             entry["target_name"] = target["name"]

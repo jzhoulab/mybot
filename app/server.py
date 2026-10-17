@@ -5875,12 +5875,19 @@ def main() -> None:
     state.briefing = state.briefings.get("claude") or next(iter(state.briefings.values()))
     for runner in state.briefings.values():
         runner.start_scheduler()
-    try:
+    def republish_for_hop() -> None:
+        # Which hop session holds each item's conversation changes all day;
+        # keep the phone's copy current so a tap reaches the live session.
         from app.briefing import publish_for_hop
 
-        publish_for_hop(state.briefings)
-    except Exception as exc:  # pragma: no cover
-        log.warning("could not publish pulse for hop: %s", exc)
+        while True:
+            try:
+                publish_for_hop(state.briefings)
+            except Exception as exc:  # pragma: no cover
+                log.warning("could not publish pulse for hop: %s", exc)
+            time.sleep(300)
+
+    threading.Thread(target=republish_for_hop, name="pulse-hop-publish", daemon=True).start()
     server = StandaloneServer((config.host, config.port), ChatHandler, state)
     print(f"Listening on http://{config.host}:{config.port}")
     server.serve_forever()
