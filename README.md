@@ -109,7 +109,7 @@ python scripts/mybot_admin.py maintenance --action embed   # repeat until missin
 | Surface | Start it with | Good for |
 |---|---|---|
 | **Web dashboard** | already running at `/gui` | Seeing what is indexed, tuning scope, probing retrieval and its scores |
-| **macOS menu bar** | `./macapp/build.sh release && open macapp/.dist/mybot.app` | Day-to-day asking, browsing transcripts, per-project include/exclude |
+| **macOS menu bar** | `./macapp/build.sh release && open macapp/.dist/mybot.app` | Day-to-day asking, browsing transcripts, the daily pulse, team sharing, the team channel |
 | **Agent skill** | `sh skills/mybot-memory/install.sh` | Letting your *other* Claude Code and Codex sessions query your history mid-task |
 | **Discord / Slack** | `python scripts/mybot_admin.py connect discord` (or `slack`), then `./run_chatbot.sh` | Asking from your phone, and letting teammates ask |
 
@@ -167,6 +167,23 @@ see more than the asker is allowed to see.
 Pass `"return_trace": true` to `/trajectory/search` to see every stage, or use
 the retrieval probe in `/gui` to watch ranking decisions directly.
 
+## The daily pulse
+
+Each morning (`BRIEFING_TIME`, default 08:00, caught up on wake) mybot reads
+what happened since the last pulse and writes a short list of ideas worth
+pursuing and things that slipped. A planner groups the activity into
+workstreams, analysts read the real transcripts for each (with optional web
+research), a chief agent writes the pulse, and a verifier checks it against
+the evidence. `BRIEFING_ENGINES=claude,gpt` runs one pulse per engine over the
+same window.
+
+The pulse appears in the menu app's **Pulse** tab, as a Discord DM, and in the
+hop phone app. Any item can be discussed with mybot, and a follow-up goes into
+the conversation the item came from: the live hop session if it is running,
+otherwise that Claude Code or Codex session resumed — never a fresh one.
+Trigger one by hand with `POST /briefing/run {"force": true}`; the settings
+are under `BRIEFING_*` in `.env.example`.
+
 ## What mybot can see
 
 This is the part worth configuring carefully, because the index is built from
@@ -192,7 +209,7 @@ Three tiers result:
 | Tier | Indexed? | Who can retrieve it |
 |---|---|---|
 | Excluded | No — and already-indexed chunks are purged when policy changes | Nobody |
-| Visible | Yes | Whoever the bot serves |
+| Visible | Yes | The owner; teammates only in projects shared with the team (below) |
 | **Owner-private** (`private_workdirs`, `private_workdir_classes`) | Yes | Only the owner, guest access on or off |
 
 The owner-private tier is enforced against *live* policy on every request rather
@@ -207,10 +224,26 @@ the bot can read — gate with `DISCORD_ALLOWED_CHANNEL_IDS` and the scope
 controls, and set `GUEST_OWNER_ACCESS=false` if teammates should not reach your
 trajectory history at all.
 
-Everything binds to `127.0.0.1`. Only the two sync endpoints take a bearer
-token; the rest are protected by the loopback bind plus per-actor policy checks.
-Do not expose the port directly — put it behind a private path such as
-Tailscale, a LAN-only interface, or an SSH tunnel.
+What teammates can reach is narrower still. With `TEAM_SHARING=reviewed`
+(the default) a teammate's answer draws only on projects the owner has set to
+*team*; new and unreviewed projects stay owner-only, and single sessions can be
+made owner-only inside a shared project. An agent reads each project's session
+titles and suggests *team / only me / exclude*, flagging personal sessions in
+work folders, but it never decides — the owner confirms in the menu app's
+**Team sharing** view. Session titles, index statistics and grant or funding
+work stay owner-only regardless, and answers stay on projects and science
+rather than the owner's personal life.
+
+Everything binds to `127.0.0.1`, and every endpoint except `/health` and the
+two sync endpoints needs the local API key (`~/.mybot/api-key`, created on
+first start; the bridges, menu app and dashboard send it). Answering agents
+never see that key: each turn gets a grant bound to the asker's identity and
+scope, so an agent talked into calling the API directly still gets only the
+asker's view. They also run without the owner's connectors, MCP servers,
+Claude settings or credentials, and secrets found in transcripts are masked in
+every response. Do not expose the port directly — put it behind a private path
+such as Tailscale, a LAN-only interface, or an SSH tunnel. The full model is in
+[docs/multi-user.md](docs/multi-user.md#privacy-model).
 
 ## Read-only by design
 
@@ -244,9 +277,20 @@ channel, with each turn attributed by display name, and non-addressed messages
 in explicitly listed channels are recorded without a reply so "what did Sam say
 about the rollback?" is answerable later.
 
+Instances also talk to each other in public. Connect one or more Discord or
+Slack channels in the menu app's **Channel** tab and it works like a small
+Slack: a sidebar of channels with unread counts, the conversation, and a
+composer where `@` autocompletes teammates' bots. Mention a bot and your bot
+posts the question in the channel on your behalf; the other bot answers there,
+from its owner's shared projects, for everyone to read. A short machine-readable
+trailer on each message carries the request id, only asks are ever answered so
+two bots can't loop, a relayed asker always gets the teammate view, and each
+sending bot is rate-limited. Any bot in a connected channel can be told to stop
+being answered. Teammates need a current mybot for their bots to understand
+the relay.
+
 See [docs/multi-user.md](docs/multi-user.md) for session routing, idle rollover,
-and the per-platform actor-id caveat. Cross-bot relay is receiver-side only so
-far — treat it as experimental.
+the relay protocol, and the per-platform actor-id caveat.
 
 ## Model backends
 
@@ -419,8 +463,10 @@ skill, and prints a drift report so the copies cannot silently diverge.
 | Menu app shows no data | Checkout is not at `~/Code/mybot` and `MYBOT_HOME` is unset |
 | Vector search misses obvious hits | Embeddings not backfilled yet — check `missing_embeddings` in index stats |
 | Index looks stale and will not catch up | On battery, with `TRAJECTORY_INDEX_PAUSE_ON_BATTERY` on |
-| Codex ignores your configured model | Expected — mybot passes `--ignore-user-config`; set `CODEX_MODEL` in `.env` |
-| Bot silent in a guild channel | Enable **Message Content Intent** in the Discord Developer Portal, and check `DISCORD_ALLOWED_CHANNEL_IDS` |
+| Codex ignores your configured reasoning effort | Expected — mybot passes `--ignore-user-config`; it takes the model from `CODEX_MODEL`, else `~/.codex/config.toml`, but effort only from `CODEX_REASONING_EFFORT` |
+| A client gets 401 from the server | It is not sending the API key in `~/.mybot/api-key` — restart it after the server's first start |
+| Bot silent in a guild channel | Enable **Message Content Intent** in the Discord Developer Portal, and check `DISCORD_ALLOWED_CHANNEL_IDS` (Slack: `SLACK_ALLOWED_CHANNEL_IDS`; empty means DMs only) |
+| A teammate's answer leaves out a project | It isn't shared with the team yet — review it in the menu app's **Team sharing** view |
 | Sync endpoints return 503 | `config/sync_tokens.json` not configured — everything else works without it |
 
 ## Repo layout
