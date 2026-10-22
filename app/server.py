@@ -4252,6 +4252,22 @@ class ChatHandler(BaseHTTPRequestHandler):
                 200, {"ok": True, "date": date, "dates": dates, "pulses": pulses, "running": running}
             )
             return
+        if path == "/briefing/figure":
+            # ?engine=&date=&name= — a figure the pulse's writers drew.
+            query = urllib.parse.parse_qs(self.path.split("?", 1)[1] if "?" in self.path else "")
+            runner = self.server.state.briefings.get((query.get("engine") or ["claude"])[0])
+            figure = runner.figure_path((query.get("date") or [""])[0], (query.get("name") or [""])[0]) if runner else None
+            if not figure:
+                self.respond_json(404, {"ok": False, "error": "no such figure"})
+                return
+            data = figure.read_bytes()
+            self.send_response(200)
+            self.send_header("Content-Type", "image/png")
+            self.send_header("Content-Length", str(len(data)))
+            self.send_header("Cache-Control", "private, max-age=86400")
+            self.end_headers()
+            self.wfile.write(data)
+            return
         if path in {"/channel", "/channel/outbox"}:
             query = urllib.parse.parse_qs(self.path.split("?", 1)[1] if "?" in self.path else "")
             channel = self.server.state.team_channel

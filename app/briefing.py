@@ -49,6 +49,7 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
+from app import pulse_figures
 from app.logging_setup import get_logger
 
 if TYPE_CHECKING:  # pragma: no cover
@@ -109,6 +110,12 @@ class BriefingRunner:
         self.dir = Path(state.config.state_dir) / "briefings"
         self.dir.mkdir(parents=True, exist_ok=True)
         self.outbox_path = Path(state.config.state_dir) / "outbox.jsonl"
+        # Figures the writers draw (see app/pulse_figures.py), per pulse run.
+        self.figures_enabled = _env_bool("BRIEFING_FIGURES", True)
+        self.figures_root = self.dir / "figures"
+        self._figure_run = ""
+        self._figure_dest: Path | None = None
+        self._figure_python = ""
         self._lock = threading.Lock()
         self.status: dict[str, Any] = {"running": False, "stage": "", "started_at": "", "last": None}
 
@@ -158,6 +165,7 @@ class BriefingRunner:
         record: dict[str, Any] = {"date": day, "started_at": datetime.now(timezone.utc).isoformat()}
         try:
             self.status.update(running=True, started_at=record["started_at"], stage="gather")
+            self._prepare_figures(f"{day}{self.suffix}", self.figures_root / f"{day}{self.suffix}")
             evidence = self.gather()
             record["evidence"] = {k: v for k, v in evidence.items() if k != "previous"}
             if not evidence["recent_prompts"] and not evidence["backdrop_prompts"] and not force:
@@ -179,6 +187,8 @@ class BriefingRunner:
                 record["draft"] = draft
                 self.status["stage"] = "verify"
                 text = self.verify(evidence, draft)
+                if self._figure_dest:
+                    text = pulse_figures.prune(text, self._figure_dest)
             text, carry = self._split_carry(text)
             record["carry"] = carry
             record["open_loops"] = carry.get("overlooked", []) if isinstance(carry, dict) else []
@@ -517,7 +527,9 @@ class BriefingRunner:
             + "\nOwner: " + (evidence.get("owner") or "") + "\n\n" + self._tool_section()
         )
 
-        def one(topic: dict[str, Any]) -> dict[str, Any]:
+        def one(item: tuple[int, dict[str, Any]]) -> dict[str, Any]:
+            index, topic = item
+            out_dir = self._figure_work_dir(index)
             message = (
                 f"Candidate topic: {json.dumps(topic, ensure_ascii=False)}\n\n"
                 "Research it properly (web: papers, docs, talks; their own prompts for what "
@@ -528,13 +540,18 @@ class BriefingRunner:
                 "the idea clearly from first principles; give one or two concrete examples; end "
                 "with what they could try or think about, in a sentence or two. Cite sources "
                 "inline as links. No bullet-point dumps — prose."
+                + (pulse_figures.instructions(self._figure_python, out_dir) if out_dir else "")
             )
             text = self._agent(label=f"article:{str(topic.get('topic'))[:40]}", system=system,
                                message=message, effort=self.chief_effort, tools=True, web=True)
+            if out_dir and self._figure_dest:
+                text = pulse_figures.collect(text, out_dir, self._figure_dest, f"a{index}")
+            else:
+                text = pulse_figures.without(text)
             return {"topic": topic.get("topic"), "text": text}
 
         with ThreadPoolExecutor(max_workers=max(1, self.parallel)) as pool:
-            results = list(pool.map(one, topics))
+            results = list(pool.map(one, enumerate(topics, start=1)))
         return [r for r in results if r["text"] and not r["text"].lstrip().upper().startswith("SKIP")]
 
     def check_overlooked(self, evidence: dict[str, Any], scout: dict[str, Any]) -> str:
@@ -576,7 +593,8 @@ class BriefingRunner:
             "2. A line `## You may have overlooked`, then the items as `- ` bullets (at most 7 "
             "one-liners, each with its pointer).\n"
             "3. Each article under its own `## <article title>` heading, lightly edited for "
-            "clarity and the owner's vocabulary.\n"
+            "clarity and the owner's vocabulary. Keep every `![caption](figure:…)` line exactly "
+            "as written, in its place in its article (drop it only with its article).\n"
             "Then a fenced ```json block: {\"topics\": [article topics used], \"overlooked\": "
             "[{\"item\": ..., \"pointer\": ...}]} so tomorrow can avoid repeats and follow up."
         )
@@ -595,12 +613,34 @@ class BriefingRunner:
             "wrong; (2) every external claim matches its cited source; (3) no session-status "
             "recap slipped in; (4) no unexplained agent jargon — rewrite in plain words. Keep "
             "the voice, length and markdown shape (`## You may have overlooked` with `- ` bullets, "
-            "then one `## <title>` per article). Output ONLY the final pulse followed by the "
+            "then one `## <title>` per article). Keep each `![caption](figure:…)` line unchanged "
+            "in its place, unless its caption claims something unsupported — then fix the caption "
+            "or drop the line. Output ONLY the final pulse followed by the "
             "```json block."
         )
         text = self._agent(label="verifier", system=system, message=message,
                            effort=self.verify_effort, tools=True, web=True)
         return text or draft
+
+    # ----------------------------------------------------------------- figures
+
+    def _prepare_figures(self, run: str, dest: Path) -> None:
+        """Give this run's writers a plotting environment and output folders
+        (nothing, if figures are off or the environment can't be made)."""
+        self._figure_run, self._figure_dest, self._figure_python = run, None, ""
+        if not self.figures_enabled:
+            return
+        python = pulse_figures.figure_python(self.state.config.codex_cwd)
+        if python:
+            self._figure_python, self._figure_dest = python, dest
+
+    def _figure_work_dir(self, index: int) -> Path | None:
+        if not self._figure_python:
+            return None
+        return pulse_figures.work_dir(self.state.config.codex_cwd, self._figure_run, index)
+
+    def figure_path(self, date: str, name: str) -> Path | None:
+        return pulse_figures.resolve(self.figures_root, f"{date}{self.suffix}", name)
 
     # ------------------------------------------------------------------ replay
 
@@ -614,6 +654,8 @@ class BriefingRunner:
         evidence.setdefault("owner", self._owner_line())
         runner = BriefingRunner(self.state, self.engine)
         runner.model = model
+        stem = f"{source_date}{self.suffix}.{tag or model}"
+        runner._prepare_figures(f"replay-{stem}", self.dir / "compare" / f"{stem}-figures")
         started = time.time()
         scout = runner.scout(evidence)
         with ThreadPoolExecutor(max_workers=2) as pool:
@@ -622,9 +664,10 @@ class BriefingRunner:
             articles, overlooked = articles_f.result(), overlooked_f.result()
         draft = runner.edit(evidence, articles, overlooked)
         text, carry = self._split_carry(runner.verify(evidence, draft))
+        if runner._figure_dest:
+            text = pulse_figures.prune(text, runner._figure_dest)
         out_dir = self.dir / "compare"
         out_dir.mkdir(exist_ok=True)
-        stem = f"{source_date}{self.suffix}.{tag or model}"
         (out_dir / f"{stem}.md").write_text(
             f"# Replay of {source_date} with {model}\n\n" + text + "\n"
         )
@@ -815,7 +858,7 @@ class BriefingRunner:
             "label": ENGINE_LABELS.get(self.engine, self.engine),
             "date": data.get("date"),
             "title": self._title(str(data.get("date"))),
-            "sections": sections,
+            "sections": [dict(sec, figures=pulse_figures.figures_in(str(sec.get("body") or ""))) for sec in sections],
             "actions": data.get("actions") or [],
         }
 
@@ -938,14 +981,15 @@ class BriefingRunner:
         # A menu-app thread: shows up in Ask history; follow-ups continue in place.
         thread = f"{THREAD_PREFIX}{day.replace('-', '')}{self.suffix.replace('.', '-')}"
         sessions.append_message(thread, owner, "user", title, {"kind": "briefing"})
-        sessions.append_message(thread, owner, "assistant", text, {"kind": "briefing"})
+        sessions.append_message(thread, owner, "assistant", pulse_figures.as_captions(text), {"kind": "briefing"})
         delivered["thread"] = thread
         if self.discord_dm and owner.isdigit():
             # Also seed the owner's DM conversation so a reply there has the
             # briefing as context; the bridge picks the text up from the outbox.
             try:
                 active, _ = sessions.resolve_active_session(f"discord-dm-user-{owner}", idle_seconds=None)
-                sessions.append_message(active, owner, "assistant", f"**{title}**\n\n{text}", {"kind": "briefing"})
+                sessions.append_message(active, owner, "assistant",
+                                        f"**{title}**\n\n{pulse_figures.as_captions(text)}", {"kind": "briefing"})
             except Exception as exc:  # pragma: no cover
                 log.warning("could not seed DM session: %s", exc)
             with self.outbox_path.open("a") as handle:
@@ -954,6 +998,12 @@ class BriefingRunner:
                     "platform": "discord",
                     "target_user_id": owner,
                     "text": f"**{title}**\n\n{text}",
+                    # The bridge attaches each figure where its line is.
+                    "figures": {
+                        fig["name"]: str(path)
+                        for fig in pulse_figures.figures_in(text)
+                        if (path := self.figure_path(day, fig["name"]))
+                    },
                     "created_at": datetime.now(timezone.utc).isoformat(),
                 }) + "\n")
             delivered["discord"] = "queued"
@@ -1141,7 +1191,9 @@ def _hop_pulse(engine: str, latest: dict[str, Any], sessions: dict[str, dict[str
         "label": latest.get("label") or engine,
         "date": latest.get("date"),
         "title": latest.get("title"),
-        "sections": latest.get("sections") or [],
+        # The phone shows text only: a figure becomes its caption.
+        "sections": [dict(sec, body=pulse_figures.as_captions(str(sec.get("body") or "")))
+                     for sec in latest.get("sections") or []],
         "actions": actions,
     }
 

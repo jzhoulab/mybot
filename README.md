@@ -175,10 +175,13 @@ pursuing and things that slipped. A planner groups the activity into
 workstreams, analysts read the real transcripts for each (with optional web
 research), a chief agent writes the pulse, and a verifier checks it against
 the evidence. `BRIEFING_ENGINES=claude,gpt` runs one pulse per engine over the
-same window.
+same window. Where a picture helps, a writer draws a diagram or chart (with
+matplotlib, inside its sandbox); charts may only use numbers from a cited
+source or the owner's own work.
 
 The pulse appears in the menu app's **Pulse** tab, as a Discord DM, and in the
-hop phone app. Any item can be discussed with mybot, and a follow-up goes into
+hop phone app. Figures are drawn inline in the menu app and attached in
+Discord; the phone shows their captions. Any item can be discussed with mybot, and a follow-up goes into
 the conversation the item came from: the live hop session if it is running,
 otherwise that Claude Code or Codex session resumed — never a fresh one.
 Trigger one by hand with `POST /briefing/run {"force": true}`; the settings

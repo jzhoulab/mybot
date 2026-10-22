@@ -23,7 +23,7 @@ except ImportError as exc:  # pragma: no cover - import guard for runtime only
         "discord.py is required. Install it with: python3 -m pip install -U discord.py"
     ) from exc
 
-from app import relay_protocol
+from app import pulse_figures, relay_protocol
 from app.api_auth import authorize
 from app.logging_setup import get_logger
 
@@ -477,7 +477,7 @@ class DiscordBridgeClient(discord.Client):
                         continue
                     user = self.get_user(int(target)) or await self.fetch_user(int(target))
                     channel = user.dm_channel or await user.create_dm()
-                    await self._send_channel_text(channel, str(item.get("text") or ""))
+                    await self._send_with_figures(channel, str(item.get("text") or ""), item.get("figures") or {})
                     # The DM channel lets the phone's pulse open this conversation.
                     await self.api.outbox_ack(str(item.get("id")), str(channel.id))
                     log.info("delivered outbox item %s to %s", item.get("id"), target)
@@ -1317,6 +1317,28 @@ class DiscordBridgeClient(discord.Client):
             if reference is not None and index == 0:
                 kwargs["reference"] = reference.to_reference(fail_if_not_exists=False)
             await channel.send(chunk, **kwargs)
+
+    async def _send_with_figures(
+        self, channel: discord.abc.Messageable, text: str, figures: dict[str, str]
+    ) -> None:
+        """Text with `![caption](figure:name)` lines: each figure goes out as
+        an attachment (captioned) where its line was, the text around it as
+        usual. A figure the server didn't hand over becomes its caption."""
+        pos = 0
+        for match in pulse_figures.FIGURE_RE.finditer(text):
+            before = text[pos:match.start()].strip()
+            if before:
+                await self._send_channel_text(channel, before)
+            caption, path = match.group(1).strip(), figures.get(match.group(2)) or ""
+            if path and os.path.isfile(path):
+                await channel.send(f"-# {caption}" if caption else None, file=discord.File(path),
+                                   allowed_mentions=self.safe_mentions)
+            elif caption:
+                await self._send_channel_text(channel, f"*Figure: {caption}*")
+            pos = match.end()
+        rest = text[pos:].strip()
+        if rest:
+            await self._send_channel_text(channel, rest)
 
     async def _send_interaction_text(
         self,

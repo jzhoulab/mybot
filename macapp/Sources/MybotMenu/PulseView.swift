@@ -82,6 +82,13 @@ struct PulseClient {
         }.resume()
     }
 
+    func figureURL(engine: String, date: String, name: String) -> URL {
+        var comps = URLComponents(url: baseURL.appendingPathComponent("briefing/figure"), resolvingAgainstBaseURL: false)!
+        comps.queryItems = [URLQueryItem(name: "engine", value: engine), URLQueryItem(name: "date", value: date),
+                            URLQueryItem(name: "name", value: name)]
+        return comps.url!
+    }
+
     func followUp(engine: String, date: String, actionID: String,
                   completion: @escaping (Result<String, Error>) -> Void) {
         var request = URLRequest(url: baseURL.appendingPathComponent("briefing/followup"))
@@ -154,7 +161,8 @@ enum PulseMarkdown {
 
     /// Copy a section: rich text (keeps bold and links) plus the markdown as
     /// plain text, so it pastes well into both editors and chat boxes.
-    static func copy(title: String, body: String) {
+    static func copy(title: String, body rawBody: String) {
+        let body = PulseFigures.asCaptions(rawBody)
         let markdown = title.isEmpty ? body : "## \(title)\n\n\(body)"
         let pasteboard = NSPasteboard.general
         pasteboard.clearContents()
@@ -171,6 +179,141 @@ enum PulseMarkdown {
             pasteboard.setData(rtf, forType: .rtf)
         }
         pasteboard.setString(markdown, forType: .string)
+    }
+}
+
+/// `![caption](figure:name.png)` lines in a pulse: drawings the article
+/// writers made, served by the local server (GET /briefing/figure).
+enum PulseFigures {
+    enum Part: Hashable {
+        case text(String)
+        case figure(caption: String, name: String)
+    }
+
+    private static let line = try! NSRegularExpression(
+        pattern: #"^[ \t]*!\[([^\]\n]*)\]\(figure:([A-Za-z0-9][\w.-]{0,80})\)[ \t]*$"#,
+        options: [.anchorsMatchLines])
+
+    static func parts(_ text: String) -> [Part] {
+        let ns = text as NSString
+        var out: [Part] = []
+        var pos = 0
+        for match in line.matches(in: text, range: NSRange(location: 0, length: ns.length)) {
+            let before = ns.substring(with: NSRange(location: pos, length: match.range.location - pos))
+                .trimmingCharacters(in: .whitespacesAndNewlines)
+            if !before.isEmpty { out.append(.text(before)) }
+            out.append(.figure(caption: ns.substring(with: match.range(at: 1)).trimmingCharacters(in: .whitespaces),
+                               name: ns.substring(with: match.range(at: 2))))
+            pos = match.range.location + match.range.length
+        }
+        let rest = ns.substring(from: pos).trimmingCharacters(in: .whitespacesAndNewlines)
+        if !rest.isEmpty || out.isEmpty { out.append(.text(rest)) }
+        return out
+    }
+
+    /// For copying: each figure becomes its caption.
+    static func asCaptions(_ text: String) -> String {
+        parts(text).map {
+            switch $0 {
+            case .text(let s): return s
+            case .figure(let caption, _): return caption.isEmpty ? "" : "*Figure: \(caption)*"
+            }
+        }.filter { !$0.isEmpty }.joined(separator: "\n\n")
+    }
+
+    static let cache = NSCache<NSString, NSImage>()
+}
+
+/// A section's text with its figures drawn in place.
+struct PulseBody: View {
+    let text: String
+    var size: CGFloat = 12
+    let engine: String
+    let date: String
+    let config: MybotConfig
+
+    var body: some View {
+        let parts = PulseFigures.parts(text)
+        VStack(alignment: .leading, spacing: size * 0.9) {
+            ForEach(Array(parts.enumerated()), id: \.offset) { _, part in
+                switch part {
+                case .text(let s):
+                    MarkdownBlock(text: s, size: size)
+                case .figure(let caption, let name):
+                    PulseFigure(url: PulseClient(config: config).figureURL(engine: engine, date: date, name: name),
+                                caption: caption, size: size)
+                }
+            }
+        }
+    }
+}
+
+struct PulseFigure: View {
+    let url: URL
+    let caption: String
+    var size: CGFloat = 12
+    @State private var image: NSImage?
+    @State private var failed = false
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 6) {
+            Group {
+                if let image {
+                    Image(nsImage: image)
+                        .resizable().interpolation(.high).aspectRatio(contentMode: .fit)
+                        .frame(maxWidth: .infinity)
+                        .background(Color.white)
+                        .clipShape(RoundedRectangle(cornerRadius: 6))
+                        .overlay(RoundedRectangle(cornerRadius: 6).stroke(Color.primary.opacity(0.08)))
+                        .onTapGesture(count: 2) { open(image) }
+                        .contextMenu {
+                            Button("Copy Image") {
+                                NSPasteboard.general.clearContents()
+                                NSPasteboard.general.writeObjects([image])
+                            }
+                            Button("Open in Preview") { open(image) }
+                        }
+                        .help("Double-click to open it larger")
+                } else if failed {
+                    Label("Figure unavailable", systemImage: "photo")
+                        .font(.system(size: size * 0.85)).foregroundStyle(.tertiary)
+                } else {
+                    RoundedRectangle(cornerRadius: 6).fill(Color.primary.opacity(0.04))
+                        .frame(height: 160).overlay(ProgressView().controlSize(.small))
+                }
+            }
+            if !caption.isEmpty {
+                Text(caption).font(.system(size: size * 0.85)).foregroundStyle(.secondary)
+                    .textSelection(.enabled).fixedSize(horizontal: false, vertical: true)
+            }
+        }
+        .onAppear(perform: load)
+    }
+
+    private func load() {
+        if let hit = PulseFigures.cache.object(forKey: url.absoluteString as NSString) { image = hit; return }
+        MybotHTTP.session.dataTask(with: url) { data, response, _ in
+            let ok = (response as? HTTPURLResponse)?.statusCode == 200
+            let loaded = ok ? data.flatMap { NSImage(data: $0) } : nil
+            DispatchQueue.main.async {
+                if let loaded {
+                    PulseFigures.cache.setObject(loaded, forKey: url.absoluteString as NSString)
+                    image = loaded
+                } else {
+                    failed = true
+                }
+            }
+        }.resume()
+    }
+
+    private func open(_ image: NSImage) {
+        guard let tiff = image.tiffRepresentation, let rep = NSBitmapImageRep(data: tiff),
+              let png = rep.representation(using: .png, properties: [:]) else { return }
+        let file = FileManager.default.temporaryDirectory.appendingPathComponent(url.lastPathComponent.isEmpty
+            ? "pulse-figure.png" : (URLComponents(url: url, resolvingAgainstBaseURL: false)?
+                .queryItems?.first(where: { $0.name == "name" })?.value ?? "pulse-figure.png"))
+        try? png.write(to: file)
+        NSWorkspace.shared.open(file)
     }
 }
 
@@ -309,7 +452,7 @@ struct PulseView: View {
     private func sectionView(_ section: PulseSection, pulse: Pulse) -> some View {
         switch section.kind {
         case "intro":
-            MarkdownBlock(text: section.body, size: 13 * scale)
+            sectionBody(section, pulse: pulse, size: 13 * scale)
                 .foregroundStyle(.primary)
         case "overlooked":
             VStack(alignment: .leading, spacing: 6) {
@@ -318,7 +461,7 @@ struct PulseView: View {
                         .foregroundStyle(.secondary)
                 }
                 VStack(alignment: .leading, spacing: 8) {
-                    MarkdownBlock(text: section.body, size: 12.5 * scale)
+                    sectionBody(section, pulse: pulse, size: 12.5 * scale)
                     HStack(spacing: 10) {
                         actionButton(pulse: pulse, id: section.id)
                         Spacer()
@@ -341,11 +484,15 @@ struct PulseView: View {
                     discussButton(pulse: pulse, section: section)
                     copyButton(key: section.id, title: section.title, body: section.body)
                 }
-                MarkdownBlock(text: section.body, size: 13 * scale)
+                sectionBody(section, pulse: pulse, size: 13 * scale)
             }
         default:
-            MarkdownBlock(text: section.body, size: 11.5 * scale).foregroundStyle(.secondary)
+            sectionBody(section, pulse: pulse, size: 11.5 * scale).foregroundStyle(.secondary)
         }
+    }
+
+    private func sectionBody(_ section: PulseSection, pulse: Pulse, size: CGFloat) -> some View {
+        PulseBody(text: section.body, size: size, engine: pulse.engine, date: pulse.date, config: model.config)
     }
 
     private func discussButton(pulse: Pulse, section: PulseSection) -> some View {
