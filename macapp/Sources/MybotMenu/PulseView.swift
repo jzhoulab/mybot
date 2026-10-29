@@ -28,6 +28,22 @@ struct Pulse: Identifiable, Hashable {
     let stage: String
 }
 
+/// Where a follow-up will go, before it's sent (GET /briefing/followup/plan).
+struct FollowUpPlan {
+    struct Option: Identifiable, Hashable {
+        let id: String        // live:<hop name> | resume:<agent>:<session> | new
+        let kind: String
+        let label: String
+        let detail: String
+        let agentPermitted: Bool
+    }
+    var prompt: String
+    var defaultTarget: String
+    var options: [Option]
+    var liveMessage: String
+    var sentTo: String?
+}
+
 struct PulseClient {
     let config: MybotConfig
 
@@ -89,15 +105,47 @@ struct PulseClient {
         return comps.url!
     }
 
-    func followUp(engine: String, date: String, actionID: String,
+    func followUpPlan(engine: String, date: String, actionID: String,
+                      completion: @escaping (Result<FollowUpPlan, Error>) -> Void) {
+        var comps = URLComponents(url: baseURL.appendingPathComponent("briefing/followup/plan"), resolvingAgainstBaseURL: false)!
+        comps.queryItems = [URLQueryItem(name: "engine", value: engine), URLQueryItem(name: "date", value: date),
+                            URLQueryItem(name: "action_id", value: actionID)]
+        var request = URLRequest(url: comps.url!)
+        request.timeoutInterval = 60  // asks hop which sessions are live
+        MybotHTTP.session.dataTask(with: request) { data, _, error in
+            let obj = data.flatMap { try? JSONSerialization.jsonObject(with: $0) as? [String: Any] }
+            DispatchQueue.main.async {
+                guard let obj, (obj["ok"] as? Bool) == true else {
+                    let message = (obj?["error"] as? String) ?? error?.localizedDescription ?? "couldn't load the follow-up"
+                    completion(.failure(NSError(domain: "mybot", code: 1, userInfo: [NSLocalizedDescriptionKey: message])))
+                    return
+                }
+                let options = ((obj["options"] as? [[String: Any]]) ?? []).compactMap { o -> FollowUpPlan.Option? in
+                    guard let id = o["id"] as? String else { return nil }
+                    return .init(id: id, kind: (o["kind"] as? String) ?? "", label: (o["label"] as? String) ?? id,
+                                 detail: (o["detail"] as? String) ?? "",
+                                 agentPermitted: (o["agent_permitted"] as? Bool) ?? true)
+                }
+                completion(.success(FollowUpPlan(
+                    prompt: (obj["prompt"] as? String) ?? "",
+                    defaultTarget: (obj["default"] as? String) ?? "new",
+                    options: options,
+                    liveMessage: (obj["live_message"] as? String) ?? "",
+                    sentTo: (obj["spawned"] as? [String: Any])?["terminal"] as? String)))
+            }
+        }.resume()
+    }
+
+    func followUp(engine: String, date: String, actionID: String, prompt: String? = nil, target: String? = nil,
                   completion: @escaping (Result<String, Error>) -> Void) {
         var request = URLRequest(url: baseURL.appendingPathComponent("briefing/followup"))
         request.httpMethod = "POST"
         request.setValue("application/json", forHTTPHeaderField: "Content-Type")
         request.timeoutInterval = 240  // spawning an agent in hop takes a few seconds
-        request.httpBody = try? JSONSerialization.data(withJSONObject: [
-            "engine": engine, "date": date, "action_id": actionID,
-        ])
+        var body: [String: Any] = ["engine": engine, "date": date, "action_id": actionID]
+        if let prompt { body["prompt"] = prompt }
+        if let target { body["target"] = target }
+        request.httpBody = try? JSONSerialization.data(withJSONObject: body)
         MybotHTTP.session.dataTask(with: request) { data, _, error in
             let obj = data.flatMap { try? JSONSerialization.jsonObject(with: $0) as? [String: Any] }
             DispatchQueue.main.async {
@@ -549,19 +597,190 @@ struct PulseView: View {
                         .font(.system(size: 10.5)).foregroundStyle(.orange).lineLimit(1)
                         .help("hop only lets you type into that session. The message is on your clipboard — paste it there.")
                 } else {
-                    Label("In hop: \(terminal)", systemImage: "checkmark.circle.fill")
-                        .font(.system(size: 10.5)).foregroundStyle(.green).lineLimit(1)
-                        .help("Sent to the hop session \(terminal).")
+                    HStack(spacing: 6) {
+                        Label("In hop: \(terminal)", systemImage: "checkmark.circle.fill")
+                            .font(.system(size: 10.5)).foregroundStyle(.green).lineLimit(1)
+                            .help("Sent to the hop session \(terminal).")
+                        FollowUpButton(model: model, pulse: pulse, actionID: id, label: "Send again", compact: true,
+                                       title: action.label)
+                    }
                 }
             } else if model.pulseLaunching.contains("\(pulse.engine)/\(id)") {
                 ProgressView().controlSize(.small)
             } else {
-                Button { model.followUp(pulse: pulse, actionID: id) } label: {
-                    Label(action.label, systemImage: "arrow.up.forward.app")
-                }
-                .controlSize(.small)
-                .help("Start an agent in hop to follow up on this.")
+                FollowUpButton(model: model, pulse: pulse, actionID: id, label: action.label)
             }
         }
+    }
+}
+
+
+/// A follow-up button that first shows where the follow-up will go and what
+/// it will say: pick another session, edit the text, then send.
+struct FollowUpButton: View {
+    @ObservedObject var model: AppModel
+    let pulse: Pulse
+    let actionID: String
+    let label: String
+    var compact = false
+    var title: String? = nil
+    @State private var showing = false
+
+    var body: some View {
+        Group {
+            if compact {
+                Button(label) { showing = true }
+                    .buttonStyle(.plain).font(.system(size: 10.5)).foregroundStyle(.secondary)
+            } else {
+                Button { showing = true } label: { Label(label, systemImage: "arrow.up.forward.app") }
+                    .controlSize(.small)
+            }
+        }
+        .help("See where this goes and what it says before sending it to hop")
+        .popover(isPresented: $showing, arrowEdge: .bottom) {
+            FollowUpEditor(model: model, pulse: pulse, actionID: actionID, title: title ?? label) { showing = false }
+        }
+    }
+}
+
+struct FollowUpEditor: View {
+    @ObservedObject var model: AppModel
+    let pulse: Pulse
+    let actionID: String
+    let title: String
+    let close: () -> Void
+    @State private var plan: FollowUpPlan?
+    @State private var error: String?
+    @State private var target = ""
+    @State private var text = ""
+    @State private var otherRef = ""
+
+    private static let otherID = "other"
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            Text(title).font(.system(size: 13, weight: .semibold))
+            if let plan {
+                if let sent = plan.sentTo {
+                    Label("Already sent to \(sent)", systemImage: "checkmark.circle")
+                        .font(.system(size: 11)).foregroundStyle(.secondary)
+                }
+                destination(plan)
+                VStack(alignment: .leading, spacing: 4) {
+                    Text("Message").font(.system(size: 11, weight: .medium)).foregroundStyle(.secondary)
+                    TextEditor(text: $text)
+                        .font(.system(size: 12))
+                        .frame(minHeight: 180, maxHeight: 320)
+                        .padding(4)
+                        .background(RoundedRectangle(cornerRadius: 6).fill(Color.primary.opacity(0.04)))
+                    Text(howItArrives(plan))
+                        .font(.system(size: 10.5)).foregroundStyle(.tertiary)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
+                HStack {
+                    if text != plan.prompt {
+                        Button("Revert text") { text = plan.prompt }.buttonStyle(.plain)
+                            .font(.system(size: 11)).foregroundStyle(.secondary)
+                    }
+                    Spacer()
+                    Button("Cancel", action: close).keyboardShortcut(.cancelAction)
+                    Button(plan.sentTo == nil ? "Send" : "Send again") { send(plan) }
+                        .keyboardShortcut(.defaultAction)
+                        .disabled(text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+                                  || (target == Self.otherID && resolvedOther == nil))
+                }
+            } else if let error {
+                Label(error, systemImage: "exclamationmark.triangle").font(.system(size: 11)).foregroundStyle(.orange)
+            } else {
+                HStack { ProgressView().controlSize(.small); Text("Finding the session…").font(.system(size: 11)).foregroundStyle(.secondary) }
+                    .frame(maxWidth: .infinity, minHeight: 80)
+            }
+        }
+        .padding(14)
+        .frame(width: 460)
+        .onAppear(perform: load)
+    }
+
+    private func destination(_ plan: FollowUpPlan) -> some View {
+        let groups: [(String, [FollowUpPlan.Option])] = [
+            ("The item's own conversation", plan.options.filter { $0.kind == "resume" }),
+            ("Live in hop", plan.options.filter { $0.kind == "live" }),
+            ("", plan.options.filter { $0.kind == "new" }),
+        ]
+        let chosen = plan.options.first { $0.id == target }
+        return VStack(alignment: .leading, spacing: 4) {
+            Text("Send to").font(.system(size: 11, weight: .medium)).foregroundStyle(.secondary)
+            Picker("", selection: $target) {
+                ForEach(groups, id: \.0) { group in
+                    if !group.1.isEmpty {
+                        Section(group.0) {
+                            ForEach(group.1) { option in
+                                Text(option.id == plan.defaultTarget ? "\(option.label)  (suggested)" : option.label)
+                                    .tag(option.id)
+                            }
+                        }
+                    }
+                }
+                Divider()
+                Text("Another session…").tag(Self.otherID)
+            }
+            .labelsHidden()
+            if target == Self.otherID {
+                TextField("Session id, e.g. claude:2099f0a8-… or codex:01a1…", text: $otherRef)
+                    .textFieldStyle(.roundedBorder).font(.system(size: 11.5))
+                Text(resolvedOther == nil ? "Paste a session reference (the agent, a colon, then the id)."
+                                          : "Reopens that conversation in a new hop session.")
+                    .font(.system(size: 10.5)).foregroundStyle(.tertiary)
+            } else if let chosen {
+                Text(chosen.detail.isEmpty ? kindLine(chosen) : "\(kindLine(chosen)) · \(chosen.detail)")
+                    .font(.system(size: 10.5)).foregroundStyle(.secondary).lineLimit(2)
+                    .textSelection(.enabled)
+                if chosen.kind == "live" && !chosen.agentPermitted {
+                    Text("hop doesn't let agents type here — you'll get the line on your clipboard to paste.")
+                        .font(.system(size: 10.5)).foregroundStyle(.orange)
+                }
+            }
+        }
+    }
+
+    private func kindLine(_ option: FollowUpPlan.Option) -> String {
+        switch option.kind {
+        case "live": return "Open in hop now"
+        case "resume": return "Reopens this conversation in a new hop session"
+        default: return "Starts a fresh agent"
+        }
+    }
+
+    private func howItArrives(_ plan: FollowUpPlan) -> String {
+        if plan.options.first(where: { $0.id == target })?.kind == "live" {
+            return "The session gets one line pointing to a task file with this text: “\(plan.liveMessage)”"
+        }
+        return "Sent as the agent's first message."
+    }
+
+    private var resolvedOther: String? {
+        let ref = otherRef.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard ref.range(of: #"^(claude|codex):[0-9a-fA-F-]{8,}$"#, options: .regularExpression) != nil else { return nil }
+        return "resume:" + ref
+    }
+
+    private func load() {
+        PulseClient(config: model.config).followUpPlan(engine: pulse.engine, date: pulse.date, actionID: actionID) { result in
+            switch result {
+            case .success(let loaded):
+                plan = loaded
+                text = loaded.prompt
+                target = loaded.defaultTarget
+            case .failure(let err):
+                error = err.localizedDescription
+            }
+        }
+    }
+
+    private func send(_ plan: FollowUpPlan) {
+        let chosen = target == Self.otherID ? (resolvedOther ?? plan.defaultTarget) : target
+        let edited = text == plan.prompt ? nil : text
+        close()
+        model.followUp(pulse: pulse, actionID: actionID, prompt: edited, target: chosen)
     }
 }

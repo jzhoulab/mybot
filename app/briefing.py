@@ -794,27 +794,8 @@ class BriefingRunner:
     def _live_hop_sessions_described(self) -> str:
         """Live hop agent sessions, each with what its conversation is about
         (title from the index), for the actions agent to route items to."""
-        sessions = hop_agent_sessions()
-        if not sessions:
-            return ""
-        db = self.state.config.trajectory_index_db_path
-        lines = []
-        try:
-            conn = sqlite3.connect(f"file:{db}?mode=ro", uri=True, timeout=10)
-        except sqlite3.Error:
-            conn = None
-        for conversation, target in sessions.items():
-            title = cwd = ""
-            if conn is not None:
-                row = conn.execute(
-                    "SELECT title, cwd FROM trajectory_chunks WHERE source_ref LIKE ? LIMIT 1",
-                    (f"%:{conversation}",),
-                ).fetchone()
-                if row:
-                    title, cwd = str(row[0] or "")[:90], str(row[1] or "")
-            lines.append(f"- {target['name']} ({target['agent']}; {cwd or '?'}): {title or '(untitled)'}")
-        if conn is not None:
-            conn.close()
+        lines = [f"- {s['name']} ({s['agent']}; {s['cwd'] or '?'}): {s['title'] or '(untitled)'}"
+                 for s in live_hop_sessions(self.state.config.trajectory_index_db_path)]
         return "\n".join(sorted(set(lines)))
 
     def _cwd_for(self, source_ref: str) -> str:
@@ -862,26 +843,102 @@ class BriefingRunner:
             "actions": data.get("actions") or [],
         }
 
-    def follow_up(self, date: str, action_id: str) -> dict[str, Any]:
-        """Launch the item's follow-up as an agent in hop (the owner watches
-        and steers it there). Returns immediately; the agent works on."""
+    def _action(self, date: str, action_id: str) -> tuple[Path, dict[str, Any], dict[str, Any]]:
+        if not re.fullmatch(r"\d{4}-\d{2}-\d{2}", date or ""):
+            raise ValueError("bad date")
         path = self.dir / f"{date}{self.suffix}.json"
         data = json.loads(path.read_text())
         action = next((a for a in data.get("actions") or [] if a.get("id") == action_id), None)
         if action is None:
             raise ValueError(f"no action {action_id} for {date}")
-        if action.get("spawned"):
-            return {"ok": True, "already": True, **action["spawned"]}
-        task_path = PULSE_TASK_DIR / f"{date}-{self.engine}-{action_id}.md"
-        if not task_path.exists():
-            PULSE_TASK_DIR.mkdir(parents=True, exist_ok=True)
-            task_path.write_text(
-                f"(Follow-up launched from mybot's morning pulse, {date}.)\n\n{action['prompt']}\n"
-            )
-        live = hop_agent_sessions()
-        target = hop_target_for(str(action.get("source_ref") or ""), live) or \
-            hop_target_named(str(action.get("hop_session") or ""), live)
+        return path, data, action
+
+    def follow_up_plan(self, date: str, action_id: str) -> dict[str, Any]:
+        """What a follow-up will do before it's sent: the message, where it
+        goes by default, and every other place it could go instead."""
+        _, _, action = self._action(date, action_id)
+        live = live_hop_sessions(self.state.config.trajectory_index_db_path)
+        by_internal = {s["internal_name"]: s for s in live}
+        sessions = {s["conversation"]: s for s in live}
+        ref = str(action.get("source_ref") or "")
+        source = source_session(self.state.config.trajectory_index_db_path, ref)
+        agent = "codex" if self.engine == "gpt" else "claude"
+        options: list[dict[str, Any]] = []
+        seen: set[str] = set()
+        for s in sorted(live, key=lambda s: (s["name"].lower(), not s["title"])):
+            if s["internal_name"] in seen:
+                continue
+            seen.add(s["internal_name"])
+            options.append({
+                "id": f"live:{s['internal_name']}", "kind": "live", "label": s["name"],
+                "detail": " · ".join(x for x in (s["agent"], _short_path(s["cwd"]), s["title"]) if x),
+                "agent_permitted": s["agent_permitted"],
+            })
+        source_live = hop_target_for(ref, sessions) if ref else None
+        if source and not source_live:
+            options.append({
+                "id": f"resume:{source['agent']}:{source['session_id']}", "kind": "resume",
+                "label": f"Reopen {source['agent']} {source['session_id'][:8]}",
+                "detail": " · ".join(x for x in (_short_path(source["cwd"]), _session_title(
+                    self.state.config.trajectory_index_db_path, source)) if x),
+            })
+        cwd = (source or {}).get("cwd") or action.get("cwd") or str(Path.home() / "Code")
+        options.append({"id": "new", "kind": "new", "label": f"New {agent} session",
+                        "detail": _short_path(cwd), "cwd": cwd})
+        default = self._default_target(action, sessions, source)
+        if default.startswith("live:") and default[5:] not in by_internal:
+            default = "new"
+        return {
+            "ok": True, "id": action_id, "label": action.get("label") or "Follow up",
+            "prompt": str(action.get("prompt_edited") or action.get("prompt") or ""),
+            "default": default, "options": options, "spawned": action.get("spawned"),
+            "source_ref": ref,
+            # A live session gets one line pointing at the task file (Enter
+            # submits, so the text itself can't be typed in multi-line).
+            "live_message": pulse_message(date, str(action.get("label") or "Follow up"),
+                                          PULSE_TASK_DIR / f"{date}-{self.engine}-{action_id}.md"),
+        }
+
+    def _default_target(self, action: dict[str, Any], sessions: dict[str, Any], source: dict[str, Any] | None) -> str:
+        ref = str(action.get("source_ref") or "")
+        target = hop_target_for(ref, sessions) or hop_target_named(str(action.get("hop_session") or ""), sessions)
         if target:
+            return f"live:{target['internal_name']}"
+        if source:
+            return f"resume:{source['agent']}:{source['session_id']}"
+        return "new"
+
+    def follow_up(self, date: str, action_id: str, *, prompt: str | None = None,
+                  target: str | None = None) -> dict[str, Any]:
+        """Launch the item's follow-up as an agent in hop (the owner watches
+        and steers it there). Returns immediately; the agent works on.
+        `prompt` replaces the task text; `target` picks where it goes
+        ("live:<hop internal name>", "resume:<agent>:<session id>", "new");
+        without them, the defaults the plan shows."""
+        path, data, action = self._action(date, action_id)
+        if action.get("spawned") and target is None and prompt is None:
+            return {"ok": True, "already": True, **action["spawned"]}
+        if prompt is not None and prompt.strip():
+            action["prompt_edited"] = prompt.strip()
+            path.write_text(json.dumps(data, indent=1, default=str))
+        text = str(action.get("prompt_edited") or action.get("prompt") or "")
+        task_path = PULSE_TASK_DIR / f"{date}-{self.engine}-{action_id}.md"
+        PULSE_TASK_DIR.mkdir(parents=True, exist_ok=True)
+        # Always the current text: the owner may have just edited it.
+        task_path.write_text(f"(Follow-up launched from mybot's morning pulse, {date}.)\n\n{text}\n")
+        live = hop_agent_sessions()
+        db = self.state.config.trajectory_index_db_path
+        if target is None:
+            source = source_session(db, str(action.get("source_ref") or ""))
+            target = self._default_target(action, live, source)
+        kind, _, rest = target.partition(":")
+        if kind not in {"live", "resume", "new"}:
+            raise ValueError(f"unknown target {target!r}")
+        hop_target = next((t for t in live.values() if t["internal_name"] == rest), None) if kind == "live" else None
+        if kind == "live" and hop_target is None:
+            raise ValueError("that hop session isn't live any more")
+        if hop_target:
+            target = hop_target
             message = pulse_message(date, str(action.get("label") or "Follow up"), task_path)
             sent = self._hopa(["tool", "hopx_send_and_wait", json.dumps({
                 "terminal_id": target["internal_name"], "data": message,
@@ -901,10 +958,15 @@ class BriefingRunner:
                              "The message is ready to paste there."}
         agent = "codex" if self.engine == "gpt" else "claude"
         name = f"pulse-{date[5:].replace('-', '')}-{self.engine}-{action_id}"
-        source = source_session(self.state.config.trajectory_index_db_path, str(action.get("source_ref") or ""))
+        source = source_session(db, rest) if kind == "resume" else None
+        if kind == "resume" and source is None:
+            raise ValueError(f"can't find the session {rest}")
         if source:
             name = resumed_session_name(source)
         spec: dict[str, Any] = {"name": name, "agent": agent, "cwd": action.get("cwd") or str(Path.home() / "Code")}
+        if source is None and kind == "new":
+            # A fresh agent: give it a name of its own, even after a resend.
+            name = spec["name"] = f"{name}-{int(time.time()) % 100000}" if action.get("spawned") else name
         # Not open in hop: reopen the item's own conversation, so the
         # follow-up lands in the exact session it's about.
         if source:
@@ -913,11 +975,9 @@ class BriefingRunner:
         if not spawn.get("ok"):
             raise RuntimeError(f"hop spawn failed: {spawn}")
         terminal = str(spawn.get("terminal_id") or name)
-        prompt = (
-            f"(Follow-up launched from mybot's morning pulse, {date}.)\n\n" + str(action["prompt"])
-        )
+        first = f"(Follow-up launched from mybot's morning pulse, {date}.)\n\n" + text
         sent = self._hopa(["tool", "hopx_send_and_wait", json.dumps({
-            "terminal_id": terminal, "data": prompt, "press_enter": True, "wait": False,
+            "terminal_id": terminal, "data": first, "press_enter": True, "wait": False,
         })], timeout=60)
         if not sent.get("ok"):
             raise RuntimeError(f"hop send failed: {sent}")
@@ -1298,6 +1358,51 @@ def hop_agent_sessions() -> dict[str, dict[str, Any]]:
         if hop and resumed:
             add(resumed.group(1), hop.group(1))
     return out
+
+
+def live_hop_sessions(db_path: str | Path | None) -> list[dict[str, Any]]:
+    """Live hop agent sessions with what each conversation is about:
+    [{conversation, internal_name, name, agent, agent_permitted, title, cwd}]."""
+    sessions = hop_agent_sessions()
+    out = []
+    try:
+        conn = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True, timeout=10) if db_path else None
+    except sqlite3.Error:
+        conn = None
+    try:
+        for conversation, target in sessions.items():
+            title = cwd = ""
+            if conn is not None:
+                # Newest chunk: the title as the conversation stands now.
+                row = conn.execute(
+                    "SELECT title, cwd FROM trajectory_chunks WHERE source_name = ? AND session_id = ? "
+                    "ORDER BY updated_at DESC LIMIT 1",
+                    (str(target.get("agent") or ""), conversation),
+                ).fetchone()
+                if row:
+                    title, cwd = str(row[0] or "")[:90], str(row[1] or "")
+            out.append({"conversation": conversation, **target, "title": title, "cwd": cwd})
+    finally:
+        if conn is not None:
+            conn.close()
+    return out
+
+
+def _session_title(db_path: str | Path, source: dict[str, Any]) -> str:
+    try:
+        with sqlite3.connect(f"file:{db_path}?mode=ro", uri=True, timeout=10) as conn:
+            row = conn.execute(
+                "SELECT title FROM trajectory_chunks WHERE source_name = ? AND session_id = ? LIMIT 1",
+                (source["agent"], source["session_id"]),
+            ).fetchone()
+    except sqlite3.Error:
+        return ""
+    return str(row[0] or "")[:90] if row else ""
+
+
+def _short_path(path: str) -> str:
+    home = str(Path.home())
+    return ("~" + path[len(home):]) if path and path.startswith(home) else (path or "")
 
 
 def hop_target_for(source_ref: str, sessions: dict[str, dict[str, Any]]) -> dict[str, Any] | None:

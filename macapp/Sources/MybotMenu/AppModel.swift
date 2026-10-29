@@ -832,10 +832,11 @@ final class AppModel: ObservableObject {
         loadPulses(date: pulseDates[i + offset])
     }
 
-    func followUp(pulse: Pulse, actionID: String) {
+    func followUp(pulse: Pulse, actionID: String, prompt: String? = nil, target: String? = nil) {
         let key = "\(pulse.engine)/\(actionID)"
         pulseLaunching.insert(key)
-        PulseClient(config: config).followUp(engine: pulse.engine, date: pulse.date, actionID: actionID) { [weak self] result in
+        PulseClient(config: config).followUp(engine: pulse.engine, date: pulse.date, actionID: actionID,
+                                             prompt: prompt, target: target) { [weak self] result in
             guard let self else { return }
             self.pulseLaunching.remove(key)
             switch result {

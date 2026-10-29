@@ -4252,6 +4252,19 @@ class ChatHandler(BaseHTTPRequestHandler):
                 200, {"ok": True, "date": date, "dates": dates, "pulses": pulses, "running": running}
             )
             return
+        if path == "/briefing/followup/plan":
+            # ?engine=&date=&action_id= — where a follow-up would go, and the alternatives.
+            query = urllib.parse.parse_qs(self.path.split("?", 1)[1] if "?" in self.path else "")
+            runner = self.server.state.briefings.get((query.get("engine") or ["claude"])[0])
+            try:
+                if runner is None:
+                    raise ValueError("unknown engine")
+                plan = runner.follow_up_plan((query.get("date") or [""])[0], (query.get("action_id") or [""])[0])
+            except (OSError, ValueError) as exc:
+                self.respond_json(404, {"ok": False, "error": str(exc)})
+                return
+            self.respond_json(200, plan)
+            return
         if path == "/briefing/figure":
             # ?engine=&date=&name= — a figure the pulse's writers drew.
             query = urllib.parse.parse_qs(self.path.split("?", 1)[1] if "?" in self.path else "")
@@ -4401,7 +4414,13 @@ class ChatHandler(BaseHTTPRequestHandler):
             date = str(body.get("date") or "")
             try:
                 if self.path == "/briefing/followup":
-                    result = runner.follow_up(date, str(body.get("action_id") or ""))
+                    prompt = body.get("prompt")
+                    target = body.get("target")
+                    result = runner.follow_up(
+                        date, str(body.get("action_id") or ""),
+                        prompt=str(prompt) if isinstance(prompt, str) else None,
+                        target=str(target) if isinstance(target, str) and target else None,
+                    )
                 else:
                     path = runner.dir / f"{date}{runner.suffix}.json"
                     data = json.loads(path.read_text())
