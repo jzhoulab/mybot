@@ -5908,6 +5908,18 @@ def main() -> None:
             time.sleep(300)
 
     threading.Thread(target=republish_for_hop, name="pulse-hop-publish", daemon=True).start()
+    # Email: the owner writes to the bot's address (see app/email_bridge.py).
+    from app.email_bridge import EmailBridge, MailConfig
+
+    mail_config = MailConfig()
+    state.email_bridge = None
+    if mail_config.enabled:
+        state.email_bridge = EmailBridge(
+            config=mail_config, server_url=f"http://127.0.0.1:{config.port}",
+            owner_actor_id=config.imported_owner_actor_id, state_dir=config.state_dir,
+            owner_name=state.owner_name,
+        )
+        state.email_bridge.start()
     server = StandaloneServer((config.host, config.port), ChatHandler, state)
     print(f"Listening on http://{config.host}:{config.port}")
     server.serve_forever()

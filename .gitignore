@@ -52,3 +52,8 @@ macapp/.dist/
 # Local backups of real configs (they hold real paths)
 config/*.bak*
 config/*.json.bak*
+
+# mybot mail Worker: the filled-in config names real addresses
+mail-worker/wrangler.jsonc
+mail-worker/.wrangler/
+mail-worker/node_modules/

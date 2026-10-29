@@ -1007,6 +1007,13 @@ class BriefingRunner:
                     "created_at": datetime.now(timezone.utc).isoformat(),
                 }) + "\n")
             delivered["discord"] = "queued"
+        mail = getattr(self.state, "email_bridge", None)
+        if mail and _env_bool("BRIEFING_EMAIL", False):
+            images = {
+                fig["name"]: path for fig in pulse_figures.figures_in(text)
+                if (path := self.figure_path(day, fig["name"]))
+            }
+            delivered["email"] = "sent" if mail.send_to_owner(title, text, images) else "failed"
         return delivered
 
     # ------------------------------------------------------------------ outbox
