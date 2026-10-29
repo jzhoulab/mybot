@@ -1,9 +1,10 @@
 """Email as a way to reach mybot: the owner writes to the bot's address and
 gets the answer back as a reply in the same thread.
 
-Mail arrives through a small Cloudflare Worker (mail-worker/): Email Routing
-hands it each message for the bot's address, it keeps only mail whose From is
-the owner's, and queues it. This thread polls that queue over HTTPS — nothing
+Mail arrives through a small Cloudflare Worker (mail-worker/) that serves a
+mailbox for each teammate's mybot (e.g. mybot-<name>@zhoulab.io): Email
+Routing hands it each message, it keeps only mail whose From is that
+mailbox's owner, and queues it. This thread polls that queue over HTTPS — nothing
 on the Mac is exposed — and sends replies back through the Worker, whose
 send_email binding Cloudflare restricts to the owner's verified addresses.
 
@@ -271,7 +272,8 @@ class EmailBridge:
     def _worker(self, method: str, path: str, payload: dict[str, Any] | None = None, timeout: int = 60) -> dict[str, Any]:
         data = json.dumps(payload).encode() if payload is not None else None
         request = urllib.request.Request(f"{self.config.url}{path}", data=data, method=method, headers={
-            "Authorization": f"Bearer {self.config.token}", "Content-Type": "application/json",
+            "Authorization": f"Bearer {self.config.token}", "X-Mybot-Mailbox": self.config.address,
+            "Content-Type": "application/json",
             "User-Agent": "mybot-mail/1",
         })
         with urllib.request.urlopen(request, timeout=timeout) as response:

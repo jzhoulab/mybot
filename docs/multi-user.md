@@ -162,6 +162,39 @@ A relayed message is readable text plus one machine-readable trailer line
 server for a live round trip (with `MYBOT_TEAM_CHANNEL=false`, so only the
 primary bridge drives the Channel tab).
 
+## Email: a mailbox per mybot
+
+Each teammate's mybot can have its own address (`mybot-<name>@<team domain>`).
+The owner writes to it, or replies to anything it sent, and the answer comes back
+in the same thread — the owner's own view, like the menu app. It is a channel
+for the owner only: nobody else's mail is answered, and the bot can email no
+one but its owner.
+
+- **One Worker for the team** (`mail-worker/`, Cloudflare Email Routing). Each
+  mailbox is a KV entry with its owners and the hash of that mybot's token.
+  The Worker queues only mail whose From is the mailbox's owner; each mybot
+  polls its own queue over HTTPS, so nothing on anyone's Mac is exposed.
+- **Trust is checked again locally.** From lines are easy to forge, so mybot
+  answers only mail carrying a valid DKIM signature from the sender's own
+  domain, and skips auto-generated mail (no reply loops).
+- **Sending** goes through the Worker's `send_email` binding: Cloudflare sends
+  only to verified destination addresses, and the Worker only to that
+  mailbox's owners.
+- **Attachments** are saved to `~/Downloads` (or matched to the identical file
+  already there) and referred to by path rather than sent back.
+- `BRIEFING_EMAIL=true` also emails the morning pulse, figures inline.
+
+Adding someone (needs wrangler on the account that owns the domain):
+
+```bash
+python scripts/mail_mailbox.py add mybot-alex@example.org --owner alex@gmail.com
+```
+
+This stores the mailbox, routes the address to the Worker, registers the
+owner's address (Cloudflare sends them a one-time verification link) and
+prints the four `MYBOT_MAIL_*` lines for their `.env`. Re-running rotates the
+token.
+
 ## Connecting a chat platform (guided setup)
 
 The Discord/Slack app setup is fiddly, so there's a validating doctor:

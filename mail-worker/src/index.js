@@ -1,21 +1,27 @@
-// mybot's mailbox on Cloudflare: Email Routing hands this Worker each message
-// sent to the bot's address; it keeps only the owner's mail in a KV queue that
-// the owner's mybot polls (outbound-only from the Mac — nothing is exposed).
-// Replies come back as finished MIME and go out through a send_email binding
-// that Cloudflare restricts to the owner's verified addresses, so even a
-// stolen token can only ever email the owner.
+// mybot mailboxes on Cloudflare — one Worker for the whole team, one mailbox
+// per person's mybot (e.g. mybot-<name>@zhoulab.io).
+//
+// Email Routing hands this Worker each message sent to a mailbox address; it
+// keeps only mail from that mailbox's owner, in a KV queue the owner's mybot
+// polls (outbound-only from their Mac — nothing is exposed). Replies come back
+// as finished MIME and are sent only to that mailbox's owner; Cloudflare also
+// refuses any recipient that isn't a verified address in the account.
+//
+// Each mailbox is a KV entry `mailbox/<address>`:
+//   { "owners": ["you@gmail.com"], "token_sha256": "<hex>" }
+// written by scripts/mail_mailbox.py, so adding a teammate needs no redeploy.
+// A mybot authenticates with its own token plus `X-Mybot-Mailbox: <address>`.
 import { EmailMessage } from "cloudflare:email";
 
 const MAX_RAW = 20 * 1024 * 1024;
-const QUEUE = "in/";
 
-function owners(env) {
-  return String(env.OWNER_ADDRESSES || "").toLowerCase().split(/[,\s]+/).filter(Boolean);
-}
+const lower = (s) => String(s || "").trim().toLowerCase();
+const json = (body, status = 200) =>
+  new Response(JSON.stringify(body), { status, headers: { "content-type": "application/json" } });
 
 function headerAddress(value) {
   const match = String(value || "").match(/<([^>]+)>/);
-  return (match ? match[1] : String(value || "")).trim().toLowerCase();
+  return lower(match ? match[1] : value);
 }
 
 function toBase64(bytes) {
@@ -26,41 +32,55 @@ function toBase64(bytes) {
   return btoa(out);
 }
 
-function authorized(request, env) {
-  const got = request.headers.get("authorization") || "";
-  const want = `Bearer ${env.MYBOT_MAIL_TOKEN || ""}`;
-  if (!env.MYBOT_MAIL_TOKEN || got.length !== want.length) return false;
+async function sha256Hex(text) {
+  const digest = await crypto.subtle.digest("SHA-256", new TextEncoder().encode(text));
+  return [...new Uint8Array(digest)].map((b) => b.toString(16).padStart(2, "0")).join("");
+}
+
+function sameString(a, b) {
+  if (a.length !== b.length) return false;
   let diff = 0;
-  for (let i = 0; i < got.length; i++) diff |= got.charCodeAt(i) ^ want.charCodeAt(i);
+  for (let i = 0; i < a.length; i++) diff |= a.charCodeAt(i) ^ b.charCodeAt(i);
   return diff === 0;
 }
 
-const json = (body, status = 200) =>
-  new Response(JSON.stringify(body), { status, headers: { "content-type": "application/json" } });
+async function mailbox(env, address) {
+  const value = await env.MAIL_QUEUE.get(`mailbox/${lower(address)}`);
+  if (!value) return null;
+  const box = JSON.parse(value);
+  box.owners = (box.owners || []).map(lower);
+  return box;
+}
 
 export default {
   async email(message, env) {
-    const allowed = owners(env);
-    const envelope = String(message.from || "").toLowerCase();
-    const header = headerAddress(message.headers.get("from"));
-    // Anyone else's mail is dropped silently (no bounce to a forged sender).
-    // mybot re-checks the DKIM signature itself before trusting a message.
-    if (!allowed.includes(header) || message.rawSize > MAX_RAW) {
-      console.log("dropped mail", { allowedSender: allowed.includes(header), size: message.rawSize });
+    const address = lower(message.to);
+    const box = await mailbox(env, address);
+    const from = headerAddress(message.headers.get("from"));
+    // Anything else is dropped silently (no bounce to a forged sender). The
+    // owner's mybot re-checks the DKIM signature before trusting a message.
+    if (!box || !box.owners.includes(from) || message.rawSize > MAX_RAW) {
+      console.log("dropped mail", { mailbox: Boolean(box), size: message.rawSize });
       return;
     }
     const raw = new Uint8Array(await new Response(message.raw).arrayBuffer());
-    const id = `${QUEUE}${Date.now().toString(36)}-${crypto.randomUUID()}`;
+    const id = `in/${address}/${Date.now().toString(36)}-${crypto.randomUUID()}`;
     await env.MAIL_QUEUE.put(id, JSON.stringify({
-      id, envelope_from: envelope, to: message.to, received: new Date().toISOString(), raw: toBase64(raw),
+      id, envelope_from: lower(message.from), to: address, received: new Date().toISOString(), raw: toBase64(raw),
     }), { expirationTtl: 14 * 24 * 3600 });
   },
 
   async fetch(request, env) {
-    if (!authorized(request, env)) return json({ ok: false, error: "unauthorized" }, 401);
+    const address = lower(request.headers.get("x-mybot-mailbox"));
+    const token = (request.headers.get("authorization") || "").replace(/^Bearer\s+/i, "");
+    const box = address ? await mailbox(env, address) : null;
+    if (!box || !token || !sameString(await sha256Hex(token), String(box.token_sha256 || ""))) {
+      return json({ ok: false, error: "unauthorized" }, 401);
+    }
+    const prefix = `in/${address}/`;
     const url = new URL(request.url);
     if (request.method === "GET" && url.pathname === "/inbox") {
-      const listed = await env.MAIL_QUEUE.list({ prefix: QUEUE, limit: 20 });
+      const listed = await env.MAIL_QUEUE.list({ prefix, limit: 20 });
       const messages = [];
       for (const key of listed.keys) {
         const value = await env.MAIL_QUEUE.get(key.name);
@@ -70,19 +90,20 @@ export default {
     }
     if (request.method === "POST" && url.pathname === "/ack") {
       const { ids = [] } = await request.json();
-      await Promise.all(ids.filter((id) => String(id).startsWith(QUEUE)).map((id) => env.MAIL_QUEUE.delete(id)));
+      await Promise.all(ids.filter((id) => String(id).startsWith(prefix)).map((id) => env.MAIL_QUEUE.delete(id)));
       return json({ ok: true });
     }
     if (request.method === "POST" && url.pathname === "/send") {
-      // { to, raw } — raw is the finished MIME message, base64.
+      // { to, raw } — raw is the finished MIME message (From: the mailbox), base64.
       const { to, raw } = await request.json();
-      const recipient = String(to || "").toLowerCase();
-      if (!owners(env).includes(recipient)) return json({ ok: false, error: "recipient not allowed" }, 403);
+      const recipient = lower(to);
+      if (!box.owners.includes(recipient)) return json({ ok: false, error: "recipient not allowed" }, 403);
+      // EmailMessage takes the MIME as a string (Python's SMTP policy keeps it 7-bit).
       const bytes = Uint8Array.from(atob(String(raw || "")), (c) => c.charCodeAt(0));
       try {
-        await env.EMAIL.send(new EmailMessage(env.MAIL_FROM, recipient, bytes));
+        await env.EMAIL.send(new EmailMessage(address, recipient, new TextDecoder().decode(bytes)));
       } catch (error) {
-        return json({ ok: false, error: String(error && error.message || error) }, 502);
+        return json({ ok: false, error: String((error && error.message) || error) }, 502);
       }
       return json({ ok: true });
     }

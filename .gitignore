@@ -57,3 +57,4 @@ config/*.json.bak*
 mail-worker/wrangler.jsonc
 mail-worker/.wrangler/
 mail-worker/node_modules/
+mail-worker/.url

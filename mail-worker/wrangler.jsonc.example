@@ -1,18 +1,15 @@
-// Copy to wrangler.jsonc (gitignored: it names your addresses), fill in, then
-//   npx wrangler kv namespace create MAIL_QUEUE   (paste the id below)
-//   npx wrangler secret put MYBOT_MAIL_TOKEN       (same value as MYBOT_MAIL_TOKEN in mybot's .env)
+// One Worker serves every teammate's mybot mailbox. To set it up once:
+//   cp wrangler.jsonc.example wrangler.jsonc   (gitignored)
+//   npx wrangler kv namespace create MAIL_QUEUE   → paste the id below
 //   npx wrangler deploy
-// and add an Email Routing rule: <bot address> -> Send to a Worker -> mybot-mail.
+// Then add mailboxes with scripts/mail_mailbox.py (no redeploy needed).
 {
   "name": "mybot-mail",
   "main": "src/index.js",
   "compatibility_date": "2026-10-01",
   "workers_dev": true,
   "kv_namespaces": [{ "binding": "MAIL_QUEUE", "id": "<kv namespace id>" }],
-  // Cloudflare refuses any other recipient: the bot can only email its owner.
-  "send_email": [{ "name": "EMAIL", "allowed_destination_addresses": ["you@example.com"] }],
-  "vars": {
-    "MAIL_FROM": "mybot@example.com",
-    "OWNER_ADDRESSES": "you@example.com"
-  }
+  // Sends only to verified destination addresses in the account; the Worker
+  // further limits each mailbox to its own owner.
+  "send_email": [{ "name": "EMAIL" }]
 }
