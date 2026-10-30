@@ -26,7 +26,7 @@ class FollowUpEditTest(unittest.TestCase):
         self.patches = [
             mock.patch.object(briefing, "PULSE_TASK_DIR", root / "tasks"),
             mock.patch.object(briefing, "hop_agent_sessions", lambda: live),
-            mock.patch.object(briefing, "live_hop_sessions", lambda db: [
+            mock.patch.object(briefing, "live_hop_sessions", lambda db, also=(): [
                 {"conversation": "conv-1", **live["conv-1"], "title": "Some work", "cwd": str(root)}]),
             mock.patch.object(briefing, "source_session", lambda db, ref: source if ref.startswith("claude:aaaa") else None),
             mock.patch.object(briefing.BriefingRunner, "_hopa", staticmethod(self._hopa)),

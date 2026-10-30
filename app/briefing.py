@@ -857,11 +857,12 @@ class BriefingRunner:
         """What a follow-up will do before it's sent: the message, where it
         goes by default, and every other place it could go instead."""
         _, _, action = self._action(date, action_id)
-        live = live_hop_sessions(self.state.config.trajectory_index_db_path)
-        by_internal = {s["internal_name"]: s for s in live}
-        sessions = {s["conversation"]: s for s in live}
         ref = str(action.get("source_ref") or "")
         source = source_session(self.state.config.trajectory_index_db_path, ref)
+        live = live_hop_sessions(self.state.config.trajectory_index_db_path,
+                                 [(source["agent"], source["session_id"])] if source else [])
+        by_internal = {s["internal_name"]: s for s in live}
+        sessions = {s["conversation"]: s for s in live}
         agent = "codex" if self.engine == "gpt" else "claude"
         options: list[dict[str, Any]] = []
         seen: set[str] = set()
@@ -1360,44 +1361,65 @@ def hop_agent_sessions() -> dict[str, dict[str, Any]]:
     return out
 
 
-def live_hop_sessions(db_path: str | Path | None) -> list[dict[str, Any]]:
+def live_hop_sessions(db_path: str | Path | None,
+                      also: list[tuple[str, str]] = ()) -> list[dict[str, Any]]:
     """Live hop agent sessions with what each conversation is about:
-    [{conversation, internal_name, name, agent, agent_permitted, title, cwd}]."""
+    [{conversation, internal_name, name, agent, agent_permitted, title, cwd}].
+    `also` names other conversations whose titles to look up in the same pass."""
     sessions = hop_agent_sessions()
-    out = []
+    known = session_titles(db_path, [(str(t.get("agent") or ""), c) for c, t in sessions.items()] + list(also))
+    return [{"conversation": conversation, **target,
+             **dict(zip(("title", "cwd"), known.get((str(target.get("agent") or ""), conversation), ("", ""))))}
+            for conversation, target in sessions.items()]
+
+
+_TITLE_TTL = 600.0
+_title_cache: dict[tuple[str, str], tuple[float, tuple[str, str]]] = {}
+_title_lock = threading.Lock()
+
+
+def session_titles(db_path: str | Path | None,
+                   keys: list[tuple[str, str]]) -> dict[tuple[str, str], tuple[str, str]]:
+    """{(agent, session id): (title, cwd)} from each conversation's newest
+    chunk. The index has no session_id index, so this is one pass over the
+    covering catalog index for all of them (not one scan each), and answers
+    are kept for a few minutes: titles change slowly."""
+    now = time.monotonic()
+    out: dict[tuple[str, str], tuple[str, str]] = {}
+    with _title_lock:
+        for key in keys:
+            hit = _title_cache.get(key)
+            if hit and now - hit[0] < _TITLE_TTL:
+                out[key] = hit[1]
+    missing = sorted({k for k in keys if k not in out and k[1]})
+    if not missing or not db_path:
+        return out
+    ids = sorted({sid for _, sid in missing})
+    found: dict[tuple[str, str], tuple[str, str]] = {}
     try:
-        conn = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True, timeout=10) if db_path else None
-    except sqlite3.Error:
-        conn = None
-    try:
-        for conversation, target in sessions.items():
-            title = cwd = ""
-            if conn is not None:
-                # Newest chunk: the title as the conversation stands now.
-                row = conn.execute(
-                    "SELECT title, cwd FROM trajectory_chunks WHERE source_name = ? AND session_id = ? "
-                    "ORDER BY updated_at DESC LIMIT 1",
-                    (str(target.get("agent") or ""), conversation),
-                ).fetchone()
+        with sqlite3.connect(f"file:{db_path}?mode=ro", uri=True, timeout=10) as conn:
+            rows = conn.execute(
+                "SELECT source_name, session_id, MAX(updated_at), rowid FROM trajectory_chunks "
+                "INDEXED BY idx_trajectory_chunks_catalog "
+                f"WHERE session_id IN ({','.join('?' * len(ids))}) GROUP BY source_name, session_id",
+                ids,
+            ).fetchall()
+            for source, sid, _, rowid in rows:
+                row = conn.execute("SELECT title, cwd FROM trajectory_chunks WHERE rowid = ?", (rowid,)).fetchone()
                 if row:
-                    title, cwd = str(row[0] or "")[:90], str(row[1] or "")
-            out.append({"conversation": conversation, **target, "title": title, "cwd": cwd})
-    finally:
-        if conn is not None:
-            conn.close()
+                    found[(str(source), str(sid))] = (str(row[0] or "")[:90], str(row[1] or ""))
+    except sqlite3.Error:
+        return out
+    with _title_lock:
+        for key in missing:
+            _title_cache[key] = (now, found.get(key, ("", "")))
+    out.update({k: found.get(k, ("", "")) for k in missing})
     return out
 
 
 def _session_title(db_path: str | Path, source: dict[str, Any]) -> str:
-    try:
-        with sqlite3.connect(f"file:{db_path}?mode=ro", uri=True, timeout=10) as conn:
-            row = conn.execute(
-                "SELECT title FROM trajectory_chunks WHERE source_name = ? AND session_id = ? LIMIT 1",
-                (source["agent"], source["session_id"]),
-            ).fetchone()
-    except sqlite3.Error:
-        return ""
-    return str(row[0] or "")[:90] if row else ""
+    key = (str(source["agent"]), str(source["session_id"]))
+    return session_titles(db_path, [key]).get(key, ("", ""))[0]
 
 
 def _short_path(path: str) -> str:
