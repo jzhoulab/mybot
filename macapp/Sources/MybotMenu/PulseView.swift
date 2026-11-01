@@ -14,6 +14,9 @@ struct PulseAction: Hashable {
     let id: String
     let label: String
     var spawnedTerminal: String?
+    /// Where the follow-up goes and what it says — part of the pulse.
+    var destination = ""
+    var prompt = ""
 }
 
 struct Pulse: Identifiable, Hashable {
@@ -83,7 +86,9 @@ struct PulseClient {
                     guard let id = a["id"] as? String else { continue }
                     let spawned = (a["spawned"] as? [String: Any])?["terminal"] as? String
                     actions[id] = PulseAction(id: id, label: (a["label"] as? String) ?? "Follow up",
-                                              spawnedTerminal: spawned)
+                                              spawnedTerminal: spawned,
+                                              destination: (a["destination"] as? String) ?? "",
+                                              prompt: (a["prompt_edited"] as? String) ?? (a["prompt"] as? String) ?? "")
                 }
                 return Pulse(engine: engine, label: (p["label"] as? String) ?? engine, date: date,
                              title: (p["title"] as? String) ?? "Morning pulse", sections: sections,
@@ -608,7 +613,38 @@ struct PulseView: View {
             } else if model.pulseLaunching.contains("\(pulse.engine)/\(id)") {
                 ProgressView().controlSize(.small)
             } else {
-                FollowUpButton(model: model, pulse: pulse, actionID: id, label: action.label)
+                VStack(alignment: .leading, spacing: 4) {
+                    FollowUpButton(model: model, pulse: pulse, actionID: id, label: action.label)
+                    FollowUpSummary(action: action)
+                }
+            }
+        }
+    }
+}
+
+/// Where a follow-up goes and what it says, shown with the pulse item.
+struct FollowUpSummary: View {
+    let action: PulseAction
+    @State private var expanded = false
+
+    var body: some View {
+        if !action.destination.isEmpty || !action.prompt.isEmpty {
+            VStack(alignment: .leading, spacing: 3) {
+                if !action.destination.isEmpty {
+                    Text("→ \(action.destination)")
+                        .font(.system(size: 10.5)).foregroundStyle(.secondary).lineLimit(2)
+                }
+                if !action.prompt.isEmpty {
+                    Button(expanded ? "Hide message" : "Show message") { expanded.toggle() }
+                        .buttonStyle(.plain).font(.system(size: 10.5)).foregroundStyle(.secondary)
+                    if expanded {
+                        Text(action.prompt)
+                            .font(.system(size: 11)).textSelection(.enabled)
+                            .padding(8)
+                            .frame(maxWidth: .infinity, alignment: .leading)
+                            .background(RoundedRectangle(cornerRadius: 6).fill(Color.secondary.opacity(0.08)))
+                    }
+                }
             }
         }
     }

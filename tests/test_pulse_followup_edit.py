@@ -86,3 +86,47 @@ class FollowUpEditTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class OneRouteTest(FollowUpEditTest):
+    """Where a follow-up goes is part of the pulse: the app's plan, the
+    phone's feed and the Discord/email text all show the same route."""
+
+    def _set(self, **fields):
+        data = json.loads(self.path.read_text())
+        data["actions"][0].update(fields)
+        self.path.write_text(json.dumps(data))
+
+    def _hop_entry(self):
+        briefing.PULSE_TASK_DIR.mkdir(parents=True, exist_ok=True)
+        latest = {"date": "2026-10-29", **json.loads(self.path.read_text())}
+        return briefing._hop_pulse("claude", latest, briefing.hop_agent_sessions(), "db")["actions"][0]
+
+    def test_stored_route_is_what_every_surface_uses(self):
+        self._set(target="resume:claude:aaaaaaaa-1111", destination="claude conversation aaaaaaaa, reopened in hop")
+        plan = self.runner.follow_up_plan("2026-10-29", "o1")
+        self.assertEqual(plan["default"], "resume:claude:aaaaaaaa-1111")
+        entry = self._hop_entry()
+        self.assertEqual(entry["target"], plan["default"])
+        self.assertEqual(entry["resumes"], "claude:aaaaaaaa-1111")
+        self.assertNotIn("target_internal_name", entry)  # not sent to the live guess
+        text = briefing.follow_ups_text(json.loads(self.path.read_text())["actions"])
+        self.assertIn("→ claude conversation aaaaaaaa, reopened in hop", text)
+        self.assertIn("> Original task", text)
+
+    def test_owner_choice_and_edit_carry_to_the_phone(self):
+        self.runner.follow_up("2026-10-29", "o1", prompt="Edited task", target="new")
+        action = json.loads(self.path.read_text())["actions"][0]
+        self.assertEqual(action["target"], "new")
+        self.assertIn("a new claude session", action["destination"])
+        self.assertEqual(self.runner.follow_up_plan("2026-10-29", "o1")["default"], "new")
+        entry = self._hop_entry()
+        self.assertEqual((entry["target"], entry["prompt"]), ("new", "Edited task"))
+        self.assertIn("Edited task", (briefing.PULSE_TASK_DIR / "2026-10-29-claude-o1.md").read_text())
+
+    def test_closed_live_session_falls_back(self):
+        self._set(target="live:s_gone")
+        route = briefing.resolve_route(json.loads(self.path.read_text())["actions"][0],
+                                       briefing.hop_agent_sessions(), None, "claude")
+        self.assertEqual(route["target"], "live:s_live")  # the agent's guess is still open
+        self.assertIn("“guess” (open now)", route["destination"])
