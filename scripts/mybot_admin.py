@@ -1174,21 +1174,25 @@ def _connect_slack(args: argparse.Namespace) -> dict[str, Any]:
             "bot_name": f"{handle}-mybot", "message": message,
             **({} if written else {"error": message}),
         }
+    manifest_path = REPO_ROOT / "docs" / "slack-app-manifest.yaml"
+    manifest = "\n".join(
+        "     " + line for line in manifest_path.read_text().replace("HANDLE", handle).splitlines()
+        if not line.startswith("#"))
     print(f"""
 == Connect mybot to Slack (Socket Mode — no public URL needed) ==
 
-1. Open https://api.slack.com/apps  ->  Create New App  ->  From scratch.
-   Name it  '{handle}-mybot'  so teammates can tell whose bot is whose.
-2. Socket Mode -> enable. Generate an App-Level Token with scope
+1. Open https://api.slack.com/apps  ->  Create New App  ->  From a manifest,
+   pick the workspace, and paste this (YAML):
+
+{manifest}
+   Create, then 'Install to Workspace' -> OAuth & Permissions -> copy the
+   Bot User OAuth Token (starts with xoxb-).
+2. Basic Information -> App-Level Tokens -> Generate, scope
    'connections:write'  -> copy it (starts with xapp-).
-3. OAuth & Permissions -> Bot Token Scopes, add:
-     app_mentions:read, chat:write, channels:history, groups:history,
-     im:history, mpim:history, channels:read, groups:read, users:read,
-     reactions:write
-   Then 'Install to Workspace' -> copy the Bot User OAuth Token (xoxb-).
-4. Event Subscriptions -> Subscribe to bot events:
-     message.channels, message.groups, message.im, message.mpim, app_mention
-5. Invite the bot to channels it should watch:  /invite @{handle}-mybot
+3. To use it in a channel (DMs work without this): /invite @{handle}-mybot,
+   and add the channel's id to SLACK_ALLOWED_CHANNEL_IDS in .slack.env.
+4. So Slack knows you're the owner: put your Slack member id (profile ->
+   ⋮ -> Copy member ID) in MYBOT_OWNER_ACTOR_IDS in .env.
 """.rstrip())
     bot_token = _prompt("\nPaste the Bot User OAuth Token (xoxb-...): ", args.bot_token)
     app_token = _prompt("Paste the App-Level Token (xapp-...): ", args.app_token)

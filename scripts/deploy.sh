@@ -109,6 +109,13 @@ if $SERVICES; then
   echo ""
   if $HEALTHY; then
     echo "  server healthy"
+    # run_chatbot.sh starts Discord when both bridges are configured; Slack
+    # runs beside it on the same (now healthy) server.
+    if [[ -f "$ROOT/.discord.env" && -f "$ROOT/.slack.env" && "${MYBOT_BRIDGE:-auto}" == auto ]]; then
+      nohup /bin/zsh "$ROOT/run_slack_chatbot.sh" >> "$ROOT/state/run/mybot-slack-launcher.log" 2>&1 &
+      disown
+      echo "  slack bridge started"
+    fi
   else
     echo "  WARNING: server not healthy yet — check state/run/mybot-launcher.log"
   fi
