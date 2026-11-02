@@ -38,6 +38,7 @@ from __future__ import annotations
 
 import json
 import os
+import shutil
 import re
 import shlex
 import sqlite3
@@ -1230,8 +1231,61 @@ def discord_dm_channel(state: Any) -> str:
 HOP_HISTORY_DAYS = 14
 
 
+HOP_FIGURE_DIR = "pulse-figures"
+
+
+def _hop_sections(engine: str, latest: dict[str, Any], figure_path: Any = None,
+                  copies: dict[str, Path] | None = None) -> list[dict[str, Any]]:
+    """The pulse's sections for hop. The body keeps each figure as its
+    italic caption (what text-only surfaces show); a figure hop can serve
+    also gets `src`, under /assets/pulse-figures/, and the file to copy
+    there is noted in `copies` (published path -> PNG)."""
+    out = []
+    for sec in latest.get("sections") or []:
+        body = str(sec.get("body") or "")
+        figures = []
+        for fig in pulse_figures.figures_in(body):
+            entry = {"caption": fig["caption"], "name": fig["name"]}
+            path = figure_path(str(latest.get("date") or ""), fig["name"]) if figure_path else None
+            if path is not None and copies is not None:
+                rel = f"{HOP_FIGURE_DIR}/{latest.get('date')}-{engine}/{fig['name']}"
+                copies[rel] = Path(path)
+                entry["src"] = f"/assets/{rel}"
+            figures.append(entry)
+        out.append(dict(sec, body=pulse_figures.as_captions(body), figures=figures))
+    return out
+
+
+def _publish_figures(root: Path, copies: dict[str, Path]) -> None:
+    """Copy the figures the feed names under `root`, and drop the ones it
+    no longer names (days that aged out of the feed)."""
+    base = root / HOP_FIGURE_DIR
+    for rel, src in copies.items():
+        dest = root / rel
+        try:
+            if dest.exists() and dest.stat().st_size == src.stat().st_size:
+                continue
+            dest.parent.mkdir(parents=True, exist_ok=True)
+            tmp = dest.with_name("." + dest.name + ".tmp")
+            shutil.copyfile(src, tmp)
+            os.chmod(tmp, 0o600)
+            os.replace(tmp, dest)
+        except OSError as exc:
+            log.warning("pulse figure %s not published: %s", rel, exc)
+    if not base.is_dir():
+        return
+    keep = {root / rel for rel in copies}
+    for path in base.glob("*/*"):
+        if path.is_file() and path not in keep:
+            path.unlink(missing_ok=True)
+    for folder in base.iterdir():
+        if folder.is_dir() and not any(folder.iterdir()):
+            folder.rmdir()
+
+
 def _hop_pulse(engine: str, latest: dict[str, Any], sessions: dict[str, dict[str, Any]],
-              db_path: str | Path | None = None) -> dict[str, Any]:
+              db_path: str | Path | None = None, figure_path: Any = None,
+              copies: dict[str, Path] | None = None) -> dict[str, Any]:
     """One engine's pulse as the phone reads it, with launchable follow-ups."""
     actions = []
     for action in latest.get("actions") or []:
@@ -1274,9 +1328,9 @@ def _hop_pulse(engine: str, latest: dict[str, Any], sessions: dict[str, dict[str
         "label": latest.get("label") or engine,
         "date": latest.get("date"),
         "title": latest.get("title"),
-        # The phone shows text only: a figure becomes its caption.
-        "sections": [dict(sec, body=pulse_figures.as_captions(str(sec.get("body") or "")))
-                     for sec in latest.get("sections") or []],
+        # Text-only readers see a figure as its caption; hop's web app
+        # draws the image from `figures[].src`.
+        "sections": _hop_sections(engine, latest, figure_path, copies),
         "actions": actions,
     }
 
@@ -1291,6 +1345,7 @@ def publish_for_hop(runners: dict[str, "BriefingRunner"]) -> dict[str, Any]:
     # "pulses" stays the newest day (what older builds read).
     dates = sorted({d for runner in runners.values() for d in runner.dates()}, reverse=True)[:HOP_HISTORY_DAYS]
     days = []
+    copies: dict[str, Path] = {}
     for date in dates:
         day_pulses = []
         for engine, runner in runners.items():
@@ -1300,7 +1355,8 @@ def publish_for_hop(runners: dict[str, "BriefingRunner"]) -> dict[str, Any]:
                 pulse = None
             if pulse:
                 db_path = getattr(getattr(runner.state, "config", None), "trajectory_index_db_path", None)
-                day_pulses.append(_hop_pulse(engine, pulse, sessions, db_path))
+                day_pulses.append(_hop_pulse(engine, pulse, sessions, db_path,
+                                             getattr(runner, "figure_path", None), copies))
         if day_pulses:
             days.append({"date": date, "pulses": day_pulses})
     pulses = days[0]["pulses"] if days else []
@@ -1317,6 +1373,7 @@ def publish_for_hop(runners: dict[str, "BriefingRunner"]) -> dict[str, Any]:
     payload = json.dumps(feed, ensure_ascii=False)
     written = []
     for root in roots:
+        _publish_figures(root, copies)
         target = root / "pulse.json"
         tmp = root / ".pulse.json.tmp"
         tmp.write_text(payload)

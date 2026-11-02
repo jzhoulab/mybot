@@ -63,3 +63,30 @@ class PulseFiguresTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class HopFiguresTest(unittest.TestCase):
+    """hop's web app draws the figures: the feed names them under
+    /assets/pulse-figures/ and the files are copied beside pulse.json."""
+
+    def test_sections_name_served_figures_and_publish_copies_them(self):
+        from app import briefing
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp = Path(tmp)
+            png = tmp / "a1-x.png"
+            png.write_bytes(PNG)
+            latest = {"date": "2026-11-02", "sections": [
+                {"id": "a1", "kind": "article", "body": "Before.\n\n![A sketch.](figure:a1-x.png)\n\nAfter."},
+                {"id": "a2", "kind": "article", "body": "![Gone](figure:gone.png)"}]}
+            copies = {}
+            secs = briefing._hop_sections("claude", latest, lambda d, n: png if n == "a1-x.png" else None, copies)
+            self.assertIn("*Figure: A sketch.*", secs[0]["body"])
+            self.assertEqual(secs[0]["figures"], [{"caption": "A sketch.", "name": "a1-x.png",
+                                                   "src": "/assets/pulse-figures/2026-11-02-claude/a1-x.png"}])
+            self.assertNotIn("src", secs[1]["figures"][0])
+            root = tmp / "assets"
+            (root / "pulse-figures" / "2026-10-01-claude").mkdir(parents=True)
+            (root / "pulse-figures" / "2026-10-01-claude" / "old.png").write_bytes(PNG)
+            briefing._publish_figures(root, copies)
+            self.assertEqual((root / "pulse-figures/2026-11-02-claude/a1-x.png").read_bytes(), PNG)
+            self.assertFalse((root / "pulse-figures/2026-10-01-claude").exists())
