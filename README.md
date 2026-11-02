@@ -54,6 +54,7 @@ spaces:
 | Project | What it is |
 |---|---|
 | [nebula-notebook](https://github.com/jzhoulab/nebula-notebook) | An agent-native notebook — you and your AI work in the same cells |
+| [nebula-writer](https://github.com/jzthree/nebula-writer) | Local-first, DOCX-compatible writing with AI-assisted revision, in the browser and inside Microsoft Word and Google Docs |
 | [hop](https://github.com/jzthree/hop) | Terminal access for humans and agents: browser terminals plus an MCP server for creating, driving, and auditing agent sessions |
 | [burrow](https://github.com/jzthree/burrow) | A macOS menu-bar manager for SSH tunnels and userspace VPN gateways, for reaching the machines work runs on |
 
