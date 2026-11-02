@@ -1135,6 +1135,28 @@ HOP_ASSET_ROOTS = [
     Path.home() / "Code/hop2/hay/apps/web/dist/assets",
     Path.home() / "Code/hop2/hay-web/assets",
 ]
+
+
+def hop_asset_roots() -> list[Path]:
+    """Where hop serves /assets/ from on this machine: MYBOT_HOP_ASSETS
+    (colon-separated), else beside the installed `hop` (an npm install
+    serves <package>/hay-web; a checkout, its web build too), plus the
+    development checkout. Only folders that exist."""
+    found: list[Path] = []
+    override = os.environ.get("MYBOT_HOP_ASSETS", "").strip()
+    if override:
+        found = [Path(p).expanduser() for p in override.split(":") if p]
+    else:
+        exe = shutil.which("hop")
+        if exe:
+            pkg = Path(os.path.realpath(exe)).parent
+            found += [pkg / "hay-web/assets", pkg / "hay/apps/web/dist/assets"]
+        found += HOP_ASSET_ROOTS
+    out: list[Path] = []
+    for root in found:
+        if root.is_dir() and root.resolve() not in {r.resolve() for r in out}:
+            out.append(root)
+    return out
 PULSE_TASK_DIR = Path.home() / ".mybot" / "pulse-tasks"
 
 
@@ -1336,7 +1358,7 @@ def _hop_pulse(engine: str, latest: dict[str, Any], sessions: dict[str, dict[str
 
 
 def publish_for_hop(runners: dict[str, "BriefingRunner"]) -> dict[str, Any]:
-    roots = [root for root in HOP_ASSET_ROOTS if root.is_dir()]
+    roots = hop_asset_roots()
     if not roots:
         return {"ok": False, "error": "no hop asset directory found"}
     PULSE_TASK_DIR.mkdir(parents=True, exist_ok=True)

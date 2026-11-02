@@ -59,6 +59,20 @@ spaces:
 
 ## Quickstart
 
+One line, on macOS or Linux (needs Python 3.11+, git, and the `claude` or
+`codex` CLI):
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/jzhoulab/mybot/main/install.sh | sh
+```
+
+It puts mybot in `~/Code/mybot` (or `MYBOT_DIR`), makes its environment, writes
+a working `.env` for the agent CLI you have, asks what mybot may read, and
+starts it — on macOS as a LaunchAgent, so it is back after a restart. Run it
+again to update; your settings stay. If hop runs on the same machine, the
+morning pulse shows up in hop's **Pulse** page and phone app with nothing else
+to set up. The manual steps below are the same thing by hand.
+
 Requires Python 3.11+, and at least one of [Claude Code](https://claude.com/claude-code)
 or Codex CLI with existing session history. The first index of a large history
 takes a while and lands in the hundreds of MB to a few GB — see
