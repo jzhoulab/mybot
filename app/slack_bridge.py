@@ -49,6 +49,80 @@ def normalize_text(text: str) -> str:
     return re.sub(r"\s+", " ", (text or "")).strip()
 
 
+def to_slack_mrkdwn(text: str) -> str:
+    """Answers are written in Markdown; Slack has its own dialect. Code stays
+    as it is, tables become code blocks (Slack can't draw them)."""
+    out: list[str] = []
+    table: list[str] = []
+    fenced = False
+
+    def flush_table() -> None:
+        if table:
+            out.extend(["```", *table, "```"])
+            table.clear()
+
+    for line in (text or "").splitlines():
+        if line.lstrip().startswith("```"):
+            flush_table()
+            fenced = not fenced
+            out.append(line)
+            continue
+        if fenced:
+            out.append(line)
+            continue
+        if re.match(r"^\s*\|.*\|\s*$", line):
+            if not re.fullmatch(r"[\s|:\-]+", line):
+                table.append(line.strip())
+            continue
+        flush_table()
+        heading = re.match(r"^#{1,6}\s+(.*)$", line)
+        if heading:
+            line = f"**{heading.group(1).strip('* ')}**"
+        parts = re.split(r"(`[^`]*`)", line)
+        for i in range(0, len(parts), 2):
+            part = re.sub(r"\*\*(.+?)\*\*", r"*\1*", parts[i])
+            part = re.sub(r"~~(.+?)~~", r"~\1~", part)
+            parts[i] = re.sub(r"\[([^\]\n]+)\]\((https?://[^)\s]+)\)", r"<\2|\1>", part)
+        out.append("".join(parts))
+    flush_table()
+    return "\n".join(out)
+
+
+CONTEXT_CHARS = 8000
+CONTEXT_MESSAGES = 40
+
+
+def conversation_context(client, bridge: Any, event: dict) -> str:
+    """What's been said around this message, for working out what people mean:
+    the whole thread (a thread can hang off a question asked before the bot
+    was involved, and may hold messages not addressed to it), or for a top-level
+    message the channel's last two hours. Fetched each turn, never stored."""
+    channel = event.get("channel") or ""
+    thread_ts = event.get("thread_ts") or ""
+    current = event.get("ts") or ""
+    try:
+        if thread_ts:
+            rows = client.conversations_replies(channel=channel, ts=thread_ts, limit=CONTEXT_MESSAGES).get("messages") or []
+        else:
+            oldest = str(float(current or time.time()) - 7200)
+            rows = list(reversed(client.conversations_history(channel=channel, oldest=oldest, limit=12).get("messages") or []))
+        lines = []
+        for row in rows:
+            if row.get("ts") == current or not row.get("text"):
+                continue
+            if row.get("user") == bridge.bot_user_id:
+                who = "(you)"
+            elif row.get("user") and not row.get("bot_id"):
+                who = bridge.display_name(client, row["user"])
+            else:
+                who = str(row.get("username") or (row.get("bot_profile") or {}).get("name") or "a bot")
+            lines.append(f"{who}: {normalize_text(bridge.resolve_mentions(client, row['text']))}")
+    except Exception:
+        log.warning("couldn't read the conversation around %s", current, exc_info=True)
+        return ""
+    return "\n".join(lines)[-CONTEXT_CHARS:]
+
+
 def split_for_slack(text: str, limit: int = 3500) -> list[str]:
     """Slack hard-caps a message near 4000 chars; split on paragraph/line/space
     boundaries like the Discord bridge does."""
@@ -125,6 +199,7 @@ class ChatbotApi:
         display_name: str = "",
         channel_kind: str = "",
         channel_label: str = "",
+        thread_context: str = "",
     ) -> dict[str, Any]:
         payload: dict[str, Any] = {
             "actor_id": actor_id,
@@ -141,6 +216,8 @@ class ChatbotApi:
             payload["channel_kind"] = channel_kind
         if channel_label:
             payload["channel_label"] = channel_label
+        if thread_context:
+            payload["thread_context"] = thread_context
         if target_user_id:
             payload["target_user_id"] = target_user_id
         return self._post("/chat", payload)
@@ -358,7 +435,7 @@ def build_bridge() -> tuple[App, SlackBridge, str]:
     base_url = os.environ.get("CHATBOT_BASE_URL", "http://127.0.0.1:8788")
     api = ChatbotApi(
         base_url,
-        timeout_seconds=int(os.environ.get("CHATBOT_REQUEST_TIMEOUT_SECONDS", "150")),
+        timeout_seconds=int(os.environ.get("CHATBOT_REQUEST_TIMEOUT_SECONDS", "900")),
         use_trajectory_memory=env_bool("SLACK_USE_TRAJECTORY_MEMORY", True),
     )
     bridge = SlackBridge(
@@ -493,15 +570,29 @@ def build_bridge() -> tuple[App, SlackBridge, str]:
             client.reactions_add(channel=channel_id, timestamp=event.get("ts"), name="eyes")
         except Exception:
             pass
+        # A long answer shouldn't look like a dead bot.
+        def mark_slow() -> None:
+            try:
+                client.reactions_add(channel=channel_id, timestamp=event.get("ts"), name="hourglass_flowing_sand")
+            except Exception:
+                pass
+
+        slow = threading.Timer(60, mark_slow)
+        slow.daemon = True
+        slow.start()
         try:
             result = api.chat(
                 actor_id=actor_id, user_key=user_key, session_key=session_key, message=text,
                 display_name=display,
                 channel_kind="dm" if is_dm else "group",
                 channel_label="" if is_dm else bridge.channel_label(client, channel_id),
+                thread_context="" if is_dm else conversation_context(client, bridge, event),
             )
+            slow.cancel()
+            result["text"] = to_slack_mrkdwn(str(result.get("text") or ""))
             reply(say, relay_protocol.neutralize(result.get("text") or "(empty response)"), thread_ts=reply_thread)
         except Exception as exc:
+            slow.cancel()
             log.exception("chat failed for user=%s", user_id)
             reply(say, f"Sorry — I couldn't answer that ({exc}). Please try again.", thread_ts=reply_thread)
 

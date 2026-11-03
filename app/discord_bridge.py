@@ -1361,10 +1361,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--request-timeout-seconds",
         type=int,
-        # 150s: hard questions legitimately take ~2min (codex-exec turns + budgeted
-        # retrieval). The bridge always replies on failure now, so a long timeout
-        # no longer means long silence.
-        default=int(os.environ.get("CHATBOT_REQUEST_TIMEOUT_SECONDS", "150")),
+        # Generous: hard questions can take minutes, and the server finishes
+        # the answer either way, so giving up early only loses it.
+        default=int(os.environ.get("CHATBOT_REQUEST_TIMEOUT_SECONDS", "900")),
     )
     return parser.parse_args()
 
