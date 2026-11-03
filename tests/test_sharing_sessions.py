@@ -103,9 +103,10 @@ class ReviewerTest(unittest.TestCase):
         )
         self.reviewer = sr.SharingReviewer(self.state, path=root / "review.json", model="m")
         self.answers = []
+        self.hop = {"hopc": "alpha-claude"}
         self.patches = [
             mock.patch.object(sr, "codex_thread_origins", lambda: ORIGINS),
-            mock.patch.object(sr.SharingReviewer, "_hop_session_ids", staticmethod(lambda: {"hopc"})),
+            mock.patch.object(sr, "hop_session_names", lambda: self.hop),
         ]
         for p in self.patches:
             p.start()
@@ -122,19 +123,34 @@ class ReviewerTest(unittest.TestCase):
     def test_candidates_skip_gui_and_automated_sessions(self):
         self.assertEqual({c["source_ref"] for c in self.reviewer.session_candidates()}, {"codex:tui", "claude:hopc"})
 
-    def test_recommends_without_sharing_and_nudges_once_a_day(self):
-        self.answers = [{"ref": "codex:tui", "level": "team", "confidence": "high", "reason": "data paths"},
+    def test_recommends_without_sharing(self):
+        self.answers = [{"ref": "codex:tui", "name": "SSD data staging", "level": "team", "confidence": "high",
+                         "reason": "data paths"},
                         {"ref": "claude:hopc", "level": "owner", "confidence": "high", "reason": "logistics"}]
         self.assertEqual(self.reviewer.run_sessions()["recommended"], 1)
         self.assertNotIn("codex:gui", self.seen)
         self.assertEqual([s["ref"] for s in self.reviewer.recommended()], ["codex:tui"])
         self.assertTrue(self.state.sharing.hidden_from_team("codex", HOME, "codex:tui"))  # still needs a yes
-        outbox = Path(self.state.config.state_dir) / "outbox.jsonl"
-        self.assertEqual(len(outbox.read_text().splitlines()), 1)
-        self.assertIn("data paths", outbox.read_text())
-        self.reviewer._notify_owner(self.reviewer.suggestions())
-        self.assertEqual(len(outbox.read_text().splitlines()), 1)
+        self.assertEqual(self.reviewer.recommended()[0]["name"], "SSD data staging")
+        self.assertFalse((Path(self.state.config.state_dir) / "outbox.jsonl").exists())  # the menu app shows these
         self.assertEqual(self.reviewer.session_candidates(), [])  # reviewed: not asked again
+
+    def test_recommendation_without_a_name_is_reviewed_again(self):
+        self.answers = [{"ref": "codex:tui", "level": "team", "confidence": "high", "reason": "paths"}]
+        self.reviewer.run_sessions()
+        self.answers = []
+        self.assertIn("codex:tui", [c["source_ref"] for c in self.reviewer.session_candidates()])
+
+    def test_hop_name_shown_and_kept_after_it_closes(self):
+        self.answers = [{"ref": "claude:hopc", "name": "n", "level": "team", "confidence": "high", "reason": "r"},
+                        {"ref": "codex:tui", "name": "n", "level": "team", "confidence": "low", "reason": "r"}]
+        self.reviewer.run_sessions()
+        by_ref = {s["ref"]: s for s in self.reviewer.recommended()}
+        self.assertEqual(by_ref["claude:hopc"]["hop_name"], "alpha-claude")
+        self.assertEqual(by_ref["codex:tui"]["hop_name"], "")  # not in hop: nothing hop-related
+        self.assertFalse(by_ref["codex:tui"]["hop"])
+        self.hop = {}  # closed, or hop isn't used at all
+        self.assertEqual({s["ref"]: s["hop_name"] for s in self.reviewer.recommended()}["claude:hopc"], "alpha-claude")
 
     def test_shared_session_that_turned_personal_is_taken_back(self):
         self.state.sharing.decide_session("codex:tui", "team", chunks=1)

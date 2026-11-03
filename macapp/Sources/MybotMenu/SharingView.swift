@@ -54,17 +54,23 @@ struct SharedSession: Identifiable, Hashable {
     let confidence: String
     let chunks: Int
     let hop: Bool
+    let hopName: String
 
     init?(_ obj: [String: Any]) {
         guard let ref = obj["ref"] as? String else { return nil }
         self.ref = ref
-        title = (obj["title"] as? String) ?? ""
+        let name = (obj["name"] as? String) ?? ""
+        title = name.isEmpty ? ((obj["title"] as? String) ?? "") : name
+        hopName = (obj["hop_name"] as? String) ?? ""
         cwd = (obj["cwd"] as? String) ?? ""
         reason = (obj["reason"] as? String) ?? ""
         confidence = (obj["confidence"] as? String) ?? ""
         chunks = (obj["chunks"] as? Int) ?? 0
         hop = (obj["hop"] as? Bool) ?? false
     }
+
+    /// Shown only for a session hop knows; nothing for anyone not using hop.
+    var hopLabel: String? { hopName.isEmpty ? (hop ? "in hop" : nil) : "hop: \(hopName)" }
 
     var displayFolder: String { (cwd as NSString).abbreviatingWithTildeInPath }
 }
@@ -267,7 +273,7 @@ struct SharingView: View {
                 Spacer()
                 actions()
             }
-            Text(([session.hop ? "hop" : nil, session.displayFolder, session.chunks > 0 ? "\(session.chunks) chunks" : nil] as [String?])
+            Text(([session.hopLabel, session.displayFolder, session.chunks > 0 ? "\(session.chunks) chunks" : nil] as [String?])
                 .compactMap { $0 }.joined(separator: " · "))
                 .font(.system(size: 9.5)).foregroundStyle(.tertiary).lineLimit(1)
             if !session.reason.isEmpty {

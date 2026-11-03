@@ -2563,7 +2563,12 @@ class AppState:
         source_name, _, cwd = key.partition(":")
         if level not in LEVELS or not source_name or not cwd:
             raise ValueError("need a project key (source:cwd) and a level: team, owner or exclude")
+        was_excluded = self.sharing.level(source_name, cwd) == "exclude"
         self.sharing.decide(key, level)
+        if was_excluded and level != "exclude":
+            # Back in scope: its sessions get indexed again.
+            self.update_scope(action="unexclude", source_name=source_name, kind="workdir", value=cwd,
+                              reconcile=reconcile)
         if level == "exclude":
             self.update_scope(action="exclude", source_name=source_name, kind="workdir", value=cwd,
                               reconcile=reconcile)
@@ -2630,16 +2635,18 @@ class AppState:
                 "level": (decided["projects"].get(key) or {}).get("level"),
                 "suggestion": suggestion,
             })
+        shared_sessions = [
+            {**s, **(session_suggestions.get(s.get("ref")) or {}), "ref": s.get("ref"), "level": "team"}
+            for s in decided.get("sessions", {}).values() if s.get("level") == "team"
+        ]
+        self.sharing_reviewer.with_hop_names(shared_sessions)
         return {
             "ok": True,
             "mode": self.sharing.mode,
             "projects": rows,
             "private_sessions": decided["private_sessions"],
             "recommended_sessions": self.sharing_reviewer.recommended(),
-            "shared_sessions": [
-                {**s, **(session_suggestions.get(s.get("ref")) or {}), "ref": s.get("ref"), "level": "team"}
-                for s in decided.get("sessions", {}).values() if s.get("level") == "team"
-            ],
+            "shared_sessions": shared_sessions,
             "reviewer": self.sharing_reviewer.status,
         }
 

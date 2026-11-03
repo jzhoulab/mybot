@@ -2,6 +2,7 @@ import Foundation
 import AppKit
 import SwiftUI
 import ServiceManagement
+import UserNotifications
 
 enum SortOrder: String, CaseIterable, Identifiable {
     case sessions = "Sessions"
@@ -140,6 +141,7 @@ final class AppModel: ObservableObject {
     /// The team channel view's state; kept across tab switches.
     lazy var channel = ChannelModel(config: config)
     private var timer: Timer?
+    private var sharingTicks = 0
 
     func start() {
         renderIcon()
@@ -154,6 +156,8 @@ final class AppModel: ObservableObject {
             Task { @MainActor in
                 guard let self, self.busyMessage == nil else { return }  // don't shift numbers mid-op
                 self.reload()
+                self.sharingTicks += 1
+                if self.sharingTicks % 40 == 0 { self.loadSharing() }  // every 10 min
                 // Keep polling while onboarding hasn't settled (discovery in
                 // flight, or a deduced name waiting for the owner's nod).
                 if self.identityInvestigating || (self.ownerName.isEmpty || !self.ownerConfirmed) {
@@ -381,12 +385,14 @@ final class AppModel: ObservableObject {
     /// Render the cute bot to an NSImage for the menu bar (non-template so it
     /// keeps its status color).
     private var renderedIconKey = ""
+    /// Things waiting on the owner: new projects and recommended sessions.
+    private var iconBadge: Int { newProjects.count + sharing.recommended.count }
 
     private func renderIcon() {
-        let key = "\(mood)-\(newProjects.count)"
+        let key = "\(mood)-\(iconBadge)"
         guard key != renderedIconKey else { return }  // 15s ticks mostly change nothing
         let renderer = ImageRenderer(
-            content: BotIconMono(mood: mood, badge: newProjects.count)
+            content: BotIconMono(mood: mood, badge: iconBadge)
                 .frame(width: 20, height: 20)
         )
         renderer.scale = 3
@@ -886,6 +892,8 @@ final class AppModel: ObservableObject {
 
     private func applySharing(_ state: SharingState) {
         sharing = state
+        renderIcon()
+        notifyRecommendations()
         // While the agent is reviewing, check back so suggestions appear.
         sharingPoll?.cancel()
         if state.reviewing {
@@ -924,6 +932,44 @@ final class AppModel: ObservableObject {
         SharingClient(config: config).post(["action": "session", "ref": ref, "private": isPrivate]) { [weak self] state in
             if let state { self?.applySharing(state) }
         }
+    }
+
+    /// Takes the owner to the sessions waiting for an answer.
+    func openTeamSharing() {
+        mode = .projects
+        detail = nil
+        trajectory = nil
+        showSharing = true
+        loadSharing()
+        NSApp.activate(ignoringOtherApps: true)
+        for window in NSApp.windows where String(describing: type(of: window)).contains("StatusBar") {
+            if window.responds(to: Selector(("statusItem"))),
+               let item = window.value(forKey: "statusItem") as? NSStatusItem {
+                item.button?.performClick(nil)
+                return
+            }
+        }
+    }
+
+    /// A system notification when newly recommended sessions wait, at most
+    /// once a day; clicking it opens Team sharing here.
+    private func notifyRecommendations() {
+        let waiting = sharing.recommended
+        guard !waiting.isEmpty, Bundle.main.bundlePath.hasSuffix(".app") else { return }
+        let defaults = UserDefaults.standard
+        let today = String(ISO8601DateFormatter().string(from: Date()).prefix(10))
+        let known = Set(defaults.stringArray(forKey: "sharingNotifiedRefs") ?? [])
+        guard defaults.string(forKey: "sharingNotifiedDay") != today, waiting.contains(where: { !known.contains($0.ref) }) else { return }
+        let center = UNUserNotificationCenter.current()
+        center.requestAuthorization(options: [.alert, .sound]) { granted, _ in
+            guard granted else { return }
+            let content = UNMutableNotificationContent()
+            content.title = "mybot recommends sharing \(waiting.count) session\(waiting.count == 1 ? "" : "s")"
+            content.body = waiting.prefix(3).map(\.title).joined(separator: "\n")
+            center.add(UNNotificationRequest(identifier: "sharing-\(today)", content: content, trigger: nil))
+        }
+        defaults.set(today, forKey: "sharingNotifiedDay")
+        defaults.set(waiting.map(\.ref), forKey: "sharingNotifiedRefs")
     }
 
     func shareSessions(_ refs: [String], share: Bool) {

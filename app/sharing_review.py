@@ -28,6 +28,7 @@ import json
 import glob
 import os
 import sqlite3
+import subprocess
 import threading
 import time
 from datetime import datetime, timezone
@@ -142,6 +143,43 @@ def is_codex_gui_chat(source_name: str, session_id: str, cwd: str,
     if "desktop" in origin["originator"].lower():
         return True
     return not (origin["originator"] == "codex-tui" or origin["source"] == "cli")
+
+
+_hop_cache: dict[str, Any] = {"at": 0.0, "names": {}}
+
+
+def hop_session_names() -> dict[str, str]:
+    """{conversation id: hop session name} for conversations hop hosts or has
+    hosted. Empty for anyone not using hop."""
+    with _origin_lock:
+        if time.monotonic() - _hop_cache["at"] < 300:
+            return _hop_cache["names"]
+    from app.briefing import hop_agent_sessions  # the live ones, Codex included
+
+    readable: dict[str, str] = {}
+    try:
+        proc = subprocess.run(["hopa", "sessions", "--json"], capture_output=True, text=True, timeout=30)
+        listing = json.loads(proc.stdout or "[]")
+        for item in listing if isinstance(listing, list) else listing.get("sessions") or []:
+            readable[str(item.get("internalName"))] = str(item.get("name") or "")
+    except (OSError, subprocess.SubprocessError, ValueError):
+        pass
+    names: dict[str, str] = {}
+    for path in (Path.home() / ".hop2" / "claude-sessions").glob("*.json"):
+        try:
+            ident = json.loads(path.read_text()).get("sessionId")
+        except (OSError, ValueError):
+            continue
+        # A closed session keeps only its record; its file is named after it
+        # unless that's an opaque internal id.
+        name = readable.get(path.stem) or ("" if path.stem.startswith("s_") else path.stem)
+        if ident:
+            names[str(ident).lower()] = name
+    for conversation, target in hop_agent_sessions().items():
+        names[conversation.lower()] = str(target.get("name") or "")
+    with _origin_lock:
+        _hop_cache.update(at=time.monotonic(), names=names)
+    return names
 
 
 class SharingPolicy:
@@ -279,7 +317,8 @@ lab's research; and sessions too thin to be useful. A mostly-work session contai
 is "owner". When unsure, "owner".
 
 Reply with ONLY a JSON array, one object per session:
-[{"ref": "<ref>", "level": "team|owner", "confidence": "high|medium|low", \
+[{"ref": "<ref>", "name": "<what the session is about, 3-7 words, not its first request>", \
+"level": "team|owner", "confidence": "high|medium|low", \
 "reason": "<one short plain sentence: for team, what a colleague could learn from it>"}]"""
 
 
@@ -293,7 +332,6 @@ class SharingReviewer:
         self.batch_size = max(1, batch_size)
         self.session_batch_size = 12
         self.sessions_per_run = int(os.environ.get("SHARING_SESSIONS_PER_RUN", "120") or 120)
-        self.notify_path = path.with_name("sharing_notified.json")
         self._lock = threading.Lock()
         self.status: dict[str, Any] = {"running": False}
 
@@ -463,19 +501,6 @@ class SharingReviewer:
         return self.status
 
     # ------------------------------------------------- individual sessions
-    @staticmethod
-    def _hop_session_ids() -> set[str]:
-        """Conversations hop has hosted, which is where the owner's work is."""
-        ids: set[str] = set()
-        for path in (Path.home() / ".hop2" / "claude-sessions").glob("*.json"):
-            try:
-                ident = json.loads(path.read_text()).get("sessionId")
-            except (OSError, ValueError):
-                continue
-            if ident:
-                ids.add(str(ident).lower())
-        return ids
-
     def session_candidates(self, data: dict[str, Any] | None = None) -> list[dict[str, Any]]:
         """Owner-typed sessions a teammate can't see, not decided by the
         owner and not reviewed yet (or grown a lot since), most useful first:
@@ -484,7 +509,7 @@ class SharingReviewer:
         policy = self.state.sharing.snapshot()
         access = self.state.access_config
         origins = codex_thread_origins()
-        hop = self._hop_session_ids()
+        hop = hop_session_names()
         with self._connect() as conn:
             typed = {(row[0], row[1]) for row in conn.execute(
                 "SELECT DISTINCT source_name, session_id FROM prompt_history")}
@@ -506,11 +531,13 @@ class SharingReviewer:
             if level == "exclude" or (level == "team" and not is_catch_all_dir(cwd)):
                 continue
             seen = data["sessions"].get(row["source_ref"])
-            if seen and int(row["chunks"]) < 2 * max(int(seen.get("chunks") or 0), 25):
+            grown = not seen or int(row["chunks"]) >= 2 * max(int(seen.get("chunks") or 0), 25)
+            unnamed = bool(seen) and seen.get("level") == "team" and not seen.get("name")
+            if not grown and not unnamed:
                 continue
             origin = origins.get(ident_key) or {}
             hosted = ident_key in hop or origin.get("originator") == "codex-tui" or origin.get("source") == "cli"
-            out.append({**dict(row), "hop": ident_key in hop, "project_level": level, "_rank": hosted})
+            out.append({**dict(row), "hop": ident_key in hop, "hop_name": hop.get(ident_key, ""), "project_level": level, "_rank": hosted})
         out.sort(key=lambda s: (not s["_rank"], -int(s["chunks"]), s["last"] or ""))
         return out
 
@@ -535,7 +562,7 @@ class SharingReviewer:
 
     def run_sessions(self, limit: int | None = None) -> dict[str, Any]:
         """Review the next sessions and record recommendations. Sharing still
-        takes the owner's yes, but a shared session that has since turned
+        takes the owner's yes (the menu app shows these), but a shared session that has since turned
         personal is taken back straight away."""
         data = self.suggestions()
         todo = self.session_candidates(data)[: limit or self.sessions_per_run]
@@ -558,9 +585,10 @@ class SharingReviewer:
                 level = "team" if result.get("level") == "team" else "owner"
                 data["sessions"][session["source_ref"]] = {
                     "level": level, "confidence": str(result.get("confidence") or "low"),
+                    "name": str(result.get("name") or "")[:80],
                     "reason": str(result.get("reason") or "")[:300], "title": session.get("title", ""),
                     "source": session["source_name"], "cwd": session["cwd"], "chunks": int(session["chunks"]),
-                    "last": session["last"], "hop": bool(session.get("hop")), "at": _now(),
+                    "last": session["last"], "hop": bool(session.get("hop")), "hop_name": session.get("hop_name", ""), "at": _now(),
                 }
                 if session.get("shared") and level != "team":
                     self.state.sharing.decide_session(session["source_ref"], "owner", by="reviewer",
@@ -572,8 +600,6 @@ class SharingReviewer:
                 elif level == "team":
                     new_team += 1
             self._save(data)
-        if new_team:
-            self._notify_owner(data)
         return {"reviewed": len(todo), "recommended": new_team}
 
     def _shared_grown(self, data: dict[str, Any]) -> list[dict[str, Any]]:
@@ -593,29 +619,6 @@ class SharingReviewer:
             if int(row["chunks"]) >= int(shared[_session_id(row["session_id"])].get("chunks") or 0) + 25
         ]
 
-    def _notify_owner(self, data: dict[str, Any]) -> None:
-        """At most one nudge a day, in the owner's Discord DM."""
-        owner = str(self.state.config.imported_owner_actor_id or "")
-        today = _now()[:10]
-        try:
-            if json.loads(self.notify_path.read_text()).get("date") == today:
-                return
-        except (OSError, ValueError):
-            pass
-        waiting = self.recommended(data)
-        if not waiting or not owner.isdigit():
-            return
-        top = "\n".join(f"- **{s['title'] or s['ref']}**: {s['reason']}" for s in waiting[:5])
-        item = {
-            "id": f"sharing-{today}", "platform": "discord", "target_user_id": owner,
-            "text": f"I recommend sharing {len(waiting)} more session{'' if len(waiting) == 1 else 's'} with your "
-                    f"team. Nothing is shared until you accept (Mac app → Team sharing).\n{top}",
-            "created_at": _now(),
-        }
-        with (Path(self.state.config.state_dir) / "outbox.jsonl").open("a") as handle:
-            handle.write(json.dumps(item) + "\n")
-        _write_json(self.notify_path, {"date": today})
-
     def recommended(self, data: dict[str, Any] | None = None) -> list[dict[str, Any]]:
         """Sessions the agent would share and the owner hasn't answered."""
         data = data or self.suggestions()
@@ -627,8 +630,21 @@ class SharingReviewer:
             and _session_id(ref) not in policy.get("sessions", {})
         ]
         rank = {"high": 0, "medium": 1, "low": 2}
+        self.with_hop_names(waiting)
         waiting.sort(key=lambda s: (rank.get(s.get("confidence"), 3), not s.get("hop"), -int(s.get("chunks") or 0)))
         return waiting
+
+    @staticmethod
+    def with_hop_names(sessions: list[dict[str, Any]]) -> None:
+        """The hop session each is in now, if any; a name seen at review time
+        outlasts the hop session closing."""
+        names = hop_session_names()
+        for session in sessions:
+            ident = _session_id(str(session.get("ref") or ""))
+            if names.get(ident):
+                session["hop_name"] = names[ident]
+            if ident in names:
+                session["hop"] = True
 
     def _ask_json(self, system: str, message: str) -> list[Any]:
         result = self.state.provider.run_claude_task(
