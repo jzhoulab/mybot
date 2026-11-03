@@ -32,7 +32,7 @@ from app.gui import GUI_HTML, build_gui_state
 from app.api_auth import load_or_create_api_key
 from app.model_catalog import codex_default_model
 from app.redact import extra_literal_secrets, redact_text
-from app.sharing_review import LEVELS, SharingPolicy, SharingReviewer, project_key
+from app.sharing_review import LEVELS, SharingPolicy, SharingReviewer, is_codex_gui_chat, project_key
 from app.team_channel import TeamChannel
 from app.logging_setup import get_logger
 from app.semantic_memory import SemanticMemoryStore, VALID_MEMORY_SCOPES, parse_tags
@@ -1959,11 +1959,12 @@ class AppState:
             return hits
         return [
             hit for hit in hits
-            if not self.access_config.is_private_workdir(str(hit.get("source_name") or ""), str(hit.get("cwd") or ""))
-            and not self.sharing.hidden_from_team(
-                str(hit.get("source_name") or ""), str(hit.get("cwd") or ""),
-                f"{hit.get('source_name')}:{hit.get('session_id')}",
-            )
+            if self.sharing.session_shared(f"{hit.get('source_name')}:{hit.get('session_id')}")
+            or (not self.access_config.is_private_workdir(str(hit.get("source_name") or ""), str(hit.get("cwd") or ""))
+                and not self.sharing.hidden_from_team(
+                    str(hit.get("source_name") or ""), str(hit.get("cwd") or ""),
+                    f"{hit.get('source_name')}:{hit.get('session_id')}",
+                ))
         ]
 
     def refresh_trajectory_chunk_index(self, *, include_vectors: bool = False) -> dict[str, Any]:
@@ -2586,7 +2587,9 @@ class AppState:
         """Every indexed project with the owner's level and the agent's
         suggestion, for the menu app's sharing review."""
         decided = self.sharing.snapshot()
-        suggestions = self.sharing_reviewer.suggestions()["projects"]
+        reviewed = self.sharing_reviewer.suggestions()
+        suggestions = reviewed["projects"]
+        session_suggestions = reviewed["sessions"]
         try:
             projects = self.sharing_reviewer.projects()
         except Exception:  # pragma: no cover
@@ -2632,6 +2635,11 @@ class AppState:
             "mode": self.sharing.mode,
             "projects": rows,
             "private_sessions": decided["private_sessions"],
+            "recommended_sessions": self.sharing_reviewer.recommended(),
+            "shared_sessions": [
+                {**s, **(session_suggestions.get(s.get("ref")) or {}), "ref": s.get("ref"), "level": "team"}
+                for s in decided.get("sessions", {}).values() if s.get("level") == "team"
+            ],
             "reviewer": self.sharing_reviewer.status,
         }
 
@@ -2651,6 +2659,10 @@ class AppState:
 
     def trajectory_payload_is_private(self, payload: dict[str, Any]) -> bool:
         metadata = payload.get("metadata") if isinstance(payload.get("metadata"), dict) else {}
+        # The owner shared this very session: that outranks where it started.
+        ref = str(payload.get("source_ref") or payload.get("parent_source_ref") or "")
+        if ref.startswith(("claude:", "codex:")) and self.sharing.session_shared(ref.split("#", 1)[0]):
+            return False
         if metadata.get("visibility") == "private":
             return True
         # Also honor the LIVE policy by cwd: chunks indexed before a workdir
@@ -3843,7 +3855,10 @@ class AppState:
             lines.append(
                 f"Setting: group channel{where}. Multiple people talk here; user turns are "
                 "prefixed with the speaker's name in [brackets]. Address the current asker, and "
-                "use the channel conversation as shared context everyone present can see."
+                "use the channel conversation as shared context everyone present can see. Here you "
+                "see only what the owner shares with the team, so a search that finds nothing doesn't "
+                "mean it doesn't exist: say you found nothing in what's shared here, never that the "
+                "sessions don't mention it, and if the asker is the owner, suggest asking in a DM."
             )
         elif channel_kind:
             lines.append("Setting: direct message — a private one-on-one conversation.")
@@ -5484,13 +5499,26 @@ class ChatHandler(BaseHTTPRequestHandler):
                 if excluded:
                     state.purge_index_to_policy()
                 state.detect_new_projects()
+            elif action == "share_sessions":
+                # The owner's answer on recommended sessions. Codex GUI chats
+                # with no project can't be shared, whatever is asked.
+                level = "team" if str(body.get("level") or "team") == "team" else "owner"
+                suggestions = state.sharing_reviewer.suggestions()["sessions"]
+                for ref in body.get("refs") or []:
+                    ref = str(ref)
+                    seen = suggestions.get(ref)
+                    if not seen:
+                        raise ValueError(f"no review of {ref}")
+                    if level == "team" and is_codex_gui_chat(str(seen.get("source") or ""), ref, str(seen.get("cwd") or "")):
+                        raise ValueError("Codex GUI chats with no project stay private")
+                    state.sharing.decide_session(ref, level, chunks=int(seen.get("chunks") or 0))
             elif action == "session":
                 state.sharing.set_session_private(
                     str(body.get("ref") or ""), coerce_bool(body.get("private"), True),
                     reason=str(body.get("reason") or "owner"),
                 )
             else:
-                self.respond_json(400, {"ok": False, "error": "action must be review, decide, accept or session"})
+                self.respond_json(400, {"ok": False, "error": "action must be review, decide, accept, share_sessions or session"})
                 return
         except ValueError as exc:
             self.respond_json(400, {"ok": False, "error": str(exc)})
@@ -5898,6 +5926,7 @@ def main() -> None:
         while True:
             try:
                 state.sharing_reviewer.run()
+                state.sharing_reviewer.run_sessions()
             except Exception:  # pragma: no cover - best effort
                 log.exception("sharing review loop")
             time.sleep(3600)

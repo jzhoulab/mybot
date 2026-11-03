@@ -6,11 +6,18 @@ Two layers, kept apart on purpose:
   server enforces. In "reviewed" mode (the default for team use) a teammate
   sees a project only once the owner marked it `team`; everything else —
   new, unreviewed, `owner` — stays owner-only. Single sessions can be made
-  owner-only inside a shared project (a tax question asked from a work dir).
+  owner-only inside a shared project (a tax question asked from a work dir),
+  or shared on their own: much of the valuable work starts from a catch-all
+  folder (a hop session in the home dir), where the folder says nothing.
 - SharingReviewer (state/sharing_review.json) is an agent that reads each
   project's session titles and the owner's own typed prompts and SUGGESTS a
   level with a reason, and flags personal sessions inside work projects. It
-  never decides; the owner confirms in the menu app.
+  also goes through individual sessions no teammate can see yet and recommends
+  the ones worth sharing. It never decides; the owner confirms in the menu app.
+
+Chats started in the Codex GUI outside any project are where personal and
+logistics questions go: they are never recommended and can't be shared. Where
+a chat's origin can't be established it counts as one of those.
 
 Levels: team (teammates can ask), owner (indexed, owner-only), exclude (not
 indexed at all).
@@ -18,6 +25,7 @@ indexed at all).
 from __future__ import annotations
 
 import json
+import glob
 import os
 import sqlite3
 import threading
@@ -86,6 +94,56 @@ def _write_json(path: Path, data: dict[str, Any]) -> None:
     os.replace(tmp, path)
 
 
+def _no_project_dir(cwd: str) -> bool:
+    """A chat with no real folder: a catch-all, or the Codex app's own
+    per-chat folders under ~/Documents/Codex."""
+    if is_catch_all_dir(cwd):
+        return True
+    documents = str(Path.home() / "Documents" / "Codex")
+    return (cwd or "").startswith(documents)
+
+
+_origin_cache: dict[str, Any] = {"at": 0.0, "threads": {}}
+_origin_lock = threading.Lock()
+
+
+def codex_thread_origins() -> dict[str, dict[str, str]]:
+    """{thread id: {originator, source}} from the Codex app's own database."""
+    with _origin_lock:
+        if time.monotonic() - _origin_cache["at"] < 600 and _origin_cache["threads"]:
+            return _origin_cache["threads"]
+        threads: dict[str, dict[str, str]] = {}
+        home = os.environ.get("CODEX_HOME") or str(Path.home() / ".codex")
+        for path in glob.glob(str(Path(home) / "state_*.sqlite")):
+            try:
+                conn = sqlite3.connect(f"file:{path}?mode=ro", uri=True, timeout=10)
+                try:
+                    for ident, originator, source in conn.execute("SELECT id, originator, source FROM threads"):
+                        threads[str(ident)] = {"originator": str(originator or ""), "source": str(source or "")}
+                finally:
+                    conn.close()
+            except sqlite3.Error as exc:
+                log.warning("could not read Codex threads from %s: %s", path, exc)
+        _origin_cache.update(at=time.monotonic(), threads=threads)
+        return threads
+
+
+def is_codex_gui_chat(source_name: str, session_id: str, cwd: str,
+                      origins: dict[str, dict[str, str]] | None = None) -> bool:
+    """A Codex chat with no project folder that isn't provably from a
+    terminal. Fails closed: unknown origin counts as a GUI chat."""
+    if (source_name or "").strip().lower() != "codex" or not _no_project_dir(cwd):
+        return False
+    if (cwd or "").startswith(str(Path.home() / "Documents" / "Codex")):
+        return True
+    origin = (codex_thread_origins() if origins is None else origins).get(_session_id(session_id))
+    if not origin:
+        return True
+    if "desktop" in origin["originator"].lower():
+        return True
+    return not (origin["originator"] == "codex-tui" or origin["source"] == "cli")
+
+
 class SharingPolicy:
     def __init__(self, path: Path, *, mode: str = "reviewed") -> None:
         self.path = path
@@ -106,6 +164,7 @@ class SharingPolicy:
                 data = {}
             data.setdefault("projects", {})
             data.setdefault("private_sessions", {})
+            data.setdefault("sessions", {})
             self._data, self._mtime = data, mtime
         return self._data
 
@@ -122,15 +181,41 @@ class SharingPolicy:
         """True when a teammate must not see this session."""
         with self._lock:
             data = self._load()
-            if session_ref and _session_id(session_ref) in {_session_id(r) for r in data["private_sessions"]}:
+            ident = _session_id(session_ref) if session_ref else ""
+            if ident and ident in {_session_id(r) for r in data["private_sessions"]}:
                 return True
             if self.mode == "open":
                 return False
+            decided = data["sessions"].get(ident) if ident else None
+            if decided:
+                return decided.get("level") != "team"
             if is_catch_all_dir(cwd):
                 # Never shared, whatever was decided: anything can start there.
                 return True
             entry = data["projects"].get(project_key(source_name, cwd))
         return (entry or {}).get("level") != "team"
+
+    def session_shared(self, session_ref: str) -> bool:
+        """The owner shared this one session (and it isn't marked private)."""
+        ident = _session_id(session_ref or "")
+        if not ident:
+            return False
+        with self._lock:
+            data = self._load()
+            if ident in {_session_id(r) for r in data["private_sessions"]}:
+                return False
+            return (data["sessions"].get(ident) or {}).get("level") == "team"
+
+    def decide_session(self, ref: str, level: str, *, by: str = "owner", chunks: int = 0) -> None:
+        if level not in ("team", "owner"):
+            raise ValueError("a session is shared (team) or kept (owner)")
+        with self._lock:
+            data = self._load()
+            data["sessions"][_session_id(ref)] = {
+                "ref": ref, "level": level, "decided_at": _now(), "by": by, "chunks": chunks,
+            }
+            _write_json(self.path, data)
+            self._mtime = -1.0
 
     def decide(self, key: str, level: str, *, by: str = "owner") -> None:
         if level not in LEVELS:
@@ -179,6 +264,25 @@ Reply with ONLY a JSON array, one object per project, in the order given:
 "reason": "<one short plain sentence>", "private_sessions": [{"ref": "<ref>", "reason": "<short>"}]}]"""
 
 
+SESSION_REVIEW_PROMPT = """You help a researcher decide which of their individual AI coding-agent \
+sessions their teammates may ask a bot about. Each session below is currently invisible to teammates, \
+usually because it was started from a general folder. You get its title, folder, size, and some of the \
+owner's own requests. Most valuable work happens in long working sessions, so actively look for those.
+
+Recommend "team" when the session is research, engineering, data, infrastructure or lab-tool work whose \
+facts would help colleagues: where data lives, how something was built or run, results, decisions, \
+methods. Recommend "owner" for: personal life, family, health, money, taxes, immigration, housing, \
+travel and logistics; job searches, tenure/promotion, salaries, HR; grading, evaluations, recommendation \
+letters, admissions; confidential peer review; the owner's own grant and funding applications; personal \
+email and correspondence; private matters of specific people; commercial or side projects outside the \
+lab's research; and sessions too thin to be useful. A mostly-work session containing some of the above \
+is "owner". When unsure, "owner".
+
+Reply with ONLY a JSON array, one object per session:
+[{"ref": "<ref>", "level": "team|owner", "confidence": "high|medium|low", \
+"reason": "<one short plain sentence: for team, what a colleague could learn from it>"}]"""
+
+
 class SharingReviewer:
     """Runs the suggesting agent in the background, a few projects per call."""
 
@@ -187,6 +291,9 @@ class SharingReviewer:
         self.path = path
         self.model = model
         self.batch_size = max(1, batch_size)
+        self.session_batch_size = 12
+        self.sessions_per_run = int(os.environ.get("SHARING_SESSIONS_PER_RUN", "120") or 120)
+        self.notify_path = path.with_name("sharing_notified.json")
         self._lock = threading.Lock()
         self.status: dict[str, Any] = {"running": False}
 
@@ -197,6 +304,7 @@ class SharingReviewer:
         except (OSError, ValueError):
             data = {}
         data.setdefault("projects", {})
+        data.setdefault("sessions", {})
         return data
 
     def _save(self, data: dict[str, Any]) -> None:
@@ -353,6 +461,182 @@ class SharingReviewer:
             log.exception("sharing review failed")
             self.status.update({"running": False, "error": str(exc)})
         return self.status
+
+    # ------------------------------------------------- individual sessions
+    @staticmethod
+    def _hop_session_ids() -> set[str]:
+        """Conversations hop has hosted, which is where the owner's work is."""
+        ids: set[str] = set()
+        for path in (Path.home() / ".hop2" / "claude-sessions").glob("*.json"):
+            try:
+                ident = json.loads(path.read_text()).get("sessionId")
+            except (OSError, ValueError):
+                continue
+            if ident:
+                ids.add(str(ident).lower())
+        return ids
+
+    def session_candidates(self, data: dict[str, Any] | None = None) -> list[dict[str, Any]]:
+        """Owner-typed sessions a teammate can't see, not decided by the
+        owner and not reviewed yet (or grown a lot since), most useful first:
+        hop sessions and terminal Codex, then the largest and newest."""
+        data = data or self.suggestions()
+        policy = self.state.sharing.snapshot()
+        access = self.state.access_config
+        origins = codex_thread_origins()
+        hop = self._hop_session_ids()
+        with self._connect() as conn:
+            typed = {(row[0], row[1]) for row in conn.execute(
+                "SELECT DISTINCT source_name, session_id FROM prompt_history")}
+            rows = conn.execute(
+                """SELECT source_ref, source_name, session_id, cwd, COUNT(*) AS chunks, MAX(updated_at) AS last
+                   FROM trajectory_chunks WHERE source_name IN ('claude', 'codex') AND cwd != ''
+                   GROUP BY source_ref"""
+            ).fetchall()
+        private = {_session_id(ref) for ref in policy["private_sessions"]}
+        out = []
+        for row in rows:
+            source, ident, cwd = row["source_name"], row["session_id"], row["cwd"]
+            ident_key = _session_id(ident)
+            if (source, ident) not in typed or ident_key in private or ident_key in policy.get("sessions", {}):
+                continue
+            if access.is_agent_workspace(cwd) or is_codex_gui_chat(source, ident, cwd, origins):
+                continue
+            level = (policy["projects"].get(project_key(source, cwd)) or {}).get("level")
+            if level == "exclude" or (level == "team" and not is_catch_all_dir(cwd)):
+                continue
+            seen = data["sessions"].get(row["source_ref"])
+            if seen and int(row["chunks"]) < 2 * max(int(seen.get("chunks") or 0), 25):
+                continue
+            origin = origins.get(ident_key) or {}
+            hosted = ident_key in hop or origin.get("originator") == "codex-tui" or origin.get("source") == "cli"
+            out.append({**dict(row), "hop": ident_key in hop, "project_level": level, "_rank": hosted})
+        out.sort(key=lambda s: (not s["_rank"], -int(s["chunks"]), s["last"] or ""))
+        return out
+
+    def session_digest(self, conn: sqlite3.Connection, session: dict[str, Any]) -> str:
+        source, ident = session["source_name"], session["session_id"]
+        title = conn.execute(
+            "SELECT title FROM trajectory_chunks WHERE source_ref = ? ORDER BY updated_at DESC LIMIT 1",
+            (session["source_ref"],),
+        ).fetchone()
+        session["title"] = str(title["title"] or "")[:120] if title else ""
+        prompts = [str(row["text"]) for row in conn.execute(
+            "SELECT text FROM prompt_history WHERE source_name = ? AND session_id = ? ORDER BY ts", (source, ident))]
+        sensitive = [p for p in prompts if any(w in p.lower() for w in _SENSITIVE_WORDS)]
+        picked = list(dict.fromkeys(prompts[:6] + prompts[-6:] + sensitive[:8]))
+        lines = [
+            f"### {session['source_ref']}", f"title: {session['title']}", f"folder: {session['cwd']}",
+            f"size: {session['chunks']} chunks, {len(prompts)} owner requests, last active {str(session['last'])[:10]}",
+            "owner's requests:",
+        ]
+        lines += [f"- {' '.join(p.split())[:220]}" for p in picked]
+        return redact_text("\n".join(lines))
+
+    def run_sessions(self, limit: int | None = None) -> dict[str, Any]:
+        """Review the next sessions and record recommendations. Sharing still
+        takes the owner's yes, but a shared session that has since turned
+        personal is taken back straight away."""
+        data = self.suggestions()
+        todo = self.session_candidates(data)[: limit or self.sessions_per_run]
+        todo += self._shared_grown(data)
+        new_team = 0
+        for start in range(0, len(todo), self.session_batch_size):
+            batch = todo[start:start + self.session_batch_size]
+            try:
+                with self._connect() as conn:
+                    message = "\n\n".join(self.session_digest(conn, s) for s in batch)
+                results = self._ask_json(SESSION_REVIEW_PROMPT, message)
+            except Exception as exc:  # keep going; the next run retries
+                log.warning("sharing session review failed: %s", exc)
+                continue
+            by_ref = {str(item.get("ref")): item for item in results if isinstance(item, dict)}
+            for session in batch:
+                result = by_ref.get(session["source_ref"])
+                if not result:
+                    continue
+                level = "team" if result.get("level") == "team" else "owner"
+                data["sessions"][session["source_ref"]] = {
+                    "level": level, "confidence": str(result.get("confidence") or "low"),
+                    "reason": str(result.get("reason") or "")[:300], "title": session.get("title", ""),
+                    "source": session["source_name"], "cwd": session["cwd"], "chunks": int(session["chunks"]),
+                    "last": session["last"], "hop": bool(session.get("hop")), "at": _now(),
+                }
+                if session.get("shared") and level != "team":
+                    self.state.sharing.decide_session(session["source_ref"], "owner", by="reviewer",
+                                                      chunks=int(session["chunks"]))
+                    log.info("sharing: took back %s, it no longer looks like shareable work", session["source_ref"])
+                elif session.get("shared"):
+                    self.state.sharing.decide_session(session["source_ref"], "team", by="owner",
+                                                      chunks=int(session["chunks"]))
+                elif level == "team":
+                    new_team += 1
+            self._save(data)
+        if new_team:
+            self._notify_owner(data)
+        return {"reviewed": len(todo), "recommended": new_team}
+
+    def _shared_grown(self, data: dict[str, Any]) -> list[dict[str, Any]]:
+        """Shared sessions that kept growing: their new content needs a look."""
+        shared = {ident: s for ident, s in self.state.sharing.snapshot().get("sessions", {}).items()
+                  if s.get("level") == "team"}
+        if not shared:
+            return []
+        marks = ",".join("?" for _ in shared)
+        with self._connect() as conn:
+            rows = conn.execute(
+                f"""SELECT source_ref, source_name, session_id, cwd, COUNT(*) AS chunks, MAX(updated_at) AS last
+                    FROM trajectory_chunks WHERE session_id IN ({marks}) GROUP BY source_ref""", list(shared),
+            ).fetchall()
+        return [
+            {**dict(row), "shared": True} for row in rows
+            if int(row["chunks"]) >= int(shared[_session_id(row["session_id"])].get("chunks") or 0) + 25
+        ]
+
+    def _notify_owner(self, data: dict[str, Any]) -> None:
+        """At most one nudge a day, in the owner's Discord DM."""
+        owner = str(self.state.config.imported_owner_actor_id or "")
+        today = _now()[:10]
+        try:
+            if json.loads(self.notify_path.read_text()).get("date") == today:
+                return
+        except (OSError, ValueError):
+            pass
+        waiting = self.recommended(data)
+        if not waiting or not owner.isdigit():
+            return
+        top = "\n".join(f"- **{s['title'] or s['ref']}**: {s['reason']}" for s in waiting[:5])
+        item = {
+            "id": f"sharing-{today}", "platform": "discord", "target_user_id": owner,
+            "text": f"I recommend sharing {len(waiting)} more session{'' if len(waiting) == 1 else 's'} with your "
+                    f"team. Nothing is shared until you accept (Mac app → Team sharing).\n{top}",
+            "created_at": _now(),
+        }
+        with (Path(self.state.config.state_dir) / "outbox.jsonl").open("a") as handle:
+            handle.write(json.dumps(item) + "\n")
+        _write_json(self.notify_path, {"date": today})
+
+    def recommended(self, data: dict[str, Any] | None = None) -> list[dict[str, Any]]:
+        """Sessions the agent would share and the owner hasn't answered."""
+        data = data or self.suggestions()
+        policy = self.state.sharing.snapshot()
+        private = {_session_id(ref) for ref in policy["private_sessions"]}
+        waiting = [
+            {"ref": ref, **s} for ref, s in data["sessions"].items()
+            if s.get("level") == "team" and _session_id(ref) not in private
+            and _session_id(ref) not in policy.get("sessions", {})
+        ]
+        rank = {"high": 0, "medium": 1, "low": 2}
+        waiting.sort(key=lambda s: (rank.get(s.get("confidence"), 3), not s.get("hop"), -int(s.get("chunks") or 0)))
+        return waiting
+
+    def _ask_json(self, system: str, message: str) -> list[Any]:
+        result = self.state.provider.run_claude_task(
+            system_prompt=system, message=message, model=self.model, effort="low", with_tools=False, timeout=600,
+        )
+        text = str(result.get("text") or "")
+        start, end = text.find("["), text.rfind("]")
+        return json.loads(text[start:end + 1]) if start >= 0 and end > start else []
 
     def _ask(self, batch: list[dict[str, Any]]) -> dict[str, dict[str, Any]]:
         with self._connect() as conn:

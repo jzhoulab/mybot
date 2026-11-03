@@ -875,7 +875,7 @@ final class AppModel: ObservableObject {
 
     // MARK: team sharing
 
-    var sharingUndecided: Int { sharing.projects.filter { $0.level == nil }.count }
+    var sharingUndecided: Int { sharing.projects.filter { $0.level == nil }.count + sharing.recommended.count }
 
     func loadSharing() {
         SharingClient(config: config).load { [weak self] state in
@@ -923,6 +923,17 @@ final class AppModel: ObservableObject {
     func setSessionPrivate(_ ref: String, isPrivate: Bool) {
         SharingClient(config: config).post(["action": "session", "ref": ref, "private": isPrivate]) { [weak self] state in
             if let state { self?.applySharing(state) }
+        }
+    }
+
+    func shareSessions(_ refs: [String], share: Bool) {
+        let set = Set(refs)
+        let moved = sharing.recommended.filter { set.contains($0.ref) }
+        sharing.recommended.removeAll { set.contains($0.ref) }
+        if share { sharing.shared.append(contentsOf: moved) } else { sharing.shared.removeAll { set.contains($0.ref) } }
+        SharingClient(config: config).post(["action": "share_sessions", "refs": refs, "level": share ? "team" : "owner"]) { [weak self] state in
+            guard let self else { return }
+            if let state { self.applySharing(state) } else { self.lastError = "Couldn't save the sharing choice" }
         }
     }
 

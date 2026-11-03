@@ -44,9 +44,36 @@ enum SharingLevel {
     }
 }
 
+/// One session the agent recommends sharing, or one already shared.
+struct SharedSession: Identifiable, Hashable {
+    var id: String { ref }
+    let ref: String
+    let title: String
+    let cwd: String
+    let reason: String
+    let confidence: String
+    let chunks: Int
+    let hop: Bool
+
+    init?(_ obj: [String: Any]) {
+        guard let ref = obj["ref"] as? String else { return nil }
+        self.ref = ref
+        title = (obj["title"] as? String) ?? ""
+        cwd = (obj["cwd"] as? String) ?? ""
+        reason = (obj["reason"] as? String) ?? ""
+        confidence = (obj["confidence"] as? String) ?? ""
+        chunks = (obj["chunks"] as? Int) ?? 0
+        hop = (obj["hop"] as? Bool) ?? false
+    }
+
+    var displayFolder: String { (cwd as NSString).abbreviatingWithTildeInPath }
+}
+
 struct SharingState {
     var mode = "reviewed"
     var projects: [SharingProject] = []
+    var recommended: [SharedSession] = []
+    var shared: [SharedSession] = []
     var reviewing = false
     var reviewDone = 0
     var reviewTotal = 0
@@ -90,6 +117,8 @@ struct SharingClient {
         state.reviewing = (reviewer["running"] as? Bool) ?? false
         state.reviewDone = (reviewer["done"] as? Int) ?? 0
         state.reviewTotal = (reviewer["total"] as? Int) ?? 0
+        state.recommended = ((obj["recommended_sessions"] as? [[String: Any]]) ?? []).compactMap(SharedSession.init)
+        state.shared = ((obj["shared_sessions"] as? [[String: Any]]) ?? []).compactMap(SharedSession.init)
         state.projects = ((obj["projects"] as? [[String: Any]]) ?? []).compactMap { p in
             guard let key = p["key"] as? String else { return nil }
             var suggestion: SharingSuggestion?
@@ -129,11 +158,13 @@ struct SharingView: View {
             ScrollView {
                 VStack(alignment: .leading, spacing: 14) {
                     intro
+                    recommendedSessions
                     suggestedSection("team", "Suggested for your team")
                     suggestedSection("owner", "Suggested only for you")
                     suggestedSection("exclude", "Suggested to exclude from the index")
                     section("To decide", undecided.filter { $0.suggestion == nil })
                     section("Shared with your team", model.sharing.projects.filter { $0.level == "team" })
+                    sharedSessions
                     section("Only you", model.sharing.projects.filter { $0.level == "owner" })
                     section("Excluded", model.sharing.projects.filter { $0.level == "exclude" })
                 }
@@ -179,6 +210,73 @@ struct SharingView: View {
                 .help("Apply each suggested level, and make the flagged sessions private")
             }
         }
+    }
+
+    /// Single sessions worth sharing, whatever folder they started from.
+    @ViewBuilder
+    private var recommendedSessions: some View {
+        let sessions = model.sharing.recommended
+        let sure = sessions.filter { $0.confidence == "high" }
+        if !sessions.isEmpty {
+            VStack(alignment: .leading, spacing: 6) {
+                HStack {
+                    Text("RECOMMENDED SESSIONS · \(sessions.count)")
+                        .font(.system(size: 9.5, weight: .heavy)).tracking(0.5).foregroundStyle(.secondary)
+                    Spacer()
+                    if !sure.isEmpty {
+                        Button("Share the \(sure.count) high-confidence") {
+                            model.shareSessions(sure.map(\.ref), share: true)
+                        }
+                        .font(.system(size: 10.5, weight: .semibold)).buttonStyle(.plain)
+                        .foregroundStyle(Palette.accent)
+                    }
+                }
+                ForEach(sessions) { session in
+                    sessionRow(session) {
+                        Button("Keep") { model.shareSessions([session.ref], share: false) }
+                            .buttonStyle(.plain).font(.system(size: 10.5)).foregroundStyle(.secondary)
+                        Button("Share") { model.shareSessions([session.ref], share: true) }
+                            .controlSize(.small)
+                    }
+                }
+            }
+        }
+    }
+
+    @ViewBuilder
+    private var sharedSessions: some View {
+        if !model.sharing.shared.isEmpty {
+            VStack(alignment: .leading, spacing: 6) {
+                Text("SHARED SESSIONS · \(model.sharing.shared.count)")
+                    .font(.system(size: 9.5, weight: .heavy)).tracking(0.5).foregroundStyle(.secondary)
+                ForEach(model.sharing.shared) { session in
+                    sessionRow(session) {
+                        Button("Stop sharing") { model.shareSessions([session.ref], share: false) }
+                            .buttonStyle(.plain).font(.system(size: 10.5)).foregroundStyle(.secondary)
+                    }
+                }
+            }
+        }
+    }
+
+    private func sessionRow<Actions: View>(_ session: SharedSession, @ViewBuilder actions: () -> Actions) -> some View {
+        VStack(alignment: .leading, spacing: 3) {
+            HStack(spacing: 7) {
+                Text(session.title.isEmpty ? session.ref : session.title)
+                    .font(.system(size: 11.5, weight: .medium)).lineLimit(1).help(session.ref)
+                Spacer()
+                actions()
+            }
+            Text(([session.hop ? "hop" : nil, session.displayFolder, session.chunks > 0 ? "\(session.chunks) chunks" : nil] as [String?])
+                .compactMap { $0 }.joined(separator: " · "))
+                .font(.system(size: 9.5)).foregroundStyle(.tertiary).lineLimit(1)
+            if !session.reason.isEmpty {
+                Text(session.reason).font(.system(size: 10)).foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+        }
+        .padding(9)
+        .background(RoundedRectangle(cornerRadius: 9, style: .continuous).fill(Color.primary.opacity(0.04)))
     }
 
     /// Undecided projects the agent put at one level, adoptable in one click.
