@@ -110,6 +110,10 @@ class TrajectoryAccessAccount:
     # Per-cluster automated exclusion (origin_detail values: "subagent", "sdk",
     # "exec", "no-user-turns"). exclude_automated=True still means all of them.
     excluded_origin_details: list[str] = field(default_factory=list)
+    # A snapshot repeats live session ids, so its ids carry the root's name. A
+    # second CLI home holds different sessions: false keeps their plain ids,
+    # the ones hop and the prompt history know them by.
+    scope_session_ids: bool = True
     # Owner-only visibility: sessions from these workdirs/classes ARE indexed
     # and searchable by the owner, but never served to other actors (guest
     # owner-access included). private_workdirs is EXACT cwd match only — a
@@ -137,7 +141,7 @@ class TrajectoryAccessAccount:
         return cached
 
     def scoped_session_id(self, raw_session_id: str) -> str:
-        if self.name and self.name != "default":
+        if self.scope_session_ids and self.name and self.name != "default":
             return f"{self.name}:{raw_session_id}"
         return raw_session_id
 
@@ -260,6 +264,7 @@ class TrajectoryAccessAccount:
             "excluded_workdir_classes": self.excluded_workdir_classes,
             "excluded_entrypoints": self.excluded_entrypoints,
             "excluded_session_ids": self.excluded_session_ids,
+            "scope_session_ids": self.scope_session_ids,
             "exclude_automated": self.exclude_automated,
             "excluded_origin_details": self.excluded_origin_details,
             "private_workdirs": self.private_workdirs,
@@ -418,6 +423,7 @@ def _coerce_accounts(source_name: str, raw: Any) -> list[TrajectoryAccessAccount
                 excluded_entrypoints=excluded_entrypoints,
                 excluded_session_ids=excluded_session_ids,
                 exclude_automated=bool(item.get("exclude_automated", False)),
+                scope_session_ids=bool(item.get("scope_session_ids", True)),
                 excluded_origin_details=[
                     str(value).strip().lower()
                     for value in item.get("excluded_origin_details", []) or []

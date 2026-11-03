@@ -2198,6 +2198,17 @@ class AppState:
             source_accounts[0],
         )
         value = str(value or "").strip()
+        # A folder is out (or back) whichever CLI home its sessions are under.
+        if action in {"exclude", "unexclude"} and kind == "workdir" and value:
+            for other in source_accounts:
+                if other is account:
+                    continue
+                if action == "exclude" and value not in other.excluded_workdirs:
+                    other.excluded_workdirs.append(value)
+                elif action == "unexclude":
+                    other.excluded_workdirs[:] = [
+                        item for item in other.excluded_workdirs if item.lower() != value.lower()
+                    ]
 
         if action == "set_visibility":
             account.visibility_mode = normalize_visibility_mode(value)

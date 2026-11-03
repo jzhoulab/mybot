@@ -8,6 +8,7 @@ from unittest import mock
 
 from app import sharing_review as sr
 from app.server import AppState
+from sources.access import TrajectoryAccessAccount
 
 
 HOME = str(Path.home())
@@ -18,6 +19,15 @@ ORIGINS = {
     "old-gui": {"originator": "", "source": "vscode"},
     "exec": {"originator": "codex_exec", "source": "exec"},
 }
+
+
+class SecondHomeTest(unittest.TestCase):
+    def test_only_a_snapshot_prefixes_session_ids(self):
+        snapshot = TrajectoryAccessAccount(source_name="claude", name="snapshot", base_dir="/x")
+        home = TrajectoryAccessAccount(source_name="claude", name="fable", base_dir="/y", scope_session_ids=False)
+        self.assertEqual(snapshot.scoped_session_id("abc"), "snapshot:abc")
+        self.assertEqual(home.scoped_session_id("abc"), "abc")
+        self.assertFalse(home.to_json()["scope_session_ids"])
 
 
 class GuiChatTest(unittest.TestCase):
