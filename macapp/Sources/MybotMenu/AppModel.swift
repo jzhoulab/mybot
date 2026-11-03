@@ -386,7 +386,7 @@ final class AppModel: ObservableObject {
     /// keeps its status color).
     private var renderedIconKey = ""
     /// Things waiting on the owner: new projects and recommended sessions.
-    private var iconBadge: Int { newProjects.count + sharing.recommended.count }
+    private var iconBadge: Int { newProjects.count + sharing.recommended.count + sharing.decisions.count }
 
     private func renderIcon() {
         let key = "\(mood)-\(iconBadge)"
@@ -881,7 +881,7 @@ final class AppModel: ObservableObject {
 
     // MARK: team sharing
 
-    var sharingUndecided: Int { sharing.projects.filter { $0.level == nil }.count + sharing.recommended.count }
+    var sharingUndecided: Int { sharing.projects.filter { $0.level == nil }.count + sharing.recommended.count + sharing.decisions.count }
 
     func loadSharing() {
         SharingClient(config: config).load { [weak self] state in
@@ -954,7 +954,8 @@ final class AppModel: ObservableObject {
     /// A system notification when newly recommended sessions wait, at most
     /// once a day; clicking it opens Team sharing here.
     private func notifyRecommendations() {
-        let waiting = sharing.recommended
+        let asking = sharing.decisions
+        let waiting = asking + sharing.recommended
         guard !waiting.isEmpty, Bundle.main.bundlePath.hasSuffix(".app") else { return }
         let defaults = UserDefaults.standard
         let today = String(ISO8601DateFormatter().string(from: Date()).prefix(10))
@@ -964,7 +965,9 @@ final class AppModel: ObservableObject {
         center.requestAuthorization(options: [.alert, .sound]) { granted, _ in
             guard granted else { return }
             let content = UNMutableNotificationContent()
-            content.title = "mybot recommends sharing \(waiting.count) session\(waiting.count == 1 ? "" : "s")"
+            content.title = asking.isEmpty
+                ? "mybot recommends sharing \(waiting.count) session\(waiting.count == 1 ? "" : "s")"
+                : "mybot needs your decision on \(asking.count) session\(asking.count == 1 ? "" : "s")"
             content.body = waiting.prefix(3).map(\.title).joined(separator: "\n")
             center.add(UNNotificationRequest(identifier: "sharing-\(today)", content: content, trigger: nil))
         }
@@ -974,8 +977,9 @@ final class AppModel: ObservableObject {
 
     func shareSessions(_ refs: [String], share: Bool) {
         let set = Set(refs)
-        let moved = sharing.recommended.filter { set.contains($0.ref) }
+        let moved = (sharing.recommended + sharing.decisions).filter { set.contains($0.ref) }
         sharing.recommended.removeAll { set.contains($0.ref) }
+        sharing.decisions.removeAll { set.contains($0.ref) }
         if share { sharing.shared.append(contentsOf: moved) } else { sharing.shared.removeAll { set.contains($0.ref) } }
         SharingClient(config: config).post(["action": "share_sessions", "refs": refs, "level": share ? "team" : "owner"]) { [weak self] state in
             guard let self else { return }

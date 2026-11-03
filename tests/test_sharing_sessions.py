@@ -153,7 +153,7 @@ class ReviewerTest(unittest.TestCase):
 
     def test_hop_name_shown_and_kept_after_it_closes(self):
         self.answers = [{"ref": "claude:hopc", "name": "n", "level": "team", "confidence": "high", "reason": "r"},
-                        {"ref": "codex:tui", "name": "n", "level": "team", "confidence": "low", "reason": "r"}]
+                        {"ref": "codex:tui", "name": "n", "level": "team", "confidence": "medium", "reason": "r"}]
         self.reviewer.run_sessions()
         by_ref = {s["ref"]: s for s in self.reviewer.recommended()}
         self.assertEqual(by_ref["claude:hopc"]["hop_name"], "alpha-claude")
@@ -161,6 +161,42 @@ class ReviewerTest(unittest.TestCase):
         self.assertFalse(by_ref["codex:tui"]["hop"])
         self.hop = {}  # closed, or hop isn't used at all
         self.assertEqual({s["ref"]: s["hop_name"] for s in self.reviewer.recommended()}["claude:hopc"], "alpha-claude")
+
+    def test_unsure_sessions_are_put_to_the_owner_not_guessed(self):
+        self.answers = [{"ref": "codex:tui", "name": "Mixed", "level": "ask", "confidence": "low",
+                         "reason": "r", "question": "Is the budget part shareable?"},
+                        {"ref": "claude:hopc", "name": "Thin", "level": "owner", "confidence": "low", "reason": "r"}]
+        self.reviewer.run_sessions()
+        self.assertEqual(self.reviewer.recommended(), [])
+        waiting = self.reviewer.decisions()
+        self.assertEqual([s["ref"] for s in waiting], ["codex:tui", "claude:hopc"])  # real questions first
+        self.assertEqual(waiting[0]["question"], "Is the budget part shareable?")
+        self.assertTrue(self.state.sharing.hidden_from_team("codex", HOME, "codex:tui"))
+
+    def test_answers_teach_later_reviews(self):
+        self.answers = [{"ref": "codex:tui", "name": "Mixed work", "level": "ask", "confidence": "low",
+                         "reason": "r", "question": "Share budget talk?"},
+                        {"ref": "claude:hopc", "name": "Other", "level": "ask", "confidence": "low",
+                         "reason": "r", "question": "Share this?"}]
+        self.reviewer.run_sessions()
+        self.state.sharing.decide_session("codex:tui", "owner")
+        self.assertEqual([s["ref"] for s in self.reviewer.decisions()], ["claude:hopc"])
+        examples = self.reviewer.preference_examples()
+        self.assertIn("Mixed work", examples)
+        self.assertIn("Share budget talk? → owner chose to keep private", examples)
+        # The unanswered question gets another look, now with that answer.
+        self.answers = [{"ref": "claude:hopc", "name": "Other", "level": "owner", "confidence": "high", "reason": "like it"}]
+        self.reviewer.run_sessions()
+        self.assertIn("owner chose to keep private", self.seen)
+        self.assertEqual(self.reviewer.decisions(), [])
+
+    def test_shared_session_the_agent_doubts_goes_to_the_owner(self):
+        self.state.sharing.decide_session("codex:tui", "team", chunks=1)
+        self.answers = [{"ref": "codex:tui", "name": "n", "level": "ask", "confidence": "low", "reason": "r",
+                         "question": "Still fine to share?"}]
+        self.reviewer.run_sessions()
+        self.assertFalse(self.state.sharing.session_shared("codex:tui"))
+        self.assertEqual([s["ref"] for s in self.reviewer.decisions()], ["codex:tui"])
 
     def test_shared_session_that_turned_personal_is_taken_back(self):
         self.state.sharing.decide_session("codex:tui", "team", chunks=1)

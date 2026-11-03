@@ -55,6 +55,7 @@ struct SharedSession: Identifiable, Hashable {
     let chunks: Int
     let hop: Bool
     let hopName: String
+    let question: String
 
     init?(_ obj: [String: Any]) {
         guard let ref = obj["ref"] as? String else { return nil }
@@ -62,6 +63,7 @@ struct SharedSession: Identifiable, Hashable {
         let name = (obj["name"] as? String) ?? ""
         title = name.isEmpty ? ((obj["title"] as? String) ?? "") : name
         hopName = (obj["hop_name"] as? String) ?? ""
+        question = (obj["question"] as? String) ?? ""
         cwd = (obj["cwd"] as? String) ?? ""
         reason = (obj["reason"] as? String) ?? ""
         confidence = (obj["confidence"] as? String) ?? ""
@@ -79,6 +81,7 @@ struct SharingState {
     var mode = "reviewed"
     var projects: [SharingProject] = []
     var recommended: [SharedSession] = []
+    var decisions: [SharedSession] = []
     var shared: [SharedSession] = []
     var reviewing = false
     var reviewDone = 0
@@ -124,6 +127,7 @@ struct SharingClient {
         state.reviewDone = (reviewer["done"] as? Int) ?? 0
         state.reviewTotal = (reviewer["total"] as? Int) ?? 0
         state.recommended = ((obj["recommended_sessions"] as? [[String: Any]]) ?? []).compactMap(SharedSession.init)
+        state.decisions = ((obj["decision_sessions"] as? [[String: Any]]) ?? []).compactMap(SharedSession.init)
         state.shared = ((obj["shared_sessions"] as? [[String: Any]]) ?? []).compactMap(SharedSession.init)
         state.projects = ((obj["projects"] as? [[String: Any]]) ?? []).compactMap { p in
             guard let key = p["key"] as? String else { return nil }
@@ -155,7 +159,8 @@ struct SharingView: View {
     @ObservedObject var model: AppModel
 
     private var undecided: [SharingProject] { model.sharing.projects.filter { $0.level == nil } }
-    private var acceptable: [SharingProject] { undecided.filter { $0.suggestion != nil } }
+    private var acceptable: [SharingProject] { undecided.filter { $0.suggestion != nil && !isUnsure($0) } }
+    private func isUnsure(_ project: SharingProject) -> Bool { project.suggestion?.confidence == "low" }
 
     var body: some View {
         VStack(spacing: 0) {
@@ -164,6 +169,7 @@ struct SharingView: View {
             ScrollView {
                 VStack(alignment: .leading, spacing: 14) {
                     intro
+                    needYourDecision
                     recommendedSessions
                     suggestedSection("team", "Suggested for your team")
                     suggestedSection("owner", "Suggested only for you")
@@ -207,13 +213,38 @@ struct SharingView: View {
                 Button {
                     model.acceptSharingSuggestions(acceptable.map(\.key))
                 } label: {
-                    Text("Accept all \(acceptable.count) suggestions")
+                    Text("Accept all \(acceptable.count) project suggestions")
                         .font(.system(size: 11, weight: .semibold))
                         .padding(.horizontal, 12).padding(.vertical, 6)
                         .background(Capsule().fill(Palette.accent)).foregroundStyle(.white)
                 }
                 .buttonStyle(.plain)
-                .help("Apply each suggested level, and make the flagged sessions private")
+                .help("Apply each suggested project level, and make the flagged sessions private. Recommended sessions and decisions are answered separately.")
+            }
+        }
+    }
+
+    /// Where the agent wasn't sure. Each answer teaches it the owner's taste.
+    @ViewBuilder
+    private var needYourDecision: some View {
+        let sessions = model.sharing.decisions
+        let projects = undecided.filter(isUnsure)
+        if !sessions.isEmpty || !projects.isEmpty {
+            VStack(alignment: .leading, spacing: 6) {
+                Text("NEED YOUR DECISION · \(sessions.count + projects.count)")
+                    .font(.system(size: 9.5, weight: .heavy)).tracking(0.5).foregroundStyle(Palette.accent)
+                Text("The agent couldn't tell. Your answers teach it what you'd share, so it asks less over time.")
+                    .font(.system(size: 10)).foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+                ForEach(sessions) { session in
+                    sessionRow(session, emphasized: session.question) {
+                        Button("Keep private") { model.shareSessions([session.ref], share: false) }
+                            .buttonStyle(.plain).font(.system(size: 10.5)).foregroundStyle(.secondary)
+                        Button("Share") { model.shareSessions([session.ref], share: true) }
+                            .controlSize(.small)
+                    }
+                }
+                ForEach(projects) { row($0) }
             }
         }
     }
@@ -265,7 +296,8 @@ struct SharingView: View {
         }
     }
 
-    private func sessionRow<Actions: View>(_ session: SharedSession, @ViewBuilder actions: () -> Actions) -> some View {
+    private func sessionRow<Actions: View>(_ session: SharedSession, emphasized: String = "",
+                                           @ViewBuilder actions: () -> Actions) -> some View {
         VStack(alignment: .leading, spacing: 3) {
             HStack(spacing: 7) {
                 Text(session.title.isEmpty ? session.ref : session.title)
@@ -276,6 +308,10 @@ struct SharingView: View {
             Text(([session.hopLabel, session.displayFolder, session.chunks > 0 ? "\(session.chunks) chunks" : nil] as [String?])
                 .compactMap { $0 }.joined(separator: " · "))
                 .font(.system(size: 9.5)).foregroundStyle(.tertiary).lineLimit(1)
+            if !emphasized.isEmpty {
+                Text(emphasized).font(.system(size: 10.5, weight: .medium))
+                    .fixedSize(horizontal: false, vertical: true)
+            }
             if !session.reason.isEmpty {
                 Text(session.reason).font(.system(size: 10)).foregroundStyle(.secondary)
                     .fixedSize(horizontal: false, vertical: true)
@@ -288,7 +324,7 @@ struct SharingView: View {
     /// Undecided projects the agent put at one level, adoptable in one click.
     @ViewBuilder
     private func suggestedSection(_ level: String, _ title: String) -> some View {
-        let projects = undecided.filter { $0.suggestion?.level == level }
+        let projects = undecided.filter { $0.suggestion?.level == level && !isUnsure($0) }
         if !projects.isEmpty {
             VStack(alignment: .leading, spacing: 6) {
                 HStack {

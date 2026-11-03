@@ -2657,6 +2657,7 @@ class AppState:
             "projects": rows,
             "private_sessions": decided["private_sessions"],
             "recommended_sessions": self.sharing_reviewer.recommended(),
+            "decision_sessions": self.sharing_reviewer.decisions(),
             "shared_sessions": shared_sessions,
             "reviewer": self.sharing_reviewer.status,
         }

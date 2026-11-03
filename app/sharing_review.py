@@ -14,6 +14,8 @@ Two layers, kept apart on purpose:
   level with a reason, and flags personal sessions inside work projects. It
   also goes through individual sessions no teammate can see yet and recommends
   the ones worth sharing. It never decides; the owner confirms in the menu app.
+  Where the agent is unsure it asks instead of guessing ("Need your decision"),
+  and the owner's answers, those above all, guide its later reviews.
 
 Chats started in the Codex GUI outside any project are where personal and
 logistics questions go: they are never recommended and can't be shared. Where
@@ -291,7 +293,8 @@ biosketches, progress reports, resubmission responses); personal email and corre
 about specific people's private matters. Also mixed or unclear projects.
 - "exclude": noise not worth indexing — throwaway scratch dirs, automated test runs, generated \
 agent workspaces with no human work.
-When in doubt between team and owner, choose owner.
+When in doubt between team and owner, choose owner with confidence "low", which puts it to the owner \
+as a question. Past decisions, when given below, are how this owner actually decides: follow their pattern.
 
 Also flag individual sessions inside a project you'd mark "team" that look personal or confidential \
 by the same rules (e.g. a tax question asked from a work folder, or grant writing inside a code \
@@ -314,12 +317,24 @@ travel and logistics; job searches, tenure/promotion, salaries, HR; grading, eva
 letters, admissions; confidential peer review; the owner's own grant and funding applications; personal \
 email and correspondence; private matters of specific people; commercial or side projects outside the \
 lab's research; and sessions too thin to be useful. A mostly-work session containing some of the above \
-is "owner". When unsure, "owner".
+is "owner".
+
+Don't guess. When you can't tell which way the owner would go (it could be either, a mostly-work session \
+with a sensitive part, a project you can't place), answer "ask" and write the "question" that would settle \
+it. These are the most useful answers you can give: the owner's reply teaches you their preference.
+Past decisions, when given below, are how this owner actually decides: follow their pattern over these \
+general rules.
 
 Reply with ONLY a JSON array, one object per session:
 [{"ref": "<ref>", "name": "<what the session is about, 3-7 words, not its first request>", \
-"level": "team|owner", "confidence": "high|medium|low", \
-"reason": "<one short plain sentence: for team, what a colleague could learn from it>"}]"""
+"level": "team|owner|ask", "confidence": "high|medium|low", \
+"reason": "<one short plain sentence: for team, what a colleague could learn from it>", \
+"question": "<for ask: the one question for the owner, else empty>"}]"""
+
+
+def needs_decision(session: dict[str, Any]) -> bool:
+    """The agent asked, or would only be guessing."""
+    return session.get("level") == "ask" or session.get("confidence") == "low"
 
 
 class SharingReviewer:
@@ -519,6 +534,8 @@ class SharingReviewer:
                    GROUP BY source_ref"""
             ).fetchall()
         private = {_session_id(ref) for ref in policy["private_sessions"]}
+        last_answer = max((str(s.get("decided_at") or "") for s in policy.get("sessions", {}).values()
+                           if s.get("by") == "owner"), default="")
         out = []
         for row in rows:
             source, ident, cwd = row["source_name"], row["session_id"], row["cwd"]
@@ -531,6 +548,11 @@ class SharingReviewer:
             if level == "exclude" or (level == "team" and not is_catch_all_dir(cwd)):
                 continue
             seen = data["sessions"].get(row["source_ref"])
+            if seen and needs_decision(seen) and str(seen.get("at") or "") < last_answer:
+                # The owner has answered something since: it may settle this.
+                out.append({**dict(row), "hop": ident_key in hop, "hop_name": hop.get(ident_key, ""),
+                            "project_level": None, "_rank": True})
+                continue
             grown = not seen or int(row["chunks"]) >= 2 * max(int(seen.get("chunks") or 0), 25)
             unnamed = bool(seen) and seen.get("level") == "team" and not seen.get("name")
             if not grown and not unnamed:
@@ -573,7 +595,7 @@ class SharingReviewer:
             try:
                 with self._connect() as conn:
                     message = "\n\n".join(self.session_digest(conn, s) for s in batch)
-                results = self._ask_json(SESSION_REVIEW_PROMPT, message)
+                results = self._ask_json(SESSION_REVIEW_PROMPT, message + self.preference_examples(data))
             except Exception as exc:  # keep going; the next run retries
                 log.warning("sharing session review failed: %s", exc)
                 continue
@@ -582,8 +604,9 @@ class SharingReviewer:
                 result = by_ref.get(session["source_ref"])
                 if not result:
                     continue
-                level = "team" if result.get("level") == "team" else "owner"
+                level = result.get("level") if result.get("level") in ("team", "owner") else "ask"
                 data["sessions"][session["source_ref"]] = {
+                    "question": str(result.get("question") or "")[:300],
                     "level": level, "confidence": str(result.get("confidence") or "low"),
                     "name": str(result.get("name") or "")[:80],
                     "reason": str(result.get("reason") or "")[:300], "title": session.get("title", ""),
@@ -597,7 +620,7 @@ class SharingReviewer:
                 elif session.get("shared"):
                     self.state.sharing.decide_session(session["source_ref"], "team", by="owner",
                                                       chunks=int(session["chunks"]))
-                elif level == "team":
+                elif level == "team" and not needs_decision(data["sessions"][session["source_ref"]]):
                     new_team += 1
             self._save(data)
         return {"reviewed": len(todo), "recommended": new_team}
@@ -619,6 +642,46 @@ class SharingReviewer:
             if int(row["chunks"]) >= int(shared[_session_id(row["session_id"])].get("chunks") or 0) + 25
         ]
 
+    def decisions(self, data: dict[str, Any] | None = None) -> list[dict[str, Any]]:
+        """Sessions the agent can't call. A shared one it took back because it
+        was no longer sure comes here too: the owner has the last word."""
+        data = data or self.suggestions()
+        policy = self.state.sharing.snapshot()
+        private = {_session_id(ref) for ref in policy["private_sessions"]}
+        answered = {ident for ident, s in policy.get("sessions", {}).items() if s.get("by") != "reviewer"}
+        waiting = [
+            {"ref": ref, **s} for ref, s in data["sessions"].items()
+            if needs_decision(s) and _session_id(ref) not in private and _session_id(ref) not in answered
+        ]
+        self.with_hop_names(waiting)
+        waiting.sort(key=lambda s: (s.get("level") != "ask", not s.get("hop"), -int(s.get("chunks") or 0)))
+        return waiting
+
+    def preference_examples(self, data: dict[str, Any] | None = None, limit: int = 30) -> str:
+        """What the owner actually chose, for the agent to learn from: the
+        questions it asked and the calls it got wrong first."""
+        data = data or self.suggestions()
+        by_id = {_session_id(ref): s for ref, s in data["sessions"].items()}
+        rows = []
+        for ident, decision in self.state.sharing.snapshot().get("sessions", {}).items():
+            if decision.get("by") != "owner":
+                continue
+            seen = by_id.get(ident) or {}
+            shared = decision.get("level") == "team"
+            overruled = seen.get("level") in ("team", "owner") and seen.get("level") != decision.get("level")
+            rows.append(((not needs_decision(seen), not overruled, str(decision.get("decided_at") or "")),
+                         f"- {seen.get('name') or seen.get('title') or ident} ({seen.get('cwd', '')}): "
+                         f"{seen.get('question') or seen.get('reason') or ''} → owner chose "
+                         f"{'to share' if shared else 'to keep private'}"))
+        if not rows:
+            return ""
+        # Questions first, then overruled calls; newest first inside each group.
+        ordered: list[str] = []
+        for flags in ((False, False), (False, True), (True, False), (True, True)):
+            group = sorted((r for r in rows if r[0][:2] == flags), key=lambda r: r[0][2], reverse=True)
+            ordered += [r[1] for r in group]
+        return redact_text("\n\nPast decisions by this owner:\n" + "\n".join(ordered[:limit]))
+
     def recommended(self, data: dict[str, Any] | None = None) -> list[dict[str, Any]]:
         """Sessions the agent would share and the owner hasn't answered."""
         data = data or self.suggestions()
@@ -626,7 +689,7 @@ class SharingReviewer:
         private = {_session_id(ref) for ref in policy["private_sessions"]}
         waiting = [
             {"ref": ref, **s} for ref, s in data["sessions"].items()
-            if s.get("level") == "team" and _session_id(ref) not in private
+            if s.get("level") == "team" and not needs_decision(s) and _session_id(ref) not in private
             and _session_id(ref) not in policy.get("sessions", {})
         ]
         rank = {"high": 0, "medium": 1, "low": 2}
@@ -656,7 +719,7 @@ class SharingReviewer:
 
     def _ask(self, batch: list[dict[str, Any]]) -> dict[str, dict[str, Any]]:
         with self._connect() as conn:
-            message = "\n\n".join(self.digest(conn, project) for project in batch)
+            message = "\n\n".join(self.digest(conn, project) for project in batch) + self.preference_examples()
         started = time.time()
         result = self.state.provider.run_claude_task(
             system_prompt=REVIEW_SYSTEM_PROMPT,
