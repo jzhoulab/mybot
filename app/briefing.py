@@ -608,6 +608,8 @@ class BriefingRunner:
             + self._AUDIENCE + "\n\n" + self._tool_section()
         )
         message = (
+            "This draft was written by mybot's own editor from the owner's sessions and the "
+            "articles it found; your job is to check it and return the corrected pulse.\n\n"
             "Draft:\n\n" + draft
             + "\n\nCheck: (1) every factual claim about the owner's own work is supported — "
             "verify the overlooked items' pointers quickly with the tools; fix or drop what is "
@@ -619,9 +621,17 @@ class BriefingRunner:
             "or drop the line. Output ONLY the final pulse followed by the "
             "```json block."
         )
-        text = self._agent(label="verifier", system=system, message=message,
-                           effort=self.verify_effort, tools=True, web=True)
-        return text or draft
+        for attempt in range(2):
+            text = self._agent(label="verifier", system=system, message=message,
+                               effort=self.verify_effort, tools=True, web=True)
+            if looks_like_pulse(text, draft):
+                return text
+            log.warning("pulse verifier returned something that isn't a pulse (%d chars, try %d): %r",
+                        len(text or ""), attempt + 1, (text or "")[:200])
+        # Better the editor's unverified draft than a refusal or a fragment.
+        log.warning("pulse verifier failed twice; delivering the editor's draft unverified")
+        return draft
+
 
     # ----------------------------------------------------------------- figures
 
@@ -1519,6 +1529,15 @@ def _session_title(db_path: str | Path, source: dict[str, Any]) -> str:
 def _short_path(path: str) -> str:
     home = str(Path.home())
     return ("~" + path[len(home):]) if path and path.startswith(home) else (path or "")
+
+
+def looks_like_pulse(text: str, draft: str) -> bool:
+    """A checked pulse keeps the draft's shape: its sections, and most of its
+    length (the verifier fixes or drops claims, it doesn't rewrite the whole)."""
+    body = re.split(r"\n```json", text or "", maxsplit=1)[0]
+    sections = len(re.findall(r"(?m)^## ", body))
+    wanted = len(re.findall(r"(?m)^## ", re.split(r"\n```json", draft or "", maxsplit=1)[0]))
+    return bool(body.strip()) and sections >= max(1, wanted - 1) and len(body) >= 0.4 * len(draft or "")
 
 
 def resolve_route(action: dict[str, Any], sessions: dict[str, dict[str, Any]],
