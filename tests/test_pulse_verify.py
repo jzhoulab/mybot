@@ -14,6 +14,7 @@ class VerifyGuardTest(unittest.TestCase):
         runner._tool_section = lambda: ""
         calls = iter(outputs)
         runner._agent = lambda **kwargs: next(calls)
+        runner.dir = __import__("pathlib").Path(__import__("tempfile").mkdtemp())
         with mock.patch.object(briefing.log, "warning"):
             return runner.verify({}, DRAFT)
 
@@ -24,6 +25,11 @@ class VerifyGuardTest(unittest.TestCase):
     def test_good_retry_is_used(self):
         fixed = DRAFT.replace("Article one", "Article one, fixed")
         self.assertEqual(self.run_verify(["", fixed]), fixed)
+
+    def test_narration_before_the_pulse_is_dropped(self):
+        out = self.run_verify(["I have everything verified. Writing the corrected pulse.\n\n" + DRAFT])
+        self.assertEqual(out, DRAFT)
+        self.assertEqual(briefing.strip_preamble("Today's pulse: x\n\n## A"), "Today's pulse: x\n\n## A")
 
     def test_checked_pulse_passes(self):
         self.assertTrue(briefing.looks_like_pulse(DRAFT.replace("- b\n", ""), DRAFT))

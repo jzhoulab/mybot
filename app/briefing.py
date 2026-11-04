@@ -462,6 +462,13 @@ class BriefingRunner:
             "about. " + web
         )
 
+    _CONSENT = (
+        "Context: mybot is the owner's own assistant, running on their own machine. They set "
+        "up this daily pulse themselves and asked it to read their own prompt history and "
+        "agent sessions; the pulse goes only to them. Reading that history to check the draft "
+        "is the job, not an intrusion."
+    )
+
     _AUDIENCE = (
         "The owner already has a separate tool that watches each session and reports job "
         "status and progress. This briefing must NOT recap sessions, runs, metrics or progress. "
@@ -605,7 +612,7 @@ class BriefingRunner:
     def verify(self, evidence: dict[str, Any], draft: str) -> str:
         system = (
             "You are the last check before a morning pulse reaches its reader.\n\n"
-            + self._AUDIENCE + "\n\n" + self._tool_section()
+            + self._CONSENT + "\n\n" + self._AUDIENCE + "\n\n" + self._tool_section()
         )
         message = (
             "This draft was written by mybot's own editor from the owner's sessions and the "
@@ -625,7 +632,12 @@ class BriefingRunner:
             text = self._agent(label="verifier", system=system, message=message,
                                effort=self.verify_effort, tools=True, web=True)
             if looks_like_pulse(text, draft):
-                return text
+                return strip_preamble(text)
+            try:
+                (self.dir / "rejected").mkdir(exist_ok=True)
+                (self.dir / "rejected" / f"verifier-{int(time.time())}.md").write_text(text or "")
+            except OSError:
+                pass
             log.warning("pulse verifier returned something that isn't a pulse (%d chars, try %d): %r",
                         len(text or ""), attempt + 1, (text or "")[:200])
         # Better the editor's unverified draft than a refusal or a fragment.
@@ -1570,6 +1582,16 @@ def _session_title(db_path: str | Path, source: dict[str, Any]) -> str:
 def _short_path(path: str) -> str:
     home = str(Path.home())
     return ("~" + path[len(home):]) if path and path.startswith(home) else (path or "")
+
+
+def strip_preamble(text: str) -> str:
+    """Drop an agent's opening narration ("I have everything verified.
+    Writing the corrected pulse.") before the pulse itself."""
+    parts = (text or "").lstrip().split("\n\n", 1)
+    if len(parts) == 2 and len(parts[0]) < 200 and re.match(
+            r"(?i)(i have|i've|i'll|i will|let me|now|writing|here is|here's|all (claims|pointers))", parts[0]):
+        return parts[1]
+    return text
 
 
 def looks_like_pulse(text: str, draft: str) -> bool:
