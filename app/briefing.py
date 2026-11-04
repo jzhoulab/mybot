@@ -655,6 +655,47 @@ class BriefingRunner:
 
     # ------------------------------------------------------------------ replay
 
+    def reverify(self, day: str) -> dict[str, Any]:
+        """Recover a day whose last step went wrong: check its stored draft
+        again and finish as the run would have (sections, follow-ups,
+        delivery), without redoing the research."""
+        if not re.fullmatch(r"\d{4}-\d{2}-\d{2}", day or ""):
+            raise ValueError("bad date")
+        if not self._lock.acquire(blocking=False):
+            return {"ok": False, "error": "a briefing is already running"}
+        try:
+            path = self.dir / f"{day}{self.suffix}.json"
+            record = json.loads(path.read_text())
+            draft = str(record.get("draft") or "")
+            if not draft:
+                return {"ok": False, "error": "no stored draft for that day"}
+            evidence = dict(record.get("evidence") or {})
+            self.status.update(running=True, stage="verify (recovery)")
+            self._figure_dest = self.figures_root / f"{day}{self.suffix}"
+            text = pulse_figures.prune(self.verify(evidence, draft), self._figure_dest)
+            text, carry = self._split_carry(text)
+            record.update(carry=carry, briefing=text,
+                          open_loops=carry.get("overlooked", []) if isinstance(carry, dict) else [],
+                          topics=carry.get("topics", []) if isinstance(carry, dict) else [])
+            self.status["stage"] = "follow-up actions"
+            record["sections"] = self.structure(text)
+            record["actions"] = self.make_actions(evidence, record["sections"])
+            self._write(day, text, record)
+            path.write_text(json.dumps(record, indent=1, default=str))
+            self.status["stage"] = "deliver"
+            record["delivered"] = self.deliver(day, text, revision=f"-r{int(time.time())}")
+            record["recovered_at"] = datetime.now(timezone.utc).isoformat()
+            path.write_text(json.dumps(record, indent=1, default=str))
+            try:
+                publish_for_hop(getattr(self.state, "briefings", {}) or {self.engine: self})
+            except Exception as exc:  # pragma: no cover
+                log.warning("could not publish pulse for hop: %s", exc)
+            log.info("pulse %s recovered from its stored draft", day)
+            return {"ok": True, "date": day, "chars": len(text)}
+        finally:
+            self.status.update(running=False, stage="")
+            self._lock.release()
+
     def replay(self, source_date: str, model: str, tag: str = "") -> dict[str, Any]:
         """Re-run the pulse pipeline on a stored evidence snapshot with a given
         model, for side-by-side comparison. Nothing is delivered; output goes
@@ -1047,7 +1088,7 @@ class BriefingRunner:
         label = "" if self.engine == "claude" else f" ({ENGINE_LABELS.get(self.engine, self.engine)})"
         return f"Morning pulse{label} — {when}"
 
-    def deliver(self, day: str, text: str) -> dict[str, Any]:
+    def deliver(self, day: str, text: str, revision: str = "") -> dict[str, Any]:
         owner = self.state.config.imported_owner_actor_id
         title = self._title(day)
         sessions = self.state.sessions
@@ -1072,7 +1113,7 @@ class BriefingRunner:
                 log.warning("could not seed DM session: %s", exc)
             with self.outbox_path.open("a") as handle:
                 handle.write(json.dumps({
-                    "id": f"briefing-{day}{self.suffix}",
+                    "id": f"briefing-{day}{self.suffix}{revision}",
                     "platform": "discord",
                     "target_user_id": owner,
                     "text": f"**{title}**\n\n{text}",
@@ -1086,7 +1127,7 @@ class BriefingRunner:
                 }) + "\n")
                 if follow_ups:
                     handle.write(json.dumps({
-                        "id": f"briefing-{day}{self.suffix}-followups",
+                        "id": f"briefing-{day}{self.suffix}{revision}-followups",
                         "platform": "discord",
                         "target_user_id": owner,
                         "text": follow_ups.strip(),

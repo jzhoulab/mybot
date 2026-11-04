@@ -4438,6 +4438,15 @@ class ChatHandler(BaseHTTPRequestHandler):
             threading.Thread(target=lambda: runner.run(force=force), name="briefing-manual", daemon=True).start()
             self.respond_json(202, {"ok": True, "started": True})
             return
+        if self.path == "/briefing/reverify":
+            runner = self.server.state.briefings.get(str(body.get("engine") or "claude"))
+            if runner is None:
+                self.respond_json(404, {"ok": False, "error": "unknown engine"})
+                return
+            date = str(body.get("date") or "")
+            threading.Thread(target=lambda: runner.reverify(date), name="briefing-reverify", daemon=True).start()
+            self.respond_json(202, {"ok": True, "started": True})
+            return
         if self.path == "/briefing/replay":
             runner = self.server.state.briefings.get(str(body.get("engine") or "claude"))
             if runner is None:
