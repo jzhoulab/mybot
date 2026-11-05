@@ -503,7 +503,7 @@ class SharingReviewer:
                         "private_sessions": [
                             {"ref": str(s.get("ref")), "reason": str(s.get("reason") or "")[:200]}
                             for s in result.get("private_sessions") or []
-                            if isinstance(s, dict) and str(s.get("ref") or "").startswith(("claude:", "codex:"))
+                            if isinstance(s, dict) and str(s.get("ref") or "").startswith(("claude:", "codex:", "antigravity:"))
                         ][:50],
                         "at": _now(),
                     }
@@ -530,7 +530,7 @@ class SharingReviewer:
                 "SELECT DISTINCT source_name, session_id FROM prompt_history")}
             rows = conn.execute(
                 """SELECT source_ref, source_name, session_id, cwd, COUNT(*) AS chunks, MAX(updated_at) AS last
-                   FROM trajectory_chunks WHERE source_name IN ('claude', 'codex') AND cwd != ''
+                   FROM trajectory_chunks WHERE source_name IN ('claude', 'codex', 'antigravity') AND cwd != ''
                    GROUP BY source_ref"""
             ).fetchall()
         private = {_session_id(ref) for ref in policy["private_sessions"]}

@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import glob
 import hashlib
 import hmac
 import json
@@ -39,6 +40,7 @@ from app.semantic_memory import SemanticMemoryStore, VALID_MEMORY_SCOPES, parse_
 from app.prompt_history import PromptHistoryStore
 from app.trajectory_index import TrajectoryChunkIndex
 from sources.access import (
+    account_patterns,
     default_config_path,
     load_access_config,
     normalize_visibility_mode,
@@ -1757,6 +1759,9 @@ def agent_subprocess_env(tool_env: dict[str, str] | None = None) -> dict[str, st
 #    still gets exactly the guest's view.
 # The agent's sandbox cannot read ~/.mybot, so it never sees the API key.
 SHARED_CHANNEL_VIEWER = "shared-channel"
+# Agent-session sources: team visibility of their sessions fails closed.
+AGENT_SOURCES = ("claude", "codex", "antigravity")
+AGENT_REF_PREFIXES = tuple(f"{name}:" for name in AGENT_SOURCES)
 
 _TITLE_KEYS = ("title", "session_title", "codex_index_title", "thread_name")
 
@@ -1989,6 +1994,11 @@ class AppState:
                 if not getattr(account, "enabled", True):
                     continue
                 base = os.path.expanduser(str(getattr(account, "expanded_base_dir", "") or account.base_dir))
+                if source_name == "antigravity":
+                    # No history log: each conversation's transcript holds its prompts.
+                    for path in account_patterns(account):
+                        seen += [p for p in glob.glob(path) if p.endswith("transcript_full.jsonl") and p not in seen]
+                    continue
                 for candidate in (
                     os.path.join(base, "history.jsonl"),
                     os.path.join(os.path.dirname(base.rstrip(os.sep)), "history.jsonl"),
@@ -2499,7 +2509,7 @@ class AppState:
         source_name = str(source.get("source_name") or "")
         if source_type and source_type != "trajectory":
             return True
-        if source_name not in {"codex", "claude"}:
+        if source_name not in AGENT_SOURCES:
             return True
         metadata = source.get("metadata") if isinstance(source.get("metadata"), dict) else {}
         account_name = str(metadata.get("account") or "default")
@@ -2680,7 +2690,7 @@ class AppState:
         metadata = payload.get("metadata") if isinstance(payload.get("metadata"), dict) else {}
         # The owner shared this very session: that outranks where it started.
         ref = str(payload.get("source_ref") or payload.get("parent_source_ref") or "")
-        if ref.startswith(("claude:", "codex:")) and self.sharing.session_shared(ref.split("#", 1)[0]):
+        if ref.startswith(AGENT_REF_PREFIXES) and self.sharing.session_shared(ref.split("#", 1)[0]):
             return False
         if metadata.get("visibility") == "private":
             return True
@@ -2694,7 +2704,7 @@ class AppState:
         # Team sharing: a session is visible to teammates only inside a
         # project the owner shared. Fails closed — no cwd, no share.
         ref = str(payload.get("source_ref") or payload.get("parent_source_ref") or "")
-        if ref.startswith(("claude:", "codex:")) or source_name in ("claude", "codex"):
+        if ref.startswith(AGENT_REF_PREFIXES) or source_name in AGENT_SOURCES:
             return self.sharing.hidden_from_team(source_name, cwd, ref.split("#", 1)[0])
         return False
 
@@ -5913,7 +5923,7 @@ def load_config(args: argparse.Namespace) -> AppConfig:
         group_observe_max_messages=int(os.environ.get("GROUP_OBSERVE_MAX_MESSAGES", "400")),
         memory_match_limit=int(os.environ.get("MEMORY_MATCH_LIMIT", "5")),
         trajectory_max_files_per_tool=int(os.environ.get("TRAJECTORY_MAX_FILES_PER_TOOL", "200")),
-        trajectory_sources=[name.strip().lower() for name in os.environ.get("TRAJECTORY_SOURCES", "codex,claude").split(",") if name.strip()],
+        trajectory_sources=[name.strip().lower() for name in os.environ.get("TRAJECTORY_SOURCES", "codex,claude,antigravity").split(",") if name.strip()],
         trajectory_investigation_mode=os.environ.get("TRAJECTORY_INVESTIGATION_MODE", "auto"),
         trajectory_search_limit=int(os.environ.get("TRAJECTORY_SEARCH_LIMIT", "5")),
         trajectory_evidence_limit=int(os.environ.get("TRAJECTORY_EVIDENCE_LIMIT", "2")),

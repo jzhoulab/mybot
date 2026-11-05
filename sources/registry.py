@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from .antigravity import AntigravitySourceAdapter
 from .claude import ClaudeSourceAdapter
 from .codex import CodexSourceAdapter
 from .access import load_access_config
@@ -10,6 +11,7 @@ def _registry() -> dict[str, type[TrajectorySourceAdapter]]:
     return {
         "codex": CodexSourceAdapter,
         "claude": ClaudeSourceAdapter,
+        "antigravity": AntigravitySourceAdapter,
     }
 
 

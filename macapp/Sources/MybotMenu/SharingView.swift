@@ -406,7 +406,8 @@ struct SharingView: View {
 private struct SharingSourceDot: View {
     let source: String
     var body: some View {
-        Circle().fill(source == "codex" ? Color.purple.opacity(0.7) : Color.orange.opacity(0.75))
+        Circle().fill(source == "codex" ? Color.purple.opacity(0.7)
+                      : source == "antigravity" ? Color.blue.opacity(0.7) : Color.orange.opacity(0.75))
             .frame(width: 7, height: 7).help(source)
     }
 }

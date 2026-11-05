@@ -31,11 +31,16 @@ STOPWORDS = frozenset(
 
 
 def _iso(ts: Any) -> str:
-    """History timestamps: Claude uses epoch milliseconds, Codex epoch seconds."""
+    """History timestamps: Claude uses epoch milliseconds, Codex epoch seconds,
+    Antigravity ISO 8601."""
     try:
         value = float(ts)
     except (TypeError, ValueError):
-        return ""
+        try:
+            parsed = datetime.fromisoformat(str(ts).replace("Z", "+00:00"))
+        except ValueError:
+            return ""
+        return (parsed if parsed.tzinfo else parsed.replace(tzinfo=timezone.utc)).astimezone(timezone.utc).isoformat()
     if value > 1e11:
         value /= 1000.0
     try:
@@ -109,7 +114,17 @@ class PromptHistoryStore:
                     continue
                 if not isinstance(entry, dict):
                     continue
-                if source_name == "claude":
+                if source_name == "antigravity":
+                    if entry.get("type") != "USER_INPUT" or entry.get("source") != "USER_EXPLICIT":
+                        continue
+                    from sources.antigravity import user_request
+
+                    text = user_request(str(entry.get("content") or ""))
+                    # brain/<conversation id>/.system_generated/logs/transcript_full.jsonl
+                    session_id = os.path.basename(os.path.dirname(os.path.dirname(os.path.dirname(path))))
+                    cwd = ""
+                    ts = _iso(entry.get("created_at"))
+                elif source_name == "claude":
                     text = str(entry.get("display") or "")
                     session_id = str(entry.get("sessionId") or "")
                     cwd = str(entry.get("project") or "")

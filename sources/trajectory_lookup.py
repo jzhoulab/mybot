@@ -424,6 +424,10 @@ def read_payload_from_file(
         events = _read_claude_events(file_path)
     elif source_name == "codex":
         events = _read_codex_events(file_path)
+    elif source_name == "antigravity":
+        from .antigravity import read_turns
+
+        events = [ParsedEvent(role=role, text=text, timestamp=ts[:19]) for role, text, ts in read_turns(file_path)]
     else:
         return None
     transcript = render_events(events)

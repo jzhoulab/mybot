@@ -17,6 +17,7 @@ _POLICY_KEY_MEMO: dict[str, str] = {}
 DEFAULT_BASE_DIRS = {
     "codex": "~/.codex",
     "claude": "~/.claude/projects",
+    "antigravity": "~/.gemini",
 }
 
 
@@ -620,6 +621,8 @@ def account_patterns(account: TrajectoryAccessAccount) -> list[str]:
         ]
     if account.source_name == "claude":
         return [os.path.join(account.expanded_base_dir, "*", "*.jsonl")]
+    if account.source_name == "antigravity":
+        return [os.path.join(account.expanded_base_dir, "antigravity*", "brain", "*", ".system_generated", "logs", "transcript*.jsonl")]
     return []
 
 
