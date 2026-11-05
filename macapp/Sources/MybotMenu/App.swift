@@ -300,8 +300,8 @@ private struct ConnectionsCard: View {
 
 struct ContentView: View {
     @ObservedObject var model: AppModel
-    // Menu-bar panels can't be resized by the window edges, so the size is
-    // ours: a corner grip changes it and it is remembered across launches.
+    // The panel resizes from its edges like any window (PanelResizer) and by
+    // the corner grip; the size is remembered across launches.
     @AppStorage("panelWidth") private var panelWidth: Double = 480
     @AppStorage("panelHeight") private var panelHeight: Double = 640
     @State private var dragStart: CGSize?
@@ -344,16 +344,19 @@ struct ContentView: View {
             .opacity(model.busyMessage != nil ? 0.45 : 1)
             footer
         }
-        .frame(width: panelWidth, height: panelHeight)
+        .frame(minWidth: 420, idealWidth: panelWidth, maxWidth: .infinity,
+               minHeight: 480, idealHeight: panelHeight, maxHeight: .infinity)
         .overlay(alignment: .bottomTrailing) { resizeGrip }
         .background(background)
+        .background(PanelResizer(width: $panelWidth, height: $panelHeight))
     }
 
     private var resizeGrip: some View {
         Image(systemName: "arrow.up.left.and.arrow.down.right")
-            .font(.system(size: 9, weight: .bold))
-            .foregroundStyle(.tertiary)
-            .frame(width: 18, height: 18)
+            .font(.system(size: 11, weight: .bold))
+            .foregroundStyle(.secondary)
+            .frame(width: 24, height: 24)
+            .background(Circle().fill(Color.primary.opacity(0.06)))
             .contentShape(Rectangle())
             .help("Drag to resize · double-click to reset")
             .gesture(
@@ -2247,6 +2250,71 @@ enum UIExporter {
             }
             .padding(12).frame(width: 480).environment(\.colorScheme, scheme).background(bg)
             write(traj, name.replacingOccurrences(of: "ui-", with: "traj-"))
+        }
+    }
+}
+
+
+/// Makes the menu-bar panel resizable from its edges and keeps it at the size
+/// the owner chose (SwiftUI's menu-bar window is fixed-size otherwise).
+struct PanelResizer: NSViewRepresentable {
+    @Binding var width: Double
+    @Binding var height: Double
+
+    func makeCoordinator() -> Coordinator { Coordinator(self) }
+
+    func makeNSView(context: Context) -> NSView {
+        let view = NSView()
+        DispatchQueue.main.async { context.coordinator.attach(to: view.window) }
+        return view
+    }
+
+    func updateNSView(_ view: NSView, context: Context) {
+        context.coordinator.parent = self
+        DispatchQueue.main.async {
+            context.coordinator.attach(to: view.window)
+            context.coordinator.apply()
+        }
+    }
+
+    final class Coordinator: NSObject {
+        var parent: PanelResizer
+        private weak var window: NSWindow?
+        private var applying = false
+
+        init(_ parent: PanelResizer) { self.parent = parent }
+
+        func attach(to window: NSWindow?) {
+            guard let window, window !== self.window else { return }
+            self.window = window
+            window.styleMask.insert(.resizable)
+            window.contentMinSize = NSSize(width: 420, height: 480)
+            window.contentMaxSize = NSSize(width: 1400, height: 1400)
+            NotificationCenter.default.addObserver(self, selector: #selector(resized),
+                                                   name: NSWindow.didResizeNotification, object: window)
+            apply()
+        }
+
+        /// The grip (or a launch) changed the stored size: size the window to it.
+        func apply() {
+            guard let window, !applying else { return }
+            let wanted = NSSize(width: parent.width, height: parent.height)
+            let current = window.contentRect(forFrameRect: window.frame).size
+            guard abs(current.width - wanted.width) > 1 || abs(current.height - wanted.height) > 1 else { return }
+            applying = true
+            // Keep the top edge under the menu bar; grow downward.
+            var frame = window.frameRect(forContentRect: NSRect(origin: .zero, size: wanted))
+            frame.origin = NSPoint(x: window.frame.minX, y: window.frame.maxY - frame.height)
+            window.setFrame(frame, display: true)
+            applying = false
+        }
+
+        /// The owner dragged an edge: remember the new size.
+        @objc private func resized() {
+            guard let window, !applying else { return }
+            let size = window.contentRect(forFrameRect: window.frame).size
+            parent.width = Double(size.width.rounded())
+            parent.height = Double(size.height.rounded())
         }
     }
 }
