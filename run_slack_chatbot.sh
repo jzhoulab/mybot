@@ -79,7 +79,9 @@ acquire_single_instance_lock() {
   fi
   local lock_pid=""
   [[ -f "$MYBOT_LOCK_DIR/pid" ]] && lock_pid="$(cat "$MYBOT_LOCK_DIR/pid" 2>/dev/null || true)"
-  if [[ -n "$lock_pid" ]] && kill -0 "$lock_pid" 2>/dev/null; then
+  # A lock left by a launcher that died with the machine can name a pid that
+  # a different process has since been given, so check what the pid is.
+  if [[ -n "$lock_pid" ]] && ps -p "$lock_pid" -o command= 2>/dev/null | grep -q "run_slack_chatbot.sh"; then
     echo "mybot Slack launcher already running with pid $lock_pid."; exit 0
   fi
   rm -rf "$MYBOT_LOCK_DIR"; mkdir "$MYBOT_LOCK_DIR" || { echo "Could not acquire lock"; exit 1; }

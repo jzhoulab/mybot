@@ -9,8 +9,8 @@
 #   neither               -> runs the chat server alone (standalone_agent_backbone.py)
 #                            and restarts it if it dies
 #
-# With both bridges configured, this starts Discord; run ./run_slack_chatbot.sh
-# alongside it (the Slack launcher shares an already-healthy server).
+# With both bridges configured, this starts Discord and runs the Slack launcher
+# beside it on the same server.
 # MYBOT_BRIDGE=auto|discord|slack|none overrides the choice (default auto).
 set -euo pipefail
 
@@ -20,6 +20,15 @@ MYBOT_BRIDGE="${MYBOT_BRIDGE:-auto}"
 case "${MYBOT_BRIDGE:l}" in
   auto)
     if [[ -f "$ROOT_DIR/.discord.env" ]]; then
+      if [[ -f "$ROOT_DIR/.slack.env" ]]; then
+        # Both configured: Slack runs beside Discord on the server the Discord
+        # launcher owns (START_LOCAL_CHAT_SERVER=false, so the two never race
+        # to start one). Without this, a reboot brought back Discord only.
+        mkdir -p "$ROOT_DIR/state/run"
+        START_LOCAL_CHAT_SERVER=false nohup /bin/zsh "$ROOT_DIR/run_slack_chatbot.sh" \
+          >> "$ROOT_DIR/state/run/mybot-slack-launcher.log" 2>&1 &
+        disown
+      fi
       exec /bin/zsh "$ROOT_DIR/run_discord_chatbot.sh" "$@"
     fi
     if [[ -f "$ROOT_DIR/.slack.env" ]]; then
