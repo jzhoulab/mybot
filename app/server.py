@@ -2600,6 +2600,38 @@ class AppState:
         else:
             self.mark_project_reviewed(source_name, cwd)
 
+    def apply_session_level(self, ref: str, level: str, *, chunks: int = 0, cwd: str = "",
+                            reconcile: bool = True) -> bool:
+        """The same three choices as a project, for one session: Team shares
+        it, Only me keeps it private even inside a shared project, Exclude
+        drops it from the index."""
+        if level not in LEVELS:
+            raise ValueError("level must be team, owner or exclude")
+        source_name = ref.split(":", 1)[0] if ":" in ref else ""
+        if not source_name:
+            raise ValueError(f"need a source-prefixed session ref, got {ref!r}")
+        if level == "team" and is_codex_gui_chat(source_name, ref, cwd):
+            raise ValueError("Codex GUI chats with no project stay private")
+        previous = (self.sharing.snapshot().get("sessions", {}).get(ref.split("#", 1)[0].rsplit(":", 1)[-1].lower())
+                    or {}).get("level")
+        self.sharing.decide_session(ref, level, chunks=chunks)
+        self.sharing.set_session_private(ref, level != "team", reason="owner")
+        raw = ref.split("#", 1)[0].rsplit(":", 1)[-1]
+        if level == "exclude" or previous == "exclude":
+            # Session ids are unique, so the exclusion goes on every account of
+            # the source (a Claude session can live under ~/.claude or ~/.claude_fable).
+            action = "exclude" if level == "exclude" else "unexclude"
+            for account in load_access_config().sources.get(source_name) or []:
+                self.update_scope(action=action, source_name=source_name, account_name=account.name,
+                                  kind="session", value=raw, reconcile=False)
+            if reconcile:
+                if level == "exclude":
+                    self.purge_index_to_policy()
+                else:
+                    self.start_trajectory_maintenance("refresh")
+        # True when the session comes back into the index and needs re-indexing.
+        return previous == "exclude" and level != "exclude"
+
     def mark_project_reviewed(self, source_name: str, cwd: str) -> None:
         key = f"{(source_name or '').strip().lower()}:{(cwd or '').strip()}"
         with self.known_projects_lock:
@@ -2643,7 +2675,10 @@ class AppState:
                 suggestion = {
                     **suggestion,
                     "private_sessions": [
-                        {**f, "title": titles.get(f["ref"], ""), "private": f["ref"] in decided["private_sessions"]}
+                        {**f, "title": titles.get(f["ref"], ""), "private": f["ref"] in decided["private_sessions"],
+                         "level": (decided.get("sessions", {}).get(f["ref"].split("#", 1)[0].rsplit(":", 1)[-1].lower())
+                                   or {}).get("level")
+                         or ("owner" if f["ref"] in decided["private_sessions"] else None)}
                         for f in suggestion.get("private_sessions") or []
                     ],
                 }
@@ -5549,18 +5584,28 @@ class ChatHandler(BaseHTTPRequestHandler):
                     state.purge_index_to_policy()
                 state.detect_new_projects()
             elif action == "share_sessions":
-                # The owner's answer on recommended sessions. Codex GUI chats
-                # with no project can't be shared, whatever is asked.
-                level = "team" if str(body.get("level") or "team") == "team" else "owner"
-                suggestions = state.sharing_reviewer.suggestions()["sessions"]
-                for ref in body.get("refs") or []:
-                    ref = str(ref)
-                    seen = suggestions.get(ref)
-                    if not seen:
-                        raise ValueError(f"no review of {ref}")
-                    if level == "team" and is_codex_gui_chat(str(seen.get("source") or ""), ref, str(seen.get("cwd") or "")):
-                        raise ValueError("Codex GUI chats with no project stay private")
-                    state.sharing.decide_session(ref, level, chunks=int(seen.get("chunks") or 0))
+                # The owner's level for these sessions: team, owner or exclude,
+                # the same choices as a project.
+                level = str(body.get("level") or "team")
+                if level not in LEVELS:
+                    raise ValueError("level must be team, owner or exclude")
+                reviewed = state.sharing_reviewer.suggestions()
+                # A session flagged inside a project carries that project's folder.
+                flagged_cwd = {
+                    flagged["ref"]: key.partition(":")[2]
+                    for key, s in reviewed["projects"].items() for flagged in s.get("private_sessions") or []
+                }
+                refs = [str(ref) for ref in body.get("refs") or []]
+                reindex = False
+                for ref in refs:
+                    seen = reviewed["sessions"].get(ref) or {}
+                    reindex |= state.apply_session_level(
+                        ref, level, chunks=int(seen.get("chunks") or 0),
+                        cwd=str(seen.get("cwd") or flagged_cwd.get(ref, "")), reconcile=False)
+                if level == "exclude" and refs:
+                    state.purge_index_to_policy()
+                if reindex:
+                    state.start_trajectory_maintenance("refresh")
             elif action == "session":
                 state.sharing.set_session_private(
                     str(body.get("ref") or ""), coerce_bool(body.get("private"), True),

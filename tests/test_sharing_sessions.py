@@ -85,6 +85,32 @@ class PolicyTest(unittest.TestCase):
         self.assertFalse(AppState.trajectory_payload_is_private(state, payload))
 
 
+    def test_a_session_takes_the_same_three_levels_as_a_project(self):
+        calls = []
+        state = types.SimpleNamespace(
+            sharing=self.policy,
+            update_scope=lambda **kw: calls.append((kw["action"], kw["account_name"], kw["value"])),
+            purge_index_to_policy=lambda: calls.append(("purge",)),
+            start_trajectory_maintenance=lambda mode: calls.append(("refresh",)),
+        )
+        accounts = [types.SimpleNamespace(name="default"), types.SimpleNamespace(name="fable")]
+        config = types.SimpleNamespace(sources={"claude": accounts})
+        with mock.patch("app.server.load_access_config", return_value=config):
+            apply = lambda ref, level: AppState.apply_session_level(state, ref, level, cwd="/w")
+            self.policy.decide("claude:/w", "team")
+            apply("claude:abc", "owner")
+            self.assertTrue(self.policy.hidden_from_team("claude", "/w", "claude:abc"))
+            self.assertEqual(calls, [])
+            self.assertFalse(apply("claude:abc", "exclude"))
+            self.assertEqual(calls, [("exclude", "default", "abc"), ("exclude", "fable", "abc"), ("purge",)])
+            calls.clear()
+            self.assertTrue(apply("claude:abc", "team"))
+            self.assertEqual(calls, [("unexclude", "default", "abc"), ("unexclude", "fable", "abc"), ("refresh",)])
+            self.assertTrue(self.policy.session_shared("claude:abc"))
+            with self.assertRaises(ValueError):
+                apply("claude:abc", "private")
+
+
 class ReviewerTest(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()

@@ -928,11 +928,6 @@ final class AppModel: ObservableObject {
         }
     }
 
-    func setSessionPrivate(_ ref: String, isPrivate: Bool) {
-        SharingClient(config: config).post(["action": "session", "ref": ref, "private": isPrivate]) { [weak self] state in
-            if let state { self?.applySharing(state) }
-        }
-    }
 
     /// Takes the owner to the sessions waiting for an answer.
     func openTeamSharing() {
@@ -975,15 +970,27 @@ final class AppModel: ObservableObject {
         defaults.set(waiting.map(\.ref), forKey: "sharingNotifiedRefs")
     }
 
-    func shareSessions(_ refs: [String], share: Bool) {
+    /// One session's level: team, owner or exclude, the same choice as a project.
+    func setSessionLevel(_ refs: [String], level: String) {
+        guard SharingLevel.all.contains(level) else { return }
         let set = Set(refs)
         let moved = (sharing.recommended + sharing.decisions).filter { set.contains($0.ref) }
         sharing.recommended.removeAll { set.contains($0.ref) }
         sharing.decisions.removeAll { set.contains($0.ref) }
-        if share { sharing.shared.append(contentsOf: moved) } else { sharing.shared.removeAll { set.contains($0.ref) } }
-        SharingClient(config: config).post(["action": "share_sessions", "refs": refs, "level": share ? "team" : "owner"]) { [weak self] state in
+        if level == "team" { sharing.shared.append(contentsOf: moved) } else { sharing.shared.removeAll { set.contains($0.ref) } }
+        for p in sharing.projects.indices {
+            guard var suggestion = sharing.projects[p].suggestion else { continue }
+            for f in suggestion.flags.indices where set.contains(suggestion.flags[f].ref) {
+                suggestion.flags[f].level = level
+            }
+            sharing.projects[p] = SharingProject(key: sharing.projects[p].key, source: sharing.projects[p].source,
+                                                 cwd: sharing.projects[p].cwd, sessions: sharing.projects[p].sessions,
+                                                 level: sharing.projects[p].level, suggestion: suggestion)
+        }
+        SharingClient(config: config).post(["action": "share_sessions", "refs": refs, "level": level]) { [weak self] state in
             guard let self else { return }
             if let state { self.applySharing(state) } else { self.lastError = "Couldn't save the sharing choice" }
+            if level == "exclude" { self.reload(force: true) }
         }
     }
 

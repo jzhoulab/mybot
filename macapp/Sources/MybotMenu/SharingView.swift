@@ -7,7 +7,7 @@ struct SharingFlag: Identifiable, Hashable {
     let ref: String
     let title: String
     let reason: String
-    var isPrivate: Bool
+    var level: String?       // the owner's level for this one session; nil = follows the project
 }
 
 struct SharingSuggestion: Hashable {
@@ -29,6 +29,20 @@ struct SharingProject: Identifiable, Hashable {
     var displayName: String {
         let name = (cwd as NSString).lastPathComponent
         return name.isEmpty ? cwd : name
+    }
+}
+
+/// The one choice for anything mybot holds, a project or a single session:
+/// Team (teammates can ask), Only me (indexed, yours alone), Exclude (not indexed).
+struct SharingLevelPicker: View {
+    let level: String?
+    let onPick: (String) -> Void
+    var body: some View {
+        Picker("", selection: Binding(get: { level ?? "" }, set: { if !$0.isEmpty { onPick($0) } })) {
+            if level == nil { Text("—").tag("") }
+            ForEach(SharingLevel.all, id: \.self) { Text(SharingLevel.label($0)).tag($0) }
+        }
+        .pickerStyle(.segmented).labelsHidden().frame(width: 190)
     }
 }
 
@@ -137,7 +151,7 @@ struct SharingClient {
                     guard let ref = f["ref"] as? String else { return nil }
                     return SharingFlag(ref: ref, title: (f["title"] as? String) ?? "",
                                        reason: (f["reason"] as? String) ?? "",
-                                       isPrivate: (f["private"] as? Bool) ?? false)
+                                       level: f["level"] as? String)
                 }
                 suggestion = SharingSuggestion(level: level, confidence: (s["confidence"] as? String) ?? "",
                                                reason: (s["reason"] as? String) ?? "", flags: flags)
@@ -206,7 +220,7 @@ struct SharingView: View {
 
     private var intro: some View {
         VStack(alignment: .leading, spacing: 8) {
-            Text("Which of your projects mybot indexes, and which teammates can ask about. An agent read each project's session titles and your requests and suggests: Team (teammates can ask), Only me (indexed, yours alone), or Exclude (not indexed). Nothing changes until you accept.")
+            Text("What mybot indexes and what teammates can ask about. Every project and session gets the same choice: Team (teammates can ask), Only me (indexed, yours alone), or Exclude (not indexed). A session's choice overrides its project's. An agent suggests; nothing changes until you choose.")
                 .font(.system(size: 11)).foregroundStyle(.secondary)
                 .fixedSize(horizontal: false, vertical: true)
             if !acceptable.isEmpty {
@@ -238,10 +252,7 @@ struct SharingView: View {
                     .fixedSize(horizontal: false, vertical: true)
                 ForEach(sessions) { session in
                     sessionRow(session, emphasized: session.question) {
-                        Button("Keep private") { model.shareSessions([session.ref], share: false) }
-                            .buttonStyle(.plain).font(.system(size: 10.5)).foregroundStyle(.secondary)
-                        Button("Share") { model.shareSessions([session.ref], share: true) }
-                            .controlSize(.small)
+                        SharingLevelPicker(level: nil) { model.setSessionLevel([session.ref], level: $0) }
                     }
                 }
                 ForEach(projects) { row($0) }
@@ -262,7 +273,7 @@ struct SharingView: View {
                     Spacer()
                     if !sure.isEmpty {
                         Button("Share the \(sure.count) high-confidence") {
-                            model.shareSessions(sure.map(\.ref), share: true)
+                            model.setSessionLevel(sure.map(\.ref), level: "team")
                         }
                         .font(.system(size: 10.5, weight: .semibold)).buttonStyle(.plain)
                         .foregroundStyle(Palette.accent)
@@ -270,10 +281,7 @@ struct SharingView: View {
                 }
                 ForEach(sessions) { session in
                     sessionRow(session) {
-                        Button("Keep") { model.shareSessions([session.ref], share: false) }
-                            .buttonStyle(.plain).font(.system(size: 10.5)).foregroundStyle(.secondary)
-                        Button("Share") { model.shareSessions([session.ref], share: true) }
-                            .controlSize(.small)
+                        SharingLevelPicker(level: nil) { model.setSessionLevel([session.ref], level: $0) }
                     }
                 }
             }
@@ -288,8 +296,7 @@ struct SharingView: View {
                     .font(.system(size: 9.5, weight: .heavy)).tracking(0.5).foregroundStyle(.secondary)
                 ForEach(model.sharing.shared) { session in
                     sessionRow(session) {
-                        Button("Stop sharing") { model.shareSessions([session.ref], share: false) }
-                            .buttonStyle(.plain).font(.system(size: 10.5)).foregroundStyle(.secondary)
+                        SharingLevelPicker(level: "team") { model.setSessionLevel([session.ref], level: $0) }
                     }
                 }
             }
@@ -362,13 +369,7 @@ struct SharingView: View {
                     .help(project.cwd)
                 Text("· \(project.sessions)").font(.system(size: 10)).foregroundStyle(.secondary)
                 Spacer()
-                Picker("", selection: Binding(
-                    get: { project.level ?? "" },
-                    set: { model.decideSharing(project.key, level: $0) })) {
-                    if project.level == nil { Text("—").tag("") }
-                    ForEach(SharingLevel.all, id: \.self) { Text(SharingLevel.label($0)).tag($0) }
-                }
-                .pickerStyle(.segmented).labelsHidden().frame(width: 190)
+                SharingLevelPicker(level: project.level) { model.decideSharing(project.key, level: $0) }
             }
             if let suggestion = project.suggestion {
                 HStack(alignment: .firstTextBaseline, spacing: 5) {
@@ -388,11 +389,8 @@ struct SharingView: View {
                             Text(flag.reason).font(.system(size: 9.5)).foregroundStyle(.secondary)
                         }
                         Spacer()
-                        Toggle("Private", isOn: Binding(
-                            get: { flag.isPrivate },
-                            set: { model.setSessionPrivate(flag.ref, isPrivate: $0) }))
-                            .toggleStyle(.checkbox).font(.system(size: 10))
-                            .help("Keep this one session to yourself even if the project is shared")
+                        SharingLevelPicker(level: flag.level) { model.setSessionLevel([flag.ref], level: $0) }
+                            .help("This one session's level; it overrides the project's")
                     }
                     .padding(.leading, 14)
                 }

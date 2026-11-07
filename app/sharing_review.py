@@ -247,8 +247,8 @@ class SharingPolicy:
             return (data["sessions"].get(ident) or {}).get("level") == "team"
 
     def decide_session(self, ref: str, level: str, *, by: str = "owner", chunks: int = 0) -> None:
-        if level not in ("team", "owner"):
-            raise ValueError("a session is shared (team) or kept (owner)")
+        if level not in LEVELS:
+            raise ValueError(f"a session's level is one of {LEVELS}, like a project's")
         with self._lock:
             data = self._load()
             data["sessions"][_session_id(ref)] = {
@@ -667,12 +667,13 @@ class SharingReviewer:
             if decision.get("by") != "owner":
                 continue
             seen = by_id.get(ident) or {}
-            shared = decision.get("level") == "team"
+            chose = {"team": "to share", "exclude": "to exclude it from the index"}.get(
+                str(decision.get("level")), "to keep private")
             overruled = seen.get("level") in ("team", "owner") and seen.get("level") != decision.get("level")
             rows.append(((not needs_decision(seen), not overruled, str(decision.get("decided_at") or "")),
                          f"- {seen.get('name') or seen.get('title') or ident} ({seen.get('cwd', '')}): "
                          f"{seen.get('question') or seen.get('reason') or ''} → owner chose "
-                         f"{'to share' if shared else 'to keep private'}"))
+                         f"{chose}"))
         if not rows:
             return ""
         # Questions first, then overruled calls; newest first inside each group.
