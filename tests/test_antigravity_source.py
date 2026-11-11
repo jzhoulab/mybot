@@ -3,6 +3,7 @@ import os
 import tempfile
 import types
 import unittest
+from datetime import datetime, timezone
 from pathlib import Path
 from unittest import mock
 
@@ -192,6 +193,20 @@ class CliRecordsTest(unittest.TestCase):
         with store._connect() as conn:
             rows = conn.execute("SELECT session_id, cwd, text FROM prompt_history").fetchall()
         self.assertEqual([tuple(r) for r in rows], [(CLI_ID, "/Users/me/Code/nebula", "fix the session store")])
+
+    def test_a_first_prompt_logged_before_its_id_finds_its_conversation(self):
+        when = int(datetime(2026, 11, 5, 15, 1, tzinfo=timezone.utc).timestamp() * 1000)  # the transcript's first step
+        with self.history.open("a") as handle:
+            handle.write(json.dumps({"display": "scripted\\n  run".replace("\\n", "\n"), "timestamp": when + 900,
+                                     "workspace": "/Users/me/Code/other"}) + "\n")
+        index = conversation_index(str(self.home))
+        self.assertIn(PRINT_ID, index["typed"])
+        self.assertEqual(index["workspaces"][PRINT_ID], "/Users/me/Code/other")
+        store = PromptHistoryStore(str(self.home / "ph.sqlite3"))
+        store.refresh(history_paths={"antigravity": [str(self.history)]})
+        with store._connect() as conn:
+            rows = conn.execute("SELECT session_id FROM prompt_history WHERE cwd = '/Users/me/Code/other'").fetchall()
+        self.assertEqual([r[0] for r in rows], [PRINT_ID])
 
     def test_session_viewer_parses_steps(self):
         from scripts.mybot_admin import _parse_trajectory

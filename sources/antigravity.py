@@ -57,6 +57,36 @@ _UUID_RE = re.compile(r"^[0-9a-fA-F-]{8,}$")
 _MODEL_RE = re.compile(r"Model Selection`?\s+from\s+.*?\s+to\s+(.+?)(?:\.\s|\.$|\n|<)|Model Selection[^\n]*?:\s*([^\n<]+)")
 _STEP_CLOCK_RE = re.compile(r"^(?:Created|Completed) At: .*\n?", re.M)
 _index_cache: dict[str, tuple[list, dict]] = {}
+TRANSCRIPT_TAIL = os.path.join(".system_generated", "logs", "transcript_full.jsonl")
+
+
+def _first_prompts(store: str) -> dict[str, list[tuple[float, str]]]:
+    """{first prompt, whitespace-normalized: [(when, conversation id)]}."""
+    found: dict[str, list[tuple[float, str]]] = {}
+    for path in glob.glob(os.path.join(store, "brain", "*", TRANSCRIPT_TAIL)):
+        try:
+            with open(path, encoding="utf-8", errors="replace") as handle:
+                step = json.loads(handle.readline(4_000_000))
+        except (OSError, ValueError):
+            continue
+        if not isinstance(step, dict) or step.get("type") != "USER_INPUT":
+            continue
+        when = parse_timestamp(str(step.get("created_at") or ""))
+        if when:
+            text = " ".join(user_request(str(step.get("content") or "")).split())
+            ident = os.path.basename(path[: -len(TRANSCRIPT_TAIL) - 1])
+            found.setdefault(text, []).append((when.timestamp(), ident))
+    return found
+
+
+def _match_first_prompt(prompts: dict[str, list[tuple[float, str]]], entry: dict) -> str:
+    try:
+        when = float(entry.get("timestamp")) / 1000
+    except (TypeError, ValueError):
+        return ""
+    near = [(abs(at - when), ident) for at, ident in prompts.get(" ".join(str(entry.get("display") or "").split()), [])
+            if abs(at - when) <= 120]
+    return min(near)[1] if near else ""
 
 
 def conversation_index(base_dir: str) -> dict:
@@ -72,20 +102,27 @@ def conversation_index(base_dir: str) -> dict:
             except OSError:
                 continue
             signature.append((path, stat.st_mtime_ns, stat.st_size))
+        signature.append((store, len(glob.glob(os.path.join(store, "brain", "*", TRANSCRIPT_TAIL)))))
     cached = _index_cache.get(base_dir)
     if cached and cached[0] == signature:
         return cached[1]
-    index: dict = {"workspaces": {}, "titles": {}, "typed": set(), "logged": bool(signature)}
+    index: dict = {"workspaces": {}, "titles": {}, "typed": set(), "by_timestamp": {},
+                   "logged": any(len(item) == 3 for item in signature)}
     for store in stores:
+        first_prompts = _first_prompts(store)
         for line in iter_bounded_jsonl_lines(os.path.join(store, "history.jsonl")) \
                 if os.path.isfile(os.path.join(store, "history.jsonl")) else ():
             try:
                 entry = json.loads(line) if line else None
             except json.JSONDecodeError:
                 continue
-            ident = str(entry.get("conversationId") or "") if isinstance(entry, dict) else ""
+            if not isinstance(entry, dict) or entry.get("type") == "slash_command":
+                continue
+            # A new conversation's first prompt is logged before it has an id.
+            ident = str(entry.get("conversationId") or "") or _match_first_prompt(first_prompts, entry)
             if ident:
                 index["typed"].add(ident)
+                index["by_timestamp"][entry.get("timestamp")] = ident
                 if entry.get("workspace"):
                     index["workspaces"][ident] = str(entry["workspace"])
         try:

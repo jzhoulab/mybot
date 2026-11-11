@@ -119,6 +119,11 @@ class PromptHistoryStore:
                         continue
                     text = str(entry.get("display") or "")
                     session_id = str(entry.get("conversationId") or "")
+                    if not session_id:
+                        from sources.antigravity import conversation_index
+
+                        home = os.path.dirname(os.path.dirname(path))
+                        session_id = conversation_index(home)["by_timestamp"].get(entry.get("timestamp"), "")
                     cwd = str(entry.get("workspace") or "")
                     ts = _iso(entry.get("timestamp"))
                 elif source_name == "antigravity":
