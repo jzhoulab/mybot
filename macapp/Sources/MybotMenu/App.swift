@@ -88,6 +88,7 @@ enum Palette {
         switch name {
         case "codex": return Color(red: 0.44, green: 0.49, blue: 0.90)
         case "claude": return Color(red: 0.80, green: 0.51, blue: 0.30)
+        case "antigravity": return Color(red: 0.26, green: 0.58, blue: 0.87)
         default: return .gray
         }
     }

@@ -54,7 +54,7 @@ DEFAULT_STOP_WORDS = {
 TRAJECTORY_INTENT_RE = re.compile(
     r"\b("
     r"trajectory|trajectories|session|sessions|conversation|conversations|"
-    r"codex|claude|previous|prior|earlier|recent|history|chat|chats|"
+    r"codex|claude|antigravity|previous|prior|earlier|recent|history|chat|chats|"
     r"what happened|what was|what were|what did|how did|where did|when did|"
     r"when i asked|asked to|asked for|which one|find|search"
     r")\b",
@@ -381,6 +381,10 @@ def read_events_for_session(session: NormalizedTrajectory) -> list[ParsedEvent]:
         return _read_claude_events(session.file_path)
     if session.source_name == "codex":
         return _read_codex_events(session.file_path)
+    if session.source_name == "antigravity":
+        from .antigravity import read_events
+
+        return [ParsedEvent(role=role, text=text, timestamp=ts[:19]) for role, text, ts in read_events(session.file_path)]
     return [ParsedEvent(role=turn.role, text=turn.text, timestamp=turn.timestamp or "") for turn in session.turns]
 
 
@@ -425,9 +429,9 @@ def read_payload_from_file(
     elif source_name == "codex":
         events = _read_codex_events(file_path)
     elif source_name == "antigravity":
-        from .antigravity import read_turns
+        from .antigravity import read_events
 
-        events = [ParsedEvent(role=role, text=text, timestamp=ts[:19]) for role, text, ts in read_turns(file_path)]
+        events = [ParsedEvent(role=role, text=text, timestamp=ts[:19]) for role, text, ts in read_events(file_path)]
     else:
         return None
     transcript = render_events(events)
@@ -512,6 +516,7 @@ def snippet_quality(snippet: str) -> int:
     if (
         "source ref: claude:" in lowered
         or "source ref: codex:" in lowered
+        or "source ref: antigravity:" in lowered
         or '"source_ref"' in lowered
         or '"match_kind"' in lowered
     ):

@@ -9,7 +9,7 @@ struct ChatSource: Identifiable, Hashable {
     let title: String
     let score: Double?
 
-    var isOpenable: Bool { ["codex", "claude"].contains(sourceName) && ref.contains(":") }
+    var isOpenable: Bool { ["codex", "claude", "antigravity"].contains(sourceName) && ref.contains(":") }
 }
 
 /// One retrieval step the model took while answering.

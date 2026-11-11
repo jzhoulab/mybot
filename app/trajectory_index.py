@@ -73,6 +73,7 @@ SELF_ECHO_MARKERS = (
     # while testing this assistant.
     "source ref: claude:",
     "source ref: codex:",
+    "source ref: antigravity:",
     '"match_kind"',
     '"source_ref"',
 )
@@ -736,6 +737,14 @@ class TrajectoryChunkIndex:
                 _, workdir, entrypoints = discover_claude_metadata(path)
                 if not account.include_workdir(workdir) or not account.include_entrypoints(entrypoints):
                     continue
+            elif source_name == "antigravity":
+                from sources.antigravity import transcript_workdir
+
+                workdir = self._cached_head_metadata(
+                    path, lambda p: (transcript_workdir(p, account.expanded_base_dir), [])
+                )[0]
+                if not account.include_workdir(workdir):
+                    continue
             allowed_seen.add(real_path)
             try:
                 mtime = os.path.getmtime(path)
@@ -1278,6 +1287,7 @@ class TrajectoryChunkIndex:
         tokens = query_tokens(query)
         broad_anchor_tokens = {
             "assistant",
+            "antigravity",
             "claude",
             "codex",
             "project",

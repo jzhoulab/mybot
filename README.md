@@ -125,7 +125,7 @@ python scripts/mybot_admin.py maintenance --action embed   # repeat until missin
 |---|---|---|
 | **Web dashboard** | already running at `/gui` | Seeing what is indexed, tuning scope, probing retrieval and its scores |
 | **macOS menu bar** | `./macapp/build.sh release && open macapp/.dist/mybot.app` | Day-to-day asking, browsing transcripts, the daily pulse, team sharing, the team channel |
-| **Agent skill** | `sh skills/mybot-memory/install.sh` | Letting your *other* Claude Code and Codex sessions query your history mid-task |
+| **Agent skill** | `sh skills/mybot-memory/install.sh` | Letting your *other* Claude Code, Codex and Antigravity sessions query your history mid-task |
 | **Discord / Slack** | `python scripts/mybot_admin.py connect discord` (or `slack`), then `./run_chatbot.sh` | Asking from your phone, and letting teammates ask |
 
 The menu-bar app reads the index SQLite directly, so browsing and search still
@@ -491,7 +491,7 @@ skill, and prints a drift report so the copies cannot silently diverge.
 
 ```
 app/          server, bridges, dashboard, semantic memory, chunk index
-sources/      trajectory adapters (codex, claude), access policy, origin classification
+sources/      trajectory adapters (codex, claude, antigravity), access policy, origin classification
 client/       access-setup TUI, remote sync CLI
 scripts/      admin CLI, agent retrieval tool, deploy, backup
 skills/       the skill that lets other coding agents query mybot

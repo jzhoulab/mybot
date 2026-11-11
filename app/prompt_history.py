@@ -114,7 +114,14 @@ class PromptHistoryStore:
                     continue
                 if not isinstance(entry, dict):
                     continue
-                if source_name == "antigravity":
+                if source_name == "antigravity" and os.path.basename(path) == "history.jsonl":
+                    if entry.get("type") == "slash_command":
+                        continue
+                    text = str(entry.get("display") or "")
+                    session_id = str(entry.get("conversationId") or "")
+                    cwd = str(entry.get("workspace") or "")
+                    ts = _iso(entry.get("timestamp"))
+                elif source_name == "antigravity":
                     if entry.get("type") != "USER_INPUT" or entry.get("source") != "USER_EXPLICIT":
                         continue
                     from sources.antigravity import user_request

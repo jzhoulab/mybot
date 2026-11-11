@@ -1995,9 +1995,14 @@ class AppState:
                     continue
                 base = os.path.expanduser(str(getattr(account, "expanded_base_dir", "") or account.base_dir))
                 if source_name == "antigravity":
-                    # No history log: each conversation's transcript holds its prompts.
+                    # The CLI logs what's typed; a store without that log (the
+                    # editor) has its prompts only in each transcript.
+                    logs = glob.glob(os.path.join(base, "antigravity*", "history.jsonl"))
+                    seen += [p for p in logs if p not in seen]
+                    logged = {os.path.dirname(p) + os.sep for p in logs}
                     for path in account_patterns(account):
-                        seen += [p for p in glob.glob(path) if p.endswith("transcript_full.jsonl") and p not in seen]
+                        seen += [p for p in glob.glob(path) if p.endswith("transcript_full.jsonl") and p not in seen
+                                 and not any(p.startswith(store) for store in logged)]
                     continue
                 for candidate in (
                     os.path.join(base, "history.jsonl"),
@@ -4063,7 +4068,7 @@ class AppState:
                 "grep, sed, awk, jq, sort, uniq, pipes — when that's sharper than SQL:\n"
                 f"- `{tool_command}` — memory-search, trajectory-search, trajectory-read, trajectory-stats "
                 "(semantic/fuzzy search + focused evidence reads). trajectory-search takes --after/--before "
-                "(ISO date) and --source codex|claude; hits report event_start/event_end + chunk_id. "
+                "(ISO date) and --source codex|claude|antigravity; hits report event_start/event_end + chunk_id. "
                 "trajectory-read --around-event N (± --events-before/--events-after) or --chunk-id C zooms "
                 "to that exact spot; reads report total_events so you can page (the tail is the freshest).\n"
                 f"- `{tool_command} sql -q \"<SELECT …>\" [--limit N]` — exact/enumeration SQL over the "

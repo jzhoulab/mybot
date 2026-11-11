@@ -1,8 +1,9 @@
 #!/bin/sh
-# Install the mybot-memory skill for Claude Code and Codex.
+# Install the mybot-memory skill for Claude Code, Codex and Antigravity.
 #   - `mybot` CLI wrapper -> ~/.local/bin
 #   - SKILL.md            -> ~/.claude/skills/mybot-memory/   (Claude Code: lazy-loaded)
 #   - a compact pointer   -> ~/.codex/AGENTS.md               (Codex: always-loaded)
+#   - SKILL.md            -> ~/.gemini/config/skills/mybot-memory/ (Antigravity, if installed)
 # Idempotent. Re-run after editing SKILL.md to refresh.
 set -eu
 HERE="$(cd "$(dirname "$0")" && pwd)"
@@ -46,5 +47,12 @@ else
   echo "Codex: appended mybot block to $CODEX_AGENTS"
 fi
 rm -f "$BLOCK_FILE"
+
+# 3) Antigravity: its machine-wide customizations live in ~/.gemini/config.
+if command -v agy >/dev/null 2>&1 || [ -d "$HOME/.gemini/config" ]; then
+  mkdir -p "$HOME/.gemini/config/skills/mybot-memory"
+  install -m 0644 "$HERE/SKILL.md" "$HOME/.gemini/config/skills/mybot-memory/SKILL.md"
+  echo "Antigravity: installed ~/.gemini/config/skills/mybot-memory/SKILL.md"
+fi
 
 echo "Done. Ensure the mybot server is running, then ask your agent about your past work."

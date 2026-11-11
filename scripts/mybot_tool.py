@@ -435,7 +435,7 @@ def main() -> int:
     trajectory_search.add_argument("--trace", action="store_true")
     trajectory_search.add_argument("--after", default="", help="Only sessions updated on/after this ISO date (YYYY-MM-DD)")
     trajectory_search.add_argument("--before", default="", help="Only sessions updated on/before this ISO date (YYYY-MM-DD)")
-    trajectory_search.add_argument("--source", default="", help="Restrict to one source: codex or claude")
+    trajectory_search.add_argument("--source", default="", help="Restrict to one source: codex, claude or antigravity")
 
     trajectory_read = subparsers.add_parser("trajectory-read", help="Read focused evidence from a trajectory")
     trajectory_read.add_argument("--source-ref", required=True)

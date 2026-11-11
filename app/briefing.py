@@ -840,7 +840,7 @@ class BriefingRunner:
                 continue
             ref = str(item.get("source_ref") or "")
             if not ref:
-                found = re.search(r"\b(claude|codex):([0-9a-f]{8}[0-9a-f-]*)", sec["body"])
+                found = re.search(r"\b(claude|codex|antigravity):([0-9a-f]{8}[0-9a-f-]*)", sec["body"])
                 if found:
                     ref = f"{found.group(1)}:{found.group(2)}"
             actions.append({
@@ -1229,7 +1229,7 @@ def source_session(db_path: str | Path, source_ref: str) -> dict[str, Any] | Non
     exactly where it was, with the CLI home it lives under."""
     source, _, ident = (source_ref or "").partition(":")
     ident = ident.rstrip("…. ").lower()
-    if source not in ("claude", "codex") or len(ident) < 8 or not re.fullmatch(r"[0-9a-f-]+", ident):
+    if source not in ("claude", "codex", "antigravity") or len(ident) < 8 or not re.fullmatch(r"[0-9a-f-]+", ident):
         return None
     try:
         with sqlite3.connect(f"file:{db_path}?mode=ro", uri=True, timeout=30) as conn:
@@ -1244,6 +1244,8 @@ def source_session(db_path: str | Path, source_ref: str) -> dict[str, Any] | Non
     if not row:
         return None
     session_id, file_path, cwd = str(row[0]), Path(str(row[1] or "")), str(row[2] or "")
+    if source == "antigravity" and not file_path.is_file():
+        return None  # an editor-only conversation: agy has no step log to resume
     # The conversation's own cwd, from its transcript (Claude resumes a
     # session only from the folder it was recorded in).
     try:
@@ -1288,6 +1290,8 @@ def _resume_command(session: dict[str, Any], prompt: str = "") -> str:
     sid = shlex.quote(session["session_id"])
     if session["agent"] == "codex":
         cmd = f"{env}command codex --dangerously-bypass-approvals-and-sandbox resume {sid}"
+    elif session["agent"] == "antigravity":
+        cmd = f"{env}command agy --conversation {sid} --dangerously-skip-permissions"
     else:
         cmd = f"{env}command claude --resume {sid} --permission-mode bypassPermissions"
     return f"{cmd} {prompt}" if prompt else cmd
@@ -1469,10 +1473,11 @@ def publish_for_hop(runners: dict[str, "BriefingRunner"]) -> dict[str, Any]:
 
 
 def hop_agent_sessions() -> dict[str, dict[str, Any]]:
-    """Map agent conversation ids (Claude session uuid / Codex thread id) to
-    the live hop session hosting them. Claude: hop's own claude-sessions
-    records. Codex: the codex process's HOP_SESSION environment plus the
-    thread id it was resumed with (or the rollout file it has open)."""
+    """Map agent conversation ids (Claude session uuid / Codex thread id /
+    Antigravity conversation id) to the live hop session hosting them. Claude
+    and Antigravity: hop's own claude-sessions records (.json, .agy). Codex:
+    the codex process's HOP_SESSION environment plus the thread id it was
+    resumed with (or the rollout file it has open)."""
     import subprocess
 
     try:
@@ -1483,7 +1488,7 @@ def hop_agent_sessions() -> dict[str, dict[str, Any]]:
     items = listing if isinstance(listing, list) else (listing.get("sessions") or [])
     live = {
         str(s.get("internalName")): s for s in items
-        if s.get("live") and s.get("agent") in ("claude", "codex")
+        if s.get("live") and s.get("agent") in ("claude", "codex", "antigravity")
     }
     out: dict[str, dict[str, Any]] = {}
 
@@ -1498,11 +1503,16 @@ def hop_agent_sessions() -> dict[str, dict[str, Any]]:
             }
 
     records = Path.home() / ".hop2" / "claude-sessions"
-    for path in records.glob("*.json"):
-        try:
-            add(str(json.loads(path.read_text()).get("sessionId") or ""), path.stem)
-        except (OSError, json.JSONDecodeError):
-            continue
+    # A room can hold both records: only the one for the agent now running
+    # there names the conversation that is live.
+    for suffix, agent in (("json", "claude"), ("agy", "antigravity")):
+        for path in records.glob(f"*.{suffix}"):
+            if (live.get(path.stem) or {}).get("agent") != agent:
+                continue
+            try:
+                add(str(json.loads(path.read_text()).get("sessionId") or ""), path.stem)
+            except (OSError, json.JSONDecodeError):
+                continue
     try:
         ps = subprocess.run(["ps", "eww", "-axo", "pid=,command="], capture_output=True, text=True, timeout=30)
     except (OSError, subprocess.SubprocessError):

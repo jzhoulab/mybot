@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Step-by-step local access setup for Codex and Claude trajectory sources."""
+"""Step-by-step local access setup for Codex, Claude and Antigravity trajectory sources."""
 
 from __future__ import annotations
 
@@ -120,9 +120,9 @@ def run_wizard(config_path: Path, max_files: int) -> Path:
 
     print("mybot trajectory access setup")
     print("Policy: each enabled root can use blacklist mode or whitelist mode.")
-    print("The bot reads Codex and Claude trajectory JSONL files through their source adapters, not arbitrary files.\n")
+    print("The bot reads Codex, Claude and Antigravity trajectory files through their source adapters, not arbitrary files.\n")
 
-    for source_name in ("codex", "claude"):
+    for source_name in ("codex", "claude", "antigravity"):
         print(f"Step: {source_name} roots")
         roots = merge_roots(source_name, existing.sources.get(source_name, []))
         default_root = DEFAULT_BASE_DIRS[source_name]

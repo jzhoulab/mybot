@@ -76,7 +76,7 @@ def is_catch_all_dir(cwd: str) -> bool:
         rel = path.relative_to(home)
     except ValueError:
         return False
-    return bool(rel.parts) and rel.parts[0].startswith((".claude", ".codex"))
+    return bool(rel.parts) and rel.parts[0].startswith((".claude", ".codex", ".gemini"))
 
 
 def _session_id(ref: str) -> str:

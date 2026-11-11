@@ -15,10 +15,14 @@ Antigravity keeps one folder per conversation, named by its id, under a
   conversation what can be read is its markdown artifacts (task.md,
   implementation_plan.md, walkthrough.md): the plan and what was done.
 
-Neither records a working directory; it's inferred from the paths the
-agent's tools used. Upgraded installs can hold the same conversation under
-more than one brain/ folder, so a conversation is read once, from its
-fullest copy.
+Beside the transcripts the CLI keeps `history.jsonl`, one line per prompt
+typed in its terminal ({display, timestamp, workspace, conversationId, type}),
+and `cache/conversation_metadata.json` with each conversation's title. The
+history gives the real working folder, and it is also how a person's
+conversation is told from an `agy -p` run: print mode appears in neither file.
+Without a history entry the folder is inferred from the paths the agent's
+tools used. Upgraded installs can hold the same conversation under more than
+one brain/ folder, so a conversation is read once, from its fullest copy.
 """
 from __future__ import annotations
 
@@ -28,6 +32,7 @@ import os
 import re
 from collections import Counter
 from datetime import datetime, timezone
+from urllib.parse import unquote, urlparse
 
 from .access import TrajectoryAccessAccount
 from .common import (
@@ -49,6 +54,57 @@ ARTIFACTS = ("task.md", "implementation_plan.md", "walkthrough.md", "proposal.md
 _REQUEST_RE = re.compile(r"<USER_REQUEST>(.*?)</USER_REQUEST>", re.S)
 _PATH_ARG_RE = re.compile(r"(?i)(cwd|workdir|directory|dir|path|file|target)")
 _UUID_RE = re.compile(r"^[0-9a-fA-F-]{8,}$")
+_MODEL_RE = re.compile(r"Model Selection`?\s+from\s+.*?\s+to\s+(.+?)(?:\.\s|\.$|\n|<)|Model Selection[^\n]*?:\s*([^\n<]+)")
+_STEP_CLOCK_RE = re.compile(r"^(?:Created|Completed) At: .*\n?", re.M)
+_index_cache: dict[str, tuple[list, dict]] = {}
+
+
+def conversation_index(base_dir: str) -> dict:
+    """What the CLI records beside its transcripts: {workspaces: {id: folder},
+    titles: {id: title}, typed: {ids a person used}, logged: any record found}."""
+    stores = sorted(glob.glob(os.path.join(base_dir, "antigravity*")))
+    signature = []
+    for store in stores:
+        for path in (os.path.join(store, "history.jsonl"),
+                     os.path.join(store, "cache", "conversation_metadata.json")):
+            try:
+                stat = os.stat(path)
+            except OSError:
+                continue
+            signature.append((path, stat.st_mtime_ns, stat.st_size))
+    cached = _index_cache.get(base_dir)
+    if cached and cached[0] == signature:
+        return cached[1]
+    index: dict = {"workspaces": {}, "titles": {}, "typed": set(), "logged": bool(signature)}
+    for store in stores:
+        for line in iter_bounded_jsonl_lines(os.path.join(store, "history.jsonl")) \
+                if os.path.isfile(os.path.join(store, "history.jsonl")) else ():
+            try:
+                entry = json.loads(line) if line else None
+            except json.JSONDecodeError:
+                continue
+            ident = str(entry.get("conversationId") or "") if isinstance(entry, dict) else ""
+            if ident:
+                index["typed"].add(ident)
+                if entry.get("workspace"):
+                    index["workspaces"][ident] = str(entry["workspace"])
+        try:
+            with open(os.path.join(store, "cache", "conversation_metadata.json"), encoding="utf-8") as handle:
+                conversations = json.load(handle).get("conversations") or {}
+        except (OSError, ValueError, AttributeError):
+            continue
+        for ident, record in conversations.items():
+            summary = (record or {}).get("summary") or {}
+            if record.get("is_internal") or summary.get("Internal"):
+                continue
+            index["typed"].add(ident)
+            if summary.get("Title"):
+                index["titles"][ident] = str(summary["Title"])
+            uris = summary.get("WorkspaceURIs") or []
+            if uris and ident not in index["workspaces"]:
+                index["workspaces"][ident] = unquote(urlparse(str(uris[0])).path)
+    _index_cache[base_dir] = (signature, index)
+    return index
 
 
 def user_request(content: str) -> str:
@@ -183,8 +239,8 @@ class AntigravitySourceAdapter(TrajectorySourceAdapter):
                 kind, origin = str(step.get("type") or ""), str(step.get("source") or "")
                 content = str(step.get("content") or "")
                 if kind == "USER_INPUT":
-                    found = re.search(r"Model Selection[^\n]*?:\s*([^\n<]+)", content)
-                    model = found.group(1).strip() if found else model
+                    found = _MODEL_RE.search(content)
+                    model = (found.group(1) or found.group(2)).strip() if found else model
                     text = user_request(content)
                     if text:
                         if origin == "USER_EXPLICIT" and is_real_user_text(text):
@@ -212,7 +268,9 @@ class AntigravitySourceAdapter(TrajectorySourceAdapter):
                     paths += re.findall(r"(?:file://)?(/(?:Users|home)/[^\s)`'\"]+)", text)
         if not turns or last_ts is None:
             return None
-        cwd = infer_cwd(paths, command_dirs)
+        index = conversation_index(self.base_dir)
+        recorded = index["workspaces"].get(ident, "")
+        cwd = recorded or infer_cwd(paths, command_dirs)
         if not self.account.include_workdir(cwd or None):
             return None
         session_id = self.account.scoped_session_id(ident)
@@ -220,11 +278,14 @@ class AntigravitySourceAdapter(TrajectorySourceAdapter):
             return None
         origin = "interactive" if human_turns or not transcript else "automated"
         origin_detail = "" if origin == "interactive" else "no-user-turns"
+        if transcript and "/antigravity-cli/" in transcript and index["logged"] and ident not in index["typed"]:
+            # `agy -p`: a script or another agent, not someone at the terminal.
+            origin, origin_detail = "automated", "exec"
         if self.account.is_origin_excluded(origin, origin_detail):
             return None
         user_turns = [t.text for t in turns if t.role == "user"]
         assistant_turns = [t.text for t in turns if t.role == "assistant"]
-        title = choose_title("", user_turns, "antigravity conversation")
+        title = choose_title(index["titles"].get(ident, ""), user_turns, "antigravity conversation")
         return NormalizedTrajectory(
             source_name=self.source_name(),
             session_id=session_id,
@@ -239,7 +300,7 @@ class AntigravitySourceAdapter(TrajectorySourceAdapter):
                 "account": self.account.name,
                 "raw_session_id": ident,
                 "cwd": cwd,
-                "cwd_inferred": True,
+                "cwd_inferred": not recorded,
                 "app": "cli" if transcript and "/antigravity-cli/" in transcript else "editor",
                 "transcript": bool(transcript),
                 "model": model,
@@ -253,7 +314,7 @@ class AntigravitySourceAdapter(TrajectorySourceAdapter):
 
 def iter_typed_prompts(base_dir: str):
     """(conversation id, timestamp, cwd, prompt) for every prompt the owner
-    typed, for the prompt history (Antigravity keeps no history.jsonl)."""
+    typed, from the transcripts (for stores with no history.jsonl)."""
     for ident, folders in conversation_files(os.path.expanduser(base_dir)).items():
         transcript = best_transcript(folders)
         if not transcript:
@@ -269,6 +330,77 @@ def iter_typed_prompts(base_dir: str):
             text = user_request(str(step.get("content") or ""))
             if ts and text:
                 yield ident, ts.isoformat(), "", text
+
+
+def transcript_workdir(path: str, base_dir: str) -> str:
+    """The working folder of one transcript, without reading its turns."""
+    ident = os.path.basename(os.path.dirname(os.path.dirname(os.path.dirname(path))))
+    recorded = conversation_index(base_dir)["workspaces"].get(ident)
+    if recorded:
+        return recorded
+    paths: list[str] = []
+    command_dirs: list[str] = []
+    for line in iter_bounded_jsonl_lines(path):
+        try:
+            step = json.loads(line) if line else None
+        except json.JSONDecodeError:
+            continue
+        for call in (step.get("tool_calls") or []) if isinstance(step, dict) else []:
+            if isinstance(call, dict):
+                _walk_args(call.get("args"), paths, command_dirs)
+    return infer_cwd(paths, command_dirs)
+
+
+def tool_summary(call: dict) -> str:
+    """One line per tool call, the way the Claude and Codex readers write them."""
+    name = str(call.get("name") or "tool")
+    args = call.get("args") if isinstance(call.get("args"), dict) else {}
+    if name == "run_command":
+        return f"[run_command] {str(args.get('CommandLine') or '')[:1000]}"
+    target = args.get("Path") or args.get("AbsolutePath") or args.get("TargetFile")
+    if target:
+        return f"[{name}] {target}"
+    shown = {k: v for k, v in args.items() if k not in ("toolSummary", "WaitMsBeforeAsync")}
+    return f"[{name}] {json.dumps(shown, ensure_ascii=False)[:1000]}"
+
+
+def step_output(content: str) -> str:
+    """A tool step's result without the clock lines Antigravity prepends."""
+    return _STEP_CLOCK_RE.sub("", content or "").strip()
+
+
+def read_events(file_path: str) -> list[tuple[str, str, str]]:
+    """(role, text, timestamp) with the agent's actions and tool output, as
+    the index and session reader want: user, assistant, actions, tool_result.
+    An editor-only conversation has just its artifacts."""
+    if os.path.isdir(file_path):
+        return read_turns(file_path)
+    events: list[tuple[str, str, str]] = []
+    for line in iter_bounded_jsonl_lines(file_path):
+        try:
+            step = json.loads(line) if line else None
+        except json.JSONDecodeError:
+            continue
+        if not isinstance(step, dict):
+            continue
+        kind, content = str(step.get("type") or ""), str(step.get("content") or "")
+        stamp = str(step.get("created_at") or "")
+        if kind == "USER_INPUT":
+            text = user_request(content)
+            if text:
+                events.append(("user", text, stamp))
+            continue
+        if kind == "PLANNER_RESPONSE":
+            if content.strip():
+                events.append(("assistant", content.strip(), stamp))
+            calls = [tool_summary(c) for c in step.get("tool_calls") or [] if isinstance(c, dict)]
+            if calls:
+                events.append(("actions", "\n".join(calls), stamp))
+            continue
+        output = step_output(content)
+        if output:
+            events.append(("tool_result", output[:1200], stamp))
+    return events
 
 
 def read_turns(file_path: str) -> list[tuple[str, str, str]]:

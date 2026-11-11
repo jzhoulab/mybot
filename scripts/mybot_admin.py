@@ -82,7 +82,7 @@ def _config() -> dict[str, Any]:
     )
     sources = [
         name.strip().lower()
-        for name in os.environ.get("TRAJECTORY_SOURCES", "codex,claude").split(",")
+        for name in os.environ.get("TRAJECTORY_SOURCES", "codex,claude,antigravity").split(",")
         if name.strip()
     ]
     return {
@@ -557,12 +557,36 @@ def _parse_claude_event(entry: dict[str, Any], events: list[dict[str, Any]]) -> 
                                    "text": _trunc(_stringify(block.get("content", "")))})
 
 
+def _parse_antigravity_event(entry: dict[str, Any], events: list[dict[str, Any]]) -> None:
+    from sources.antigravity import step_output, user_request
+
+    kind, content = str(entry.get("type") or ""), str(entry.get("content") or "")
+    if kind == "USER_INPUT":
+        _push(events, "user", user_request(content))
+    elif kind == "PLANNER_RESPONSE":
+        _push(events, "thinking", str(entry.get("thinking") or ""))
+        _push(events, "assistant", content)
+        for call in entry.get("tool_calls") or []:
+            if isinstance(call, dict):
+                events.append({"kind": "tool_use", "tool": str(call.get("name", "tool")),
+                               "text": _trunc(_stringify(call.get("args", {})))})
+    elif step_output(content):
+        events.append({"kind": "tool_result", "tool": "output", "text": _trunc(step_output(content))})
+
+
 def _parse_trajectory(path: str, source: str, cap: int) -> tuple[list[dict[str, Any]], int]:
     """Bounded parse: skips oversized lines, stops at `cap` events. Returns
     (events, omitted_large_line_count)."""
-    parse_event = _parse_claude_event if source == "claude" else _parse_codex_event
+    parse_event = {"claude": _parse_claude_event, "antigravity": _parse_antigravity_event}.get(source, _parse_codex_event)
     events: list[dict[str, Any]] = []
     omitted = 0
+    if source == "antigravity" and os.path.isdir(path):
+        # An editor-only conversation: its plan and walkthrough, no step log.
+        from sources.antigravity import read_events
+
+        for role, text, _ in read_events(path)[:cap]:
+            _push(events, role, text)
+        return events, 0
     for line in _iter_trajectory_lines(path):
         if len(events) >= cap:
             break

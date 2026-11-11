@@ -1,11 +1,11 @@
 ---
 name: mybot-memory
-description: Search the user's own past Claude Code and Codex coding sessions (their "mybot" trajectory memory). Use when the user asks about their own prior work — "have I done X before", "what was the config/command for Y", "did I already try Z", "what did I decide about W", "where's that error I hit", or wants grounded evidence from earlier sessions rather than a guess. Provides hybrid semantic + exact search, read-only SQL with regex over the cleaned index, and windowed transcript reads.
+description: Search the user's own past Claude Code, Codex and Antigravity coding sessions (their "mybot" trajectory memory). Use when the user asks about their own prior work — "have I done X before", "what was the config/command for Y", "did I already try Z", "what did I decide about W", "where's that error I hit", or wants grounded evidence from earlier sessions rather than a guess. Provides hybrid semantic + exact search, read-only SQL with regex over the cleaned index, and windowed transcript reads.
 ---
 
 # mybot memory: search your own coding history
 
-You have a searchable index of the user's past **Claude Code and Codex sessions**
+You have a searchable index of the user's past **Claude Code, Codex and Antigravity sessions**
 on this machine — every prior conversation, command, and tool output, cleaned and
 deduplicated. Use it to answer "have I done this before / what was that config /
 did that job finish / what did I decide" with **real evidence from their history**,
@@ -22,7 +22,7 @@ All commands go through the `mybot` CLI (owner identity + server URL are preset)
 ## Search
 
 ```
-mybot trajectory-search -q "<query>" [--limit N] [--after YYYY-MM-DD] [--before YYYY-MM-DD] [--source codex|claude]
+mybot trajectory-search -q "<query>" [--limit N] [--after YYYY-MM-DD] [--before YYYY-MM-DD] [--source codex|claude|antigravity]
 ```
 Hybrid lexical + semantic search over sessions. Each hit reports `source_ref`,
 `title`, `cwd`, `updated_at`, a `snippet`, and in `metadata`: `event_start`,
@@ -37,7 +37,7 @@ Search promoted long-term notes (semantic memory), separate from raw sessions.
 ## Read the exact spot
 
 ```
-mybot trajectory-read --source-ref "<codex|claude:id>" [--around-event N --events-before 3 --events-after 6] [--chunk-id C] [-q "<query>"]
+mybot trajectory-read --source-ref "<codex|claude|antigravity:id>" [--around-event N --events-before 3 --events-after 6] [--chunk-id C] [-q "<query>"]
 ```
 Zoom into a session. `--around-event N` (from a hit's `event_start`) reads a
 window; `--chunk-id C` (from a hit's `metadata.chunk_id`) reads that exact chunk
@@ -53,7 +53,7 @@ Read-only SQL over the cleaned, included-only index. Tables:
 - `trajectory_chunks(id, source_ref, source_name, cwd, title, updated_at, event_start, event_end, text, metadata_json)`
 - FTS5 `trajectory_chunks_fts(title, cwd, text)`
 - `prompt_history(id, source_name, session_id, ts, cwd, text)` — every prompt the user
-  typed (Claude Code + Codex) with ISO `ts` and project dir; FTS5
+  typed (Claude Code, Codex, Antigravity) with ISO `ts` and project dir; FTS5
   `prompt_history_fts(text, cwd)`. Durable: it survives transcript deletion, so it
   places work in time and names the session (`source_name:session_id`) even when
   `trajectory_chunks` has nothing. `trajectory-search` also returns `prompt_history` hits.

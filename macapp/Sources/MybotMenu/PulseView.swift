@@ -762,7 +762,7 @@ struct FollowUpEditor: View {
             }
             .labelsHidden()
             if target == Self.otherID {
-                TextField("Session id, e.g. claude:2099f0a8-… or codex:01a1…", text: $otherRef)
+                TextField("Session id, e.g. claude:2099f0a8-…, codex:01a1… or antigravity:98d9…", text: $otherRef)
                     .textFieldStyle(.roundedBorder).font(.system(size: 11.5))
                 Text(resolvedOther == nil ? "Paste a session reference (the agent, a colon, then the id)."
                                           : "Reopens that conversation in a new hop session.")
@@ -796,7 +796,7 @@ struct FollowUpEditor: View {
 
     private var resolvedOther: String? {
         let ref = otherRef.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard ref.range(of: #"^(claude|codex):[0-9a-fA-F-]{8,}$"#, options: .regularExpression) != nil else { return nil }
+        guard ref.range(of: #"^(claude|codex|antigravity):[0-9a-fA-F-]{8,}$"#, options: .regularExpression) != nil else { return nil }
         return "resume:" + ref
     }
 
