@@ -1519,10 +1519,15 @@ def hop_agent_sessions() -> dict[str, dict[str, Any]]:
         ps = None
     uuid_re = re.compile(r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}")
     for line in (ps.stdout.splitlines() if ps else []):
-        if "codex" not in line or "HOP_SESSION=" not in line:
+        # A claude that hop forked runs `--resume <source> --fork-session`
+        # (and "codex" turns up in any environment): it is a NEW conversation,
+        # not the source's. Read as codex's `resume <id>`, it took over the
+        # source's conversation, and every pulse item about the source went
+        # to the fork instead.
+        if "codex" not in line or "HOP_SESSION=" not in line or "--fork-session" in line:
             continue
         hop = re.search(r"\bHOP_SESSION=(\S+)", line)
-        resumed = re.search(r"\bresume\s+'?(" + uuid_re.pattern + r")", line)
+        resumed = re.search(r"(?<![\w-])resume\s+'?(" + uuid_re.pattern + r")", line)
         if hop and resumed:
             add(resumed.group(1), hop.group(1))
     return out
