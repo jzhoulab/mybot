@@ -1511,6 +1511,53 @@ class ProviderClient:
             "usage": usage,
         }
 
+    def run_antigravity_task(
+        self,
+        *,
+        prompt: str,
+        tool_env: dict[str, str] | None = None,
+        model: str = "",
+        effort: str = "",
+        cwd: str | None = None,
+        timeout: int | None = None,
+    ) -> dict[str, Any]:
+        """One headless `agy -p` turn, for the owner's own pulse only. agy's
+        built-in tools (browser, scheduling, subagents) can't be turned off
+        and its terminal sandbox blocks localhost (the mybot tool) while still
+        reading the home folder, so it runs unsandboxed and must never answer
+        teammates. The conversation it leaves in agy's history is removed."""
+        command = os.environ.get("ANTIGRAVITY_COMMAND") or shutil.which("agy") or "agy"
+        cmd = [command, "--dangerously-skip-permissions", "--output-format", "json",
+               "--disable-slash-commands"]
+        if model:
+            cmd.extend(["--model", model])
+        if effort:
+            # agy's top level is xhigh; mybot's "max" maps onto it.
+            cmd.extend(["--effort", "xhigh" if effort == "max" else effort])
+        if timeout:
+            cmd.extend(["--print-timeout", f"{int(timeout)}s"])
+        cmd.append(f"-p={prompt}")
+        workdir = cwd or self.config.codex_cwd
+        Path(workdir).mkdir(parents=True, exist_ok=True)
+        env = agent_subprocess_env(tool_env)
+        proc = subprocess.run(cmd, capture_output=True, text=True, env=env, cwd=workdir,
+                              timeout=(timeout + 120) if timeout else None)
+        data: dict[str, Any] = {}
+        match = re.search(r"\{.*\}", proc.stdout or "", re.S)
+        if match:
+            try:
+                data = json.loads(match.group(0))
+            except json.JSONDecodeError:
+                data = {}
+        forget_antigravity_conversation(str(data.get("conversation_id") or ""))
+        if proc.returncode != 0 or str(data.get("status") or "").upper() != "SUCCESS":
+            raise RuntimeError(
+                f"Antigravity CLI failed (exit {proc.returncode}). stderr={normalize_text(proc.stderr, 1500)} "
+                f"stdout={normalize_text(proc.stdout, 1500)}"
+            )
+        return {"text": str(data.get("response") or "").strip(), "provider_style": "antigravity_cli",
+                "usage": data.get("usage")}
+
     def complete(
         self,
         *,
@@ -1731,6 +1778,17 @@ AGENT_ENV_ALLOW = {
     "PATH", "HOME", "USER", "LOGNAME", "SHELL", "TMPDIR", "TERM", "LANG", "TZ",
     "CODEX_HOME", "CLAUDE_CONFIG_DIR", "XDG_CONFIG_HOME", "XDG_CACHE_HOME",
 }
+
+
+def forget_antigravity_conversation(conversation_id: str, home: Path | None = None) -> None:
+    """Remove a headless agy run's conversation (its store, brain folder and
+    presence lock) so mybot's own runs don't fill the owner's agy history."""
+    if not re.fullmatch(r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}", conversation_id or ""):
+        return
+    root = (home or Path.home()) / ".gemini" / "antigravity-cli"
+    for path in (root / "conversations" / f"{conversation_id}.db", root / "presence" / f"{conversation_id}.lock"):
+        path.unlink(missing_ok=True)
+    shutil.rmtree(root / "brain" / conversation_id, ignore_errors=True)
 
 
 def agent_subprocess_env(tool_env: dict[str, str] | None = None) -> dict[str, str]:

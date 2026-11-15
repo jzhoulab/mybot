@@ -83,7 +83,13 @@ def _fmt_local(iso: str) -> str:
         return iso[:16]
 
 
-ENGINE_LABELS = {"claude": "Claude", "gpt": "GPT"}
+ENGINE_LABELS = {"claude": "Claude", "gpt": "GPT", "antigravity": "Antigravity"}
+# The hop agent each engine's follow-ups open in.
+ENGINE_AGENTS = {"claude": "claude", "gpt": "codex", "antigravity": "antigravity"}
+
+
+def engine_agent(engine: str) -> str:
+    return ENGINE_AGENTS.get(engine, "claude")
 
 
 class BriefingRunner:
@@ -99,9 +105,10 @@ class BriefingRunner:
         self.verify_effort = _env("BRIEFING_VERIFY_EFFORT", "high")
         self.planner_effort = _env("BRIEFING_PLANNER_EFFORT", "medium")
         # Each engine uses its strongest model by default.
-        self.model = (
-            _env("BRIEFING_GPT_MODEL", "gpt-6-astra") if engine == "gpt" else _env("BRIEFING_MODEL", "fable")
-        )
+        self.model = {
+            "gpt": lambda: _env("BRIEFING_GPT_MODEL", "gpt-6-astra"),
+            "antigravity": lambda: _env("BRIEFING_ANTIGRAVITY_MODEL", "gemini-4-hydrogen"),
+        }.get(engine, lambda: _env("BRIEFING_MODEL", "fable"))()
         self.web_research = _env_bool("BRIEFING_WEB_RESEARCH", True)
         self.max_workstreams = int(_env("BRIEFING_MAX_WORKSTREAMS", "6"))
         self.parallel = int(_env("BRIEFING_PARALLEL_ANALYSTS", "3"))
@@ -415,7 +422,17 @@ class BriefingRunner:
             else None
         )
         started = time.time()
-        if self.engine == "gpt":
+        if self.engine == "antigravity":
+            # No separate system prompt in print mode; web search is built in.
+            result = provider.run_antigravity_task(
+                prompt=f"{system}\n\n---\n\n{message}",
+                tool_env=tool_env,
+                model=self.model,
+                effort=effort,
+                cwd=self.state.config.codex_cwd,
+                timeout=self.agent_timeout,
+            )
+        elif self.engine == "gpt":
             # Codex has no separate system prompt in exec mode; it always has
             # its (sandboxed) shell, and --search turns on live web search.
             result = provider._run_codex(
@@ -454,7 +471,8 @@ class BriefingRunner:
     def _tool_section(self) -> str:
         tool = f"{self.state.config.mybot_tool_python} {self.state.config.mybot_tool_path}"
         web = (
-            "You have WebSearch and WebFetch for real research. Cite URLs."
+            ("You have WebSearch and WebFetch for real research. Cite URLs." if self.engine == "claude"
+             else "You have web search and web page reading for real research. Cite URLs.")
             if self.web_research
             else "You have no web access."
         )
@@ -940,7 +958,7 @@ class BriefingRunner:
         live = live_hop_sessions(self.state.config.trajectory_index_db_path,
                                  [(source["agent"], source["session_id"])] if source else [])
         sessions = {s["conversation"]: s for s in live}
-        agent = "codex" if self.engine == "gpt" else "claude"
+        agent = engine_agent(self.engine)
         options: list[dict[str, Any]] = []
         seen: set[str] = set()
         for s in sorted(live, key=lambda s: (s["name"].lower(), not s["title"])):
@@ -1030,7 +1048,7 @@ class BriefingRunner:
                     "message": message,
                     "error": f"hop won't let agents type into “{hop_target['name']}”. "
                              "The message is ready to paste there."}
-        agent = "codex" if self.engine == "gpt" else "claude"
+        agent = engine_agent(self.engine)
         name = f"pulse-{date[5:].replace('-', '')}-{self.engine}-{action_id}"
         source = source_session(db, rest) if kind == "resume" else None
         if kind == "resume" and source is None:
@@ -1345,6 +1363,8 @@ def _launch_command(engine: str, task_path: Path) -> str:
     # The phone creates a hop session in the item's folder and types this
     # one line. The task itself lives in a file, so nothing long or quoted
     # crosses the terminal. `command` bypasses shell wrappers/functions.
+    if engine == "antigravity":
+        return f"command agy --dangerously-skip-permissions -i=\"$(cat '{task_path}')\""
     if engine == "gpt":
         return f"command codex --dangerously-bypass-approvals-and-sandbox \"$(cat '{task_path}')\""
     return f"command claude --permission-mode bypassPermissions \"$(cat '{task_path}')\""
@@ -1694,7 +1714,7 @@ def resolve_route(action: dict[str, Any], sessions: dict[str, dict[str, Any]],
         else:
             target = "new"
     kind, _, rest = target.partition(":")
-    agent = "codex" if engine == "gpt" else "claude"
+    agent = engine_agent(engine)
     if kind == "live":
         destination = f"hop session “{live[rest]['name']}” (open now)"
     elif kind == "resume" and resumed:
