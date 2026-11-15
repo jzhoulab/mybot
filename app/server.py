@@ -1550,12 +1550,20 @@ class ProviderClient:
             except json.JSONDecodeError:
                 data = {}
         forget_antigravity_conversation(str(data.get("conversation_id") or ""))
-        if proc.returncode != 0 or str(data.get("status") or "").upper() != "SUCCESS":
+        text = str(data.get("response") or "").strip()
+        status = str(data.get("status") or "").upper()
+        if text and status != "SUCCESS":
+            # agy has reported ERROR on a turn that finished with a complete
+            # answer (after a retried connection reset); keep the answer.
+            log.warning("Antigravity run %s ended with status %s (exit %s) but answered; keeping it. %s",
+                        data.get("conversation_id"), status or "?", proc.returncode,
+                        normalize_text(str({k: v for k, v in data.items() if k != "response"}), 500))
+        if not text:
             raise RuntimeError(
                 f"Antigravity CLI failed (exit {proc.returncode}). stderr={normalize_text(proc.stderr, 1500)} "
                 f"stdout={normalize_text(proc.stdout, 1500)}"
             )
-        return {"text": str(data.get("response") or "").strip(), "provider_style": "antigravity_cli",
+        return {"text": text, "provider_style": "antigravity_cli",
                 "usage": data.get("usage")}
 
     def complete(

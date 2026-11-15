@@ -33,11 +33,11 @@ class AntigravityPulseEngineTest(unittest.TestCase):
     def tearDown(self):
         self.tmp.cleanup()
 
-    def _fake(self, status="SUCCESS", code=0):
+    def _fake(self, status="SUCCESS", code=0, response=" the pulse "):
         self.fake.write_text(
             "#!/usr/bin/env python3\nimport json, sys, os\n"
             f"json.dump({{'argv': sys.argv[1:], 'cwd': os.getcwd(), 'tok': os.environ.get('MYBOT_TOOL_TOKEN')}}, open({str(self.args)!r}, 'w'))\n"
-            f"print(json.dumps({{'conversation_id': {self.cid!r}, 'status': {status!r}, 'response': ' the pulse '}}))\n"
+            f"print(json.dumps({{'conversation_id': {self.cid!r}, 'status': {status!r}, 'response': {response!r}}}))\n"
             f"sys.exit({code})\n")
         self.fake.chmod(self.fake.stat().st_mode | stat.S_IEXEC)
 
@@ -67,8 +67,14 @@ class AntigravityPulseEngineTest(unittest.TestCase):
         self.assertFalse((self.store / "brain" / self.cid).exists())
         self.assertTrue((self.store / "conversations" / "keep.db").exists())
 
+    def test_error_status_with_an_answer_keeps_the_answer(self):
+        self._fake(status="ERROR")
+        with mock.patch.dict(os.environ, {"ANTIGRAVITY_COMMAND": str(self.fake)}), \
+                mock.patch.object(server.Path, "home", lambda: self.home):
+            self.assertEqual(self._call()["text"], "the pulse")
+
     def test_failure_raises_and_still_cleans_up(self):
-        self._fake(status="ERROR", code=1)
+        self._fake(status="ERROR", code=1, response="")
         with mock.patch.dict(os.environ, {"ANTIGRAVITY_COMMAND": str(self.fake)}), \
                 mock.patch.object(server.Path, "home", lambda: self.home):
             with self.assertRaises(RuntimeError):
