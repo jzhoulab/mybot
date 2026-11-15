@@ -108,6 +108,8 @@ class BriefingRunner:
         self.retrieval_budget = _env("BRIEFING_RETRIEVAL_BUDGET_SECONDS", "900")
         self.agent_timeout = int(_env("BRIEFING_AGENT_TIMEOUT_SECONDS", "2700"))
         self.discord_dm = _env_bool("BRIEFING_DISCORD_DM", True)
+        # Items whose work is open in a live hop session go straight there.
+        self.auto_send = _env_bool("BRIEFING_AUTO_SEND", True)
         self.dir = Path(state.config.state_dir) / "briefings"
         self.dir.mkdir(parents=True, exist_ok=True)
         self.outbox_path = Path(state.config.state_dir) / "outbox.jsonl"
@@ -198,8 +200,13 @@ class BriefingRunner:
             self.status["stage"] = "follow-up actions"
             record["sections"] = self.structure(text)
             record["actions"] = self.make_actions(evidence, record["sections"])
+            if self.auto_send:
+                self.status["stage"] = "send to hop sessions"
+                record["sent"] = self.send_to_live_sessions(day, record["actions"])
             record["seconds"] = round(time.time() - started, 1)
             self._write(day, text, record)
+            # deliver() reads the follow-ups from this file: write it first.
+            (self.dir / f"{day}{self.suffix}.json").write_text(json.dumps(record, indent=1, default=str))
             self.status["stage"] = "deliver"
             record["delivered"] = self.deliver(day, text)
             (self.dir / f"{day}{self.suffix}.json").write_text(json.dumps(record, indent=1, default=str))
@@ -1058,6 +1065,43 @@ class BriefingRunner:
         log.info("pulse follow-up %s/%s spawned in hop as %s", date, action_id, name)
         return {"ok": True, **action["spawned"]}
 
+    def send_to_live_sessions(self, date: str, actions: list[dict[str, Any]]) -> dict[str, Any]:
+        """Send each item whose route is a live hop session straight to it,
+        one message per session. Items for a closed conversation or a new
+        agent stay one tap away: opening those means starting agents."""
+        live = hop_agent_sessions()
+        rooms = {t["internal_name"]: t for t in live.values()}
+        groups: dict[str, list[dict[str, Any]]] = {}
+        for action in actions:
+            kind, _, rest = str(action.get("target") or "").partition(":")
+            if kind == "live" and rest in rooms and rooms[rest].get("agent_permitted") and not action.get("spawned"):
+                groups.setdefault(rest, []).append(action)
+        PULSE_TASK_DIR.mkdir(parents=True, exist_ok=True)
+        sent: dict[str, Any] = {}
+        for internal, items in groups.items():
+            paths = []
+            for action in items:
+                task_path = PULSE_TASK_DIR / f"{date}-{self.engine}-{action['id']}.md"
+                task_path.write_text(f"(Follow-up from mybot's morning pulse, {date}.)\n\n{action.get('prompt') or ''}\n")
+                paths.append((str(action.get("label") or "Follow up"), task_path))
+            message = pulse_message(date, paths[0][0], paths[0][1]) if len(paths) == 1 else pulse_batch_message(date, paths)
+            result = self._hopa(["tool", "hopx_send_and_wait", json.dumps({
+                "terminal_id": internal, "data": message, "press_enter": True, "wait": False,
+            })], timeout=60)
+            name = rooms[internal]["name"]
+            if not result.get("ok"):
+                log.warning("pulse %s: could not send to hop session %s: %s", date, name, result)
+                sent[name] = {"ok": False, "items": [a["id"] for a in items]}
+                continue
+            at = datetime.now(timezone.utc).isoformat()
+            for action in items:
+                action["spawned"] = {"terminal": name, "terminal_id": internal, "session": internal,
+                                     "routed": "existing", "auto": True, "at": at}
+            sent[name] = {"ok": True, "items": [a["id"] for a in items]}
+        if sent:
+            log.info("pulse %s: sent items straight to hop sessions %s", date, sorted(sent))
+        return sent
+
     @staticmethod
     def _hopa(args: list[str], *, timeout: int) -> dict[str, Any]:
         import subprocess
@@ -1394,6 +1438,7 @@ def _hop_pulse(engine: str, latest: dict[str, Any], sessions: dict[str, dict[str
             "prompt": text,
             "target": route["target"],
             "destination": route["destination"],
+            "sent_to": (action.get("spawned") or {}).get("terminal") or "",
         }
         kind, _, rest = route["target"].partition(":")
         resume = source if kind == "resume" and source and rest.endswith(source["session_id"]) else (
@@ -1667,13 +1712,19 @@ def follow_ups_text(actions: list[dict[str, Any]]) -> str:
     if not actions:
         return ""
     blocks = []
+    waiting = False
     for action in actions:
         text = str(action.get("prompt_edited") or action.get("prompt") or "").strip()
         quoted = "\n".join(f"> {line}" if line.strip() else ">" for line in text.splitlines())
-        blocks.append(f"**{action.get('label') or 'Follow up'}** ({action.get('id')}) → "
-                      f"{action.get('destination') or 'hop'}\n{quoted}")
-    return ("\n\n**Follow-ups** — send from the Pulse tab in the Mac app or in hop on the phone\n\n"
-            + "\n\n".join(blocks))
+        spawned = action.get("spawned") or {}
+        where = (f"sent to hop session “{spawned.get('terminal')}”" if spawned.get("auto")
+                 else action.get("destination") or "hop")
+        waiting = waiting or not spawned
+        blocks.append(f"**{action.get('label') or 'Follow up'}** ({action.get('id')}) → {where}\n{quoted}")
+    note = (" — the rest send from the Pulse tab in the Mac app or in hop on the phone" if waiting
+            and any((a.get("spawned") or {}).get("auto") for a in actions)
+            else " — send from the Pulse tab in the Mac app or in hop on the phone" if waiting else "")
+    return f"\n\n**Follow-ups**{note}\n\n" + "\n\n".join(blocks)
 
 
 def hop_target_for(source_ref: str, sessions: dict[str, dict[str, Any]]) -> dict[str, Any] | None:
@@ -1694,6 +1745,16 @@ def pulse_message(date: str, label: str, task_path: Path) -> str:
     return (
         f"From mybot's morning pulse ({date}): {label}. The details and the ask are in "
         f"{task_path} - please read it and pick this up here; check with me before anything "
+        "irreversible or outward-facing."
+    )
+
+
+def pulse_batch_message(date: str, items: list[tuple[str, Path]]) -> str:
+    """Several items for one session, still one line."""
+    listing = "; ".join(f"{i}) {label} - {path}" for i, (label, path) in enumerate(items, 1))
+    return (
+        f"From mybot's morning pulse ({date}), {len(items)} items for this session: {listing}. "
+        "Please read each file and pick them up here; check with me before anything "
         "irreversible or outward-facing."
     )
 

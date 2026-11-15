@@ -84,6 +84,62 @@ class FollowUpEditTest(unittest.TestCase):
             self.runner.follow_up("../x", "o1")
 
 
+class AutoSendTest(unittest.TestCase):
+    """Items whose work is open in a live hop session go straight there."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        root = Path(self.tmp.name)
+        state = types.SimpleNamespace(config=types.SimpleNamespace(
+            state_dir=str(root), trajectory_index_db_path=str(root / "none.sqlite3"), imported_owner_actor_id="1"))
+        self.runner = briefing.BriefingRunner(state, "claude")
+        self.calls = []
+        live = {
+            "c1": {"internal_name": "s_a", "name": "alpha", "agent": "claude", "agent_permitted": True},
+            "c2": {"internal_name": "s_b", "name": "beta", "agent": "codex", "agent_permitted": False},
+        }
+        self.patches = [
+            mock.patch.object(briefing, "PULSE_TASK_DIR", root / "tasks"),
+            mock.patch.object(briefing, "hop_agent_sessions", lambda: live),
+            mock.patch.object(briefing.BriefingRunner, "_hopa", staticmethod(self._hopa)),
+        ]
+        for p in self.patches:
+            p.start()
+
+    def _hopa(self, args, *, timeout):
+        self.calls.append(json.loads(args[2]))
+        return {"ok": True}
+
+    def tearDown(self):
+        for p in self.patches:
+            p.stop()
+        self.tmp.cleanup()
+
+    def test_live_items_sent_once_per_session(self):
+        actions = [
+            {"id": "o1", "label": "One", "prompt": "do one", "target": "live:s_a"},
+            {"id": "a1", "label": "Two", "prompt": "do two", "target": "live:s_a"},
+            {"id": "o2", "label": "Locked", "prompt": "x", "target": "live:s_b"},
+            {"id": "o3", "label": "Closed", "prompt": "x", "target": "resume:claude:abc"},
+            {"id": "o4", "label": "New", "prompt": "x", "target": "new"},
+        ]
+        sent = self.runner.send_to_live_sessions("2026-11-15", actions)
+        self.assertEqual(len(self.calls), 1)
+        self.assertEqual(self.calls[0]["terminal_id"], "s_a")
+        self.assertIn("2 items", self.calls[0]["data"])
+        self.assertNotIn("\n", self.calls[0]["data"])
+        self.assertEqual(sent, {"alpha": {"ok": True, "items": ["o1", "a1"]}})
+        self.assertTrue(actions[0]["spawned"]["auto"])
+        self.assertIsNone(actions[2].get("spawned"))   # hop refuses agents there: left to the owner
+        self.assertIsNone(actions[3].get("spawned"))   # opening a closed one starts an agent
+        text = briefing.follow_ups_text(actions)
+        self.assertIn("sent to hop session “alpha”", text)
+        self.assertIn("the rest send from the Pulse tab", text)
+        # Sent once: a second pass sends nothing.
+        self.runner.send_to_live_sessions("2026-11-15", actions)
+        self.assertEqual(len(self.calls), 1)
+
+
 if __name__ == "__main__":
     unittest.main()
 
