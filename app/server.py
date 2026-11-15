@@ -1540,16 +1540,25 @@ class ProviderClient:
         workdir = cwd or self.config.codex_cwd
         Path(workdir).mkdir(parents=True, exist_ok=True)
         env = agent_subprocess_env(tool_env)
-        proc = subprocess.run(cmd, capture_output=True, text=True, env=env, cwd=workdir,
-                              timeout=(timeout + 120) if timeout else None)
-        data: dict[str, Any] = {}
-        match = re.search(r"\{.*\}", proc.stdout or "", re.S)
-        if match:
-            try:
-                data = json.loads(match.group(0))
-            except json.JSONDecodeError:
-                data = {}
-        forget_antigravity_conversation(str(data.get("conversation_id") or ""))
+        for attempt in range(2):
+            proc = subprocess.run(cmd, capture_output=True, text=True, env=env, cwd=workdir,
+                                  timeout=(timeout + 120) if timeout else None)
+            data: dict[str, Any] = {}
+            match = re.search(r"\{.*\}", proc.stdout or "", re.S)
+            if match:
+                try:
+                    data = json.loads(match.group(0))
+                except json.JSONDecodeError:
+                    data = {}
+            forget_antigravity_conversation(str(data.get("conversation_id") or ""))
+            # A dropped connection (the Mac asleep, Wi-Fi gone) ends the turn
+            # with nothing; agy marks it retryable. One fresh try.
+            network = '"retryable":true' in (proc.stderr or "").replace(" ", "") or "network issue" in (
+                str(data.get("error") or "") + (proc.stderr or "")).lower()
+            if str(data.get("response") or "").strip() or not network or attempt:
+                break
+            log.warning("Antigravity run %s lost its connection; retrying once", data.get("conversation_id"))
+            time.sleep(30)
         text = str(data.get("response") or "").strip()
         status = str(data.get("status") or "").upper()
         if text and status != "SUCCESS":

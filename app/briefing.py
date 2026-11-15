@@ -189,7 +189,14 @@ class BriefingRunner:
                     articles_future = pool.submit(self.write_articles, evidence, scout)
                     overlooked_future = pool.submit(self.check_overlooked, evidence, scout)
                     articles = articles_future.result()
-                    overlooked = overlooked_future.result()
+                    try:
+                        overlooked = overlooked_future.result()
+                    except Exception as exc:
+                        # The articles alone still make a pulse.
+                        if not articles:
+                            raise
+                        log.warning("pulse overlooked check failed; going on without it: %s", exc)
+                        overlooked = ""
                 record["articles"] = articles
                 record["overlooked"] = overlooked
                 self.status["stage"] = "editor"
@@ -584,8 +591,20 @@ class BriefingRunner:
             return {"topic": topic.get("topic"), "text": text}
 
         with ThreadPoolExecutor(max_workers=max(1, self.parallel)) as pool:
-            results = list(pool.map(one, enumerate(topics, start=1)))
-        return [r for r in results if r["text"] and not r["text"].lstrip().upper().startswith("SKIP")]
+            results = list(pool.map(self._survive(one, "article"), enumerate(topics, start=1)))
+        return [r for r in results if r and r["text"] and not r["text"].lstrip().upper().startswith("SKIP")]
+
+    @staticmethod
+    def _survive(fn: Any, what: str) -> Any:
+        """One failed article (a dropped connection, an agent error) drops
+        that article, not the whole pulse."""
+        def wrapped(item: Any) -> Any:
+            try:
+                return fn(item)
+            except Exception as exc:
+                log.warning("pulse %s failed; leaving it out: %s", what, str(exc)[:300])
+                return None
+        return wrapped
 
     def check_overlooked(self, evidence: dict[str, Any], scout: dict[str, Any]) -> str:
         candidates = [c for c in scout.get("overlooked_candidates") or [] if isinstance(c, dict)]

@@ -99,5 +99,40 @@ class AntigravityPulseEngineTest(unittest.TestCase):
         self.assertIn("new antigravity session", route["destination"])
 
 
+    def test_network_drop_is_retried_once(self):
+        counter = self.root / "count"
+        self.fake.write_text(
+            "#!/usr/bin/env python3\nimport json, sys, pathlib\n"
+            f"p = pathlib.Path({str(counter)!r}); n = int(p.read_text()) if p.exists() else 0; p.write_text(str(n + 1))\n"
+            "if n == 0:\n"
+            "    sys.stderr.write('error: There was a network issue connecting to the server, please try again. AGY_ERROR: {\"retryable\":true}')\n"
+            f"    print(json.dumps({{'conversation_id': {self.cid!r}, 'status': 'ERROR', 'response': '', 'error': 'There was a network issue connecting to the server, please try again.'}})); sys.exit(3)\n"
+            f"print(json.dumps({{'conversation_id': {self.cid!r}, 'status': 'SUCCESS', 'response': 'second try'}}))\n")
+        self.fake.chmod(self.fake.stat().st_mode | stat.S_IEXEC)
+        with mock.patch.dict(os.environ, {"ANTIGRAVITY_COMMAND": str(self.fake)}), \
+                mock.patch.object(server.Path, "home", lambda: self.home), \
+                mock.patch.object(server.time, "sleep", lambda s: None):
+            self.assertEqual(self._call()["text"], "second try")
+        self.assertEqual(counter.read_text(), "2")
+
+    def test_a_failed_article_is_left_out(self):
+        state = types.SimpleNamespace(config=types.SimpleNamespace(
+            state_dir=str(self.root), trajectory_index_db_path="x", imported_owner_actor_id="1",
+            codex_cwd=str(self.root), mybot_tool_python="py", mybot_tool_path="t"))
+        runner = briefing.BriefingRunner(state, "antigravity")
+        runner.figures_enabled = False
+        calls = []
+
+        def agent(**kw):
+            calls.append(kw["label"])
+            if "bad" in kw["label"]:
+                raise RuntimeError("network issue")
+            return "An article"
+        runner._agent = agent
+        out = runner.write_articles({"owner": ""}, {"article_topics": [{"topic": "good"}, {"topic": "bad"}]})
+        self.assertEqual([a["topic"] for a in out], ["good"])
+        self.assertEqual(len(calls), 2)
+
+
 if __name__ == "__main__":
     unittest.main()
