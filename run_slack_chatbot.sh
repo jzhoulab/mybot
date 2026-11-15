@@ -7,7 +7,7 @@ ROOT_DIR="$(cd "$(dirname "$0")" && pwd)"
 SERVER_ENV_FILE="$ROOT_DIR/.env"
 ENV_FILE="$ROOT_DIR/.slack.env"
 PYTHON_BIN="$ROOT_DIR/.venv/bin/python"
-START_LOCAL_CHAT_SERVER="${START_LOCAL_CHAT_SERVER:-true}"
+CALLER_START_LOCAL_CHAT_SERVER="${START_LOCAL_CHAT_SERVER:-}"
 SUPERVISE_SLACK_BRIDGE="${SUPERVISE_SLACK_BRIDGE:-true}"
 MYBOT_SINGLE_INSTANCE="${MYBOT_SINGLE_INSTANCE:-true}"
 MYBOT_RUN_DIR="${MYBOT_RUN_DIR:-$ROOT_DIR/state/run}"
@@ -31,6 +31,11 @@ if [[ -f "$SERVER_ENV_FILE" ]]; then
   set -a; source "$SERVER_ENV_FILE"; set +a
 fi
 set -a; source "$ENV_FILE"; set +a
+# run_chatbot.sh runs this beside the Discord launcher with
+# START_LOCAL_CHAT_SERVER=false; an env file saying true must not override
+# that, or both launchers start a server and race for the port.
+[[ -n "$CALLER_START_LOCAL_CHAT_SERVER" ]] && START_LOCAL_CHAT_SERVER="$CALLER_START_LOCAL_CHAT_SERVER"
+START_LOCAL_CHAT_SERVER="${START_LOCAL_CHAT_SERVER:-true}"
 
 if [[ -z "${SLACK_BOT_TOKEN:-}" || "${SLACK_BOT_TOKEN}" == xoxb-REPLACE-ME ]]; then
   echo "Set SLACK_BOT_TOKEN in $ENV_FILE"; exit 1
