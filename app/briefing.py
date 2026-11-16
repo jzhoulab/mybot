@@ -1051,10 +1051,7 @@ class BriefingRunner:
             raise ValueError("that hop session isn't live any more")
         if hop_target:
             message = pulse_message(date, str(action.get("label") or "Follow up"), task_path)
-            sent = self._hopa(["tool", "hopx_send_and_wait", json.dumps({
-                "terminal_id": hop_target["internal_name"], "data": message,
-                "press_enter": True, "wait": False,
-            })], timeout=60)
+            sent = self._send_to_session(hop_target["internal_name"], message)
             if sent.get("ok"):
                 action["spawned"] = {"terminal": hop_target["name"], "terminal_id": hop_target["internal_name"],
                                      "session": hop_target["internal_name"], "routed": "existing",
@@ -1122,9 +1119,7 @@ class BriefingRunner:
                 task_path.write_text(f"(Follow-up from mybot's morning pulse, {date}.)\n\n{action.get('prompt') or ''}\n")
                 paths.append((str(action.get("label") or "Follow up"), task_path))
             message = pulse_message(date, paths[0][0], paths[0][1]) if len(paths) == 1 else pulse_batch_message(date, paths)
-            result = self._hopa(["tool", "hopx_send_and_wait", json.dumps({
-                "terminal_id": internal, "data": message, "press_enter": True, "wait": False,
-            })], timeout=60)
+            result = self._send_to_session(internal, message)
             name = rooms[internal]["name"]
             if not result.get("ok"):
                 log.warning("pulse %s: could not send to hop session %s: %s", date, name, result)
@@ -1138,6 +1133,23 @@ class BriefingRunner:
         if sent:
             log.info("pulse %s: sent items straight to hop sessions %s", date, sorted(sent))
         return sent
+
+    def _send_to_session(self, internal: str, message: str) -> dict[str, Any]:
+        """Type one line into a live hop session and submit it. hop writes to
+        terminals, not sessions: a session nobody has attached to has none
+        ("Terminal not found"), and one with several is ambiguous. Use its
+        newest terminal, or attach one."""
+        listing = self._hopa(["tool", "hop_list_terminals", "{}"], timeout=30)
+        terminals = listing if isinstance(listing, list) else (listing.get("terminals") or [])
+        mine = sorted((t for t in terminals if isinstance(t, dict) and t.get("sessionName") == internal),
+                      key=lambda t: str(t.get("createdAt") or ""))
+        terminal = str(mine[-1].get("id") or "") if mine else ""
+        if not terminal:
+            attached = self._hopa(["tool", "hop_attach_terminal", json.dumps({"internalName": internal})], timeout=30)
+            terminal = str(attached.get("id") or "") if attached.get("ok") else ""
+        return self._hopa(["tool", "hopx_send_and_wait", json.dumps({
+            "terminal_id": terminal or internal, "data": message, "press_enter": True, "wait": False,
+        })], timeout=60)
 
     @staticmethod
     def _hopa(args: list[str], *, timeout: int) -> dict[str, Any]:

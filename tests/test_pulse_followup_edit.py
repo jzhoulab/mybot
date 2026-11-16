@@ -35,6 +35,10 @@ class FollowUpEditTest(unittest.TestCase):
             p.start()
 
     def _hopa(self, args, *, timeout):
+        if args[1] == "hop_list_terminals":
+            return {"terminals": []}
+        if args[1] == "hop_attach_terminal":
+            return {"ok": True, "id": json.loads(args[2])["internalName"]}
         self.calls.append((args[1], json.loads(args[2])))
         return {"ok": True, "terminal_id": "t-new"}
 
@@ -107,6 +111,10 @@ class AutoSendTest(unittest.TestCase):
             p.start()
 
     def _hopa(self, args, *, timeout):
+        if args[1] == "hop_list_terminals":
+            # Two terminals on s_a: the newest is used. None on s_b.
+            return {"terminals": [{"id": "t_old", "sessionName": "s_a", "createdAt": "2026-11-14"},
+                                  {"id": "t_new", "sessionName": "s_a", "createdAt": "2026-11-15"}]}
         self.calls.append(json.loads(args[2]))
         return {"ok": True}
 
@@ -125,7 +133,7 @@ class AutoSendTest(unittest.TestCase):
         ]
         sent = self.runner.send_to_live_sessions("2026-11-15", actions)
         self.assertEqual(len(self.calls), 1)
-        self.assertEqual(self.calls[0]["terminal_id"], "s_a")
+        self.assertEqual(self.calls[0]["terminal_id"], "t_new")
         self.assertIn("2 items", self.calls[0]["data"])
         self.assertNotIn("\n", self.calls[0]["data"])
         self.assertEqual(sent, {"alpha": {"ok": True, "items": ["o1", "a1"]}})
