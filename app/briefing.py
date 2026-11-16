@@ -1156,9 +1156,13 @@ class BriefingRunner:
         import subprocess
 
         hopa = os.environ.get("HOPA_COMMAND") or "hopa"
+        # The server is not a hop session, even when it was started from one
+        # (a deploy run inside hop): with HOP_SESSION set, hop labels each
+        # message as from that session's agent and points replies there.
+        env = {k: v for k, v in os.environ.items() if k not in ("HOP_SESSION", "HOP_TERMINAL_ID")}
         proc = subprocess.run(
             [hopa, *args, "--cli-timeout", str(timeout * 1000)],
-            capture_output=True, text=True, timeout=timeout + 15,
+            capture_output=True, text=True, timeout=timeout + 15, env=env,
         )
         try:
             return json.loads(proc.stdout or "{}")
