@@ -6109,6 +6109,11 @@ def main() -> None:
     # Decode the embedding matrix off the request path: the first semantic
     # search otherwise pays tens of seconds out of the agent's retrieval budget.
     state.trajectory_chunk_index.warm_vector_cache_async()
+    # One-time upgrade of embeddings still stored as JSON text (5x the bytes
+    # of the float32 form). No-op once done; new rows are written compact.
+    compact = getattr(state.trajectory_chunk_index, "compact_embeddings_async", None)
+    if compact is not None:
+        compact()
     state.maybe_start_identity_onboarding()
     from app.briefing import BriefingRunner
 

@@ -112,7 +112,20 @@ class LocalEmbedder:
                 "sentence-transformers is required for semantic memory. "
                 "Install it in the project venv: python3 -m pip install -U sentence-transformers"
             ) from exc
-        self._model = SentenceTransformer(self.model_name)
+        # CPU by default: this is a small model, and on Apple's GPU (MPS) the
+        # allocator holds ~1.2 GB for it while a query embeds no faster
+        # (measured 4 ms on CPU vs 8 ms on MPS; 512 chunks 4.2 s vs 1.9 s,
+        # and background embedding is a few chunks per refresh).
+        device = os.environ.get("EMBEDDING_DEVICE", "cpu").strip() or None
+        threads = int(os.environ.get("EMBEDDING_THREADS", "4") or 0)
+        if device == "cpu" and threads > 0:
+            try:
+                import torch
+
+                torch.set_num_threads(threads)
+            except Exception:  # pragma: no cover - torch always ships with sentence-transformers
+                pass
+        self._model = SentenceTransformer(self.model_name, device=device)
         return self._model
 
     def encode(self, texts: list[str], *, prefix: str) -> list[list[float]]:
