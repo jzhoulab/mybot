@@ -59,6 +59,25 @@ class AntigravityTest(unittest.TestCase):
     def tearDown(self):
         self.tmp.cleanup()
 
+    def test_a_conversation_deleted_mid_pass_is_skipped(self):
+        # The pulse deletes its headless conversations when they finish; one
+        # that vanishes between listing and reading must not fail the pass.
+        import sources.common as common
+
+        common._DISCOVERY_CACHE.clear()
+        self.addCleanup(common._DISCOVERY_CACHE.clear)
+        account = TrajectoryAccessAccount(source_name="antigravity", name="default", base_dir=str(self.home))
+        real_read = AntigravitySourceAdapter._read
+
+        def read(adapter, ident, folders, transcript):
+            if ident == CLI_ID:
+                raise FileNotFoundError(transcript)
+            return real_read(adapter, ident, folders, transcript)
+
+        with mock.patch.object(AntigravitySourceAdapter, "_read", read):
+            found = {s.session_id for s in AntigravitySourceAdapter(account=account).discover_sessions()}
+        self.assertEqual(found, {EDITOR_ID})
+
     def test_cli_conversation(self):
         s = self.sessions[CLI_ID]
         self.assertEqual([t.role for t in s.turns], ["user", "assistant", "user"])

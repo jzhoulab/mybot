@@ -246,7 +246,13 @@ class AntigravitySourceAdapter(TrajectorySourceAdapter):
             if cached is not None:
                 sessions.append(cached)
                 continue
-            session = self._read(ident, folders, transcript)
+            try:
+                session = self._read(ident, folders, transcript)
+            except OSError:
+                # Deleted since it was listed: the pulse removes its own
+                # headless conversations when they finish. One vanished
+                # conversation must not fail every lookup in the pass.
+                continue
             if session is None:
                 if signature:
                     discovery_cache_put(key_path, signature, SKIPPED)
