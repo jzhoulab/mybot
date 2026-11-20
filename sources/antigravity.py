@@ -38,6 +38,8 @@ from .access import TrajectoryAccessAccount
 from .common import (
     append_turn,
     choose_title,
+    DiscoverySkip,
+    SKIPPED,
     discovery_cache_get,
     discovery_cache_put,
     discovery_cache_signature,
@@ -230,21 +232,29 @@ class AntigravitySourceAdapter(TrajectorySourceAdapter):
             except OSError:
                 continue
         by_recency.sort(reverse=True)
+        # Each read needs the CLI's records, and checking whether they changed
+        # globs every conversation folder; check once per pass, not per read.
+        self._pass_index = None
         for _, ident, folders, transcript in by_recency:
             if max_files > 0 and len(sessions) >= max_files:
                 break
             key_path = transcript or folders[0]
             signature = discovery_cache_signature(key_path, policy_key) if transcript else None
             cached = discovery_cache_get(key_path, signature) if signature else None
+            if isinstance(cached, DiscoverySkip):
+                continue
             if cached is not None:
                 sessions.append(cached)
                 continue
             session = self._read(ident, folders, transcript)
             if session is None:
+                if signature:
+                    discovery_cache_put(key_path, signature, SKIPPED)
                 continue
             if signature:
                 discovery_cache_put(key_path, signature, session)
             sessions.append(session)
+        self._pass_index = None
         self._sessions = sorted(sessions, key=lambda s: s.updated_at, reverse=True)
         return self._sessions
 
@@ -305,7 +315,10 @@ class AntigravitySourceAdapter(TrajectorySourceAdapter):
                     paths += re.findall(r"(?:file://)?(/(?:Users|home)/[^\s)`'\"]+)", text)
         if not turns or last_ts is None:
             return None
-        index = conversation_index(self.base_dir)
+        index = getattr(self, "_pass_index", None)
+        if index is None:
+            index = conversation_index(self.base_dir)
+            self._pass_index = index
         recorded = index["workspaces"].get(ident, "")
         cwd = recorded or infer_cwd(paths, command_dirs)
         if not self.account.include_workdir(cwd or None):

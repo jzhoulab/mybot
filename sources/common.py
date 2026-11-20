@@ -188,6 +188,24 @@ _DISCOVERY_CACHE: dict[str, tuple[tuple[int, int, str], Any]] = {}
 _DISCOVERY_CACHE_MAX = 6000
 
 
+class DiscoverySkip:
+    """Cached "this file is not a session" verdict. Rejections were never
+    cached, so every transcript filtered out after a full parse (no typed
+    turns, an excluded origin, a private folder) was re-parsed every cycle:
+    ~800k JSON lines and ~15 s of CPU per 5-minute refresh. `counted` keeps
+    the recency cap identical to a cold pass, where a file that passed the
+    cheap head check used up a slot even if the full parse then rejected it."""
+
+    __slots__ = ("counted",)
+
+    def __init__(self, counted: bool) -> None:
+        self.counted = counted
+
+
+SKIPPED = DiscoverySkip(counted=False)
+SKIPPED_COUNTED = DiscoverySkip(counted=True)
+
+
 def discovery_cache_signature(path: str, policy_key: str = "") -> tuple[int, int, str] | None:
     try:
         stat = os.stat(path)
