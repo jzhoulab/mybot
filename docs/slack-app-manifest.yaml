@@ -24,6 +24,7 @@ oauth_config:
       - channels:read
       - groups:read
       - users:read
+      - reactions:read
       - reactions:write
 settings:
   event_subscriptions:
@@ -33,6 +34,7 @@ settings:
       - message.groups
       - message.im
       - message.mpim
+      - reaction_added
   interactivity:
     is_enabled: false
   org_deploy_enabled: false

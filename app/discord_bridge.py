@@ -23,6 +23,7 @@ except ImportError as exc:  # pragma: no cover - import guard for runtime only
         "discord.py is required. Install it with: python3 -m pip install -U discord.py"
     ) from exc
 
+from app import feedback as fb
 from app import pulse_figures, relay_protocol
 from app.api_auth import authorize
 from app.logging_setup import get_logger
@@ -151,6 +152,8 @@ class PendingChatRequest:
     display_name: str = ""
     channel_kind: str = "dm"
     channel_label: str = ""
+    # "down": this message is a note on an answer that missed (after a 👎).
+    feedback: str = ""
 
 
 @dataclass
@@ -264,6 +267,7 @@ class ChatbotApi:
         display_name: str = "",
         channel_kind: str = "",
         channel_label: str = "",
+        feedback: str = "",
     ) -> dict[str, Any]:
         payload: dict[str, Any] = {
             "actor_id": actor_id,
@@ -274,6 +278,9 @@ class ChatbotApi:
             "use_trajectory_memory": self.config.use_trajectory_memory,
             "return_sources": return_sources,
         }
+        if feedback:
+            payload["feedback"] = feedback
+            payload["platform"] = "discord"
         if display_name:
             payload["actor_display_name"] = display_name
         if channel_kind:
@@ -305,6 +312,17 @@ class ChatbotApi:
             payload["actor_display_name"] = display_name
             payload["author_label"] = display_name
         return await asyncio.to_thread(self._post_json, "/sessions/observe", payload)
+
+    async def record_feedback(
+        self, *, actor_id: str, user_key: str, session_key: str,
+        display_name: str = "", channel_label: str = "",
+    ) -> dict[str, Any]:
+        payload = {
+            "action": "record", "rating": "down", "platform": "discord",
+            "actor_id": actor_id, "user": user_key, "session_key": session_key,
+            "actor_display_name": display_name, "channel_label": channel_label,
+        }
+        return await asyncio.to_thread(self._post_json, "/feedback", payload)
 
     async def reset_session(self, *, user_key: str, session_key: str) -> dict[str, Any]:
         payload = {"user": user_key, "session_key": session_key}
@@ -359,7 +377,8 @@ class ChatbotApi:
 
 class DiscordBridgeClient(discord.Client):
     def __init__(self, config: BridgeConfig, api: ChatbotApi) -> None:
-        intents = discord.Intents(guilds=True, messages=True)
+        # reactions: a 👎 on an answer asks what missed (not a privileged intent).
+        intents = discord.Intents(guilds=True, messages=True, reactions=True)
         intents.message_content = config.enable_message_content
         super().__init__(intents=intents)
         self.config = config
@@ -372,6 +391,9 @@ class DiscordBridgeClient(discord.Client):
         self.team_channel_ids: set[int] = set()
         self.blocked_bot_ids: set[int] = set()
         self.relay_limiter = relay_protocol.RateLimiter()
+        # Which bot messages answered which chat, and who owes a note after a 👎.
+        self.answers = fb.AnswerLedger()
+        self.pending_feedback = fb.PendingFeedback()
         self._register_commands()
 
     def _register_commands(self) -> None:
@@ -722,8 +744,9 @@ class DiscordBridgeClient(discord.Client):
             return
 
         raw_text = message.content or ""
+        pending = self._pending_feedback_for(message)
         if message.guild is not None:
-            if not self._should_reply_in_guild_message(message):
+            if pending is None and not self._should_reply_in_guild_message(message):
                 await self._maybe_observe_message(message, raw_text)
                 return
             raw_text = self._strip_bot_mentions(raw_text)
@@ -732,6 +755,11 @@ class DiscordBridgeClient(discord.Client):
         text = normalize_text(raw_text)
         if not text:
             return
+        if pending is not None:
+            self.pending_feedback.take(message.channel.id, message.author.id, time.monotonic())
+            if not text.startswith("!"):
+                await self._handle_feedback_note(message, text, pending)
+                return
 
         log.info(
             "message received: author=%s channel=%s len=%d",  # no content: logs outlive chats
@@ -745,6 +773,96 @@ class DiscordBridgeClient(discord.Client):
             message,
             text,
             memory_scope="private",
+        )
+
+    def _pending_feedback_for(self, message: discord.Message) -> dict[str, Any] | None:
+        """The answer this message is a note on: after a 👎, the person's next
+        message in a DM, or in a channel a reply to the answer or the ask (or
+        one that mentions the bot)."""
+        pending = self.pending_feedback.peek(message.channel.id, message.author.id, time.monotonic())
+        if pending is None or message.guild is None:
+            return pending
+        replied_to = getattr(message.reference, "message_id", None)
+        if replied_to in pending["reply_ids"] or (self.user is not None and self.user in message.mentions):
+            return pending
+        return None
+
+    async def _handle_feedback_note(
+        self, message: discord.Message, text: str, answer: dict[str, Any]
+    ) -> None:
+        await self._enqueue_chat_request(
+            PendingChatRequest(
+                actor_id=self._actor_id(message.author.id),
+                user_key=self._user_key(message.author.id),
+                session_key=answer["session_key"],
+                message_text=text,
+                memory_scope=answer["memory_scope"],
+                target_user_id=answer["target_user_id"],
+                discord_message=message,
+                display_name=message.author.display_name,
+                channel_kind=answer["channel_kind"],
+                channel_label=answer["channel_label"],
+                feedback="down",
+            )
+        )
+
+    async def on_raw_reaction_add(self, payload: discord.RawReactionActionEvent) -> None:
+        """A 👎 on one of our answers: keep the rating for the owner, ask what
+        missed, and take the person's reply as feedback on that answer."""
+        if self.user is None or payload.user_id == self.user.id:
+            return
+        if not fb.is_thumbs_down(str(payload.emoji)):
+            return
+        if payload.message_author_id is not None and payload.message_author_id != self.user.id:
+            return
+        if payload.member is not None and payload.member.bot:
+            return
+        channel = self.get_channel(payload.channel_id)
+        if channel is None:
+            try:
+                channel = await self.fetch_channel(payload.channel_id)
+            except discord.HTTPException:
+                return
+        if not self._channel_allowed(channel):
+            return
+        answer = self.answers.get(payload.message_id)
+        if answer is None:
+            # Answered before a restart: our reply to someone's message counts;
+            # a post (pulse, team item) does not.
+            try:
+                sent = await channel.fetch_message(payload.message_id)
+            except discord.HTTPException:
+                return
+            if sent.author.id != self.user.id or sent.reference is None:
+                return
+            kind, label = self._channel_kind_label(channel)
+            answer = {
+                "session_key": self._session_key_for_channel(user_id=payload.user_id, channel=channel),
+                "memory_scope": "private", "target_user_id": None,
+                "channel_kind": kind, "channel_label": label,
+            }
+        display = payload.member.display_name if payload.member is not None else ""
+        try:
+            await self.api.record_feedback(
+                actor_id=self._actor_id(payload.user_id), user_key=self._user_key(payload.user_id),
+                session_key=answer["session_key"], display_name=display,
+                channel_label=answer["channel_label"],
+            )
+        except RuntimeError:
+            log.warning("feedback record failed", exc_info=True)
+        ask_text = fb.FEEDBACK_ASK if payload.guild_id is None else f"<@{payload.user_id}> {fb.FEEDBACK_ASK}"
+        try:
+            ask = await channel.send(
+                ask_text,
+                reference=channel.get_partial_message(payload.message_id).to_reference(fail_if_not_exists=False),
+                allowed_mentions=self.safe_mentions,
+            )
+        except discord.HTTPException:
+            log.warning("feedback ask failed", exc_info=True)
+            return
+        self.pending_feedback.expect(
+            channel.id, payload.user_id,
+            {**answer, "reply_ids": {payload.message_id, ask.id}}, time.monotonic(),
         )
 
     def _observation_eligible(self, channel: discord.abc.MessageableChannel) -> bool:
@@ -968,6 +1086,7 @@ class DiscordBridgeClient(discord.Client):
                 request.actor_id,
                 request.memory_scope,
                 request.target_user_id or "",
+                request.feedback,
             ]
         )
 
@@ -1058,6 +1177,7 @@ class DiscordBridgeClient(discord.Client):
             display_name=target.display_name,
             channel_kind=target.channel_kind,
             channel_label=target.channel_label,
+            feedback=target.feedback,
         )
         if len(requests) > 1:
             await self._acknowledge_folded_interactions(
@@ -1075,15 +1195,23 @@ class DiscordBridgeClient(discord.Client):
 
     async def _send_chat_response(self, request: PendingChatRequest, text: str) -> None:
         text = relay_protocol.neutralize(text)
+        sent: list[Any] = []
         if request.interaction is not None:
-            await self._send_interaction_text(request.interaction, text)
-            return
-        if request.discord_message is not None:
-            await self._send_channel_text(
+            sent = await self._send_interaction_text(request.interaction, text)
+        elif request.discord_message is not None:
+            sent = await self._send_channel_text(
                 request.discord_message.channel,
                 text,
                 reference=request.discord_message,
             )
+        answer = {
+            "session_key": request.session_key, "memory_scope": request.memory_scope,
+            "target_user_id": request.target_user_id, "channel_kind": request.channel_kind,
+            "channel_label": request.channel_label,
+        }
+        for message in sent:
+            if message is not None:
+                self.answers.add(message.id, answer)
 
     async def _send_chat_error(self, request: PendingChatRequest, text: str) -> None:
         if request.interaction is not None:
@@ -1311,12 +1439,14 @@ class DiscordBridgeClient(discord.Client):
         text: str,
         *,
         reference: discord.Message | None = None,
-    ) -> None:
+    ) -> list[discord.Message]:
+        sent: list[discord.Message] = []
         for index, chunk in enumerate(split_for_discord(text)):
             kwargs: dict[str, Any] = {"allowed_mentions": self.safe_mentions}
             if reference is not None and index == 0:
                 kwargs["reference"] = reference.to_reference(fail_if_not_exists=False)
-            await channel.send(chunk, **kwargs)
+            sent.append(await channel.send(chunk, **kwargs))
+        return sent
 
     async def _send_with_figures(
         self, channel: discord.abc.Messageable, text: str, figures: dict[str, str]
@@ -1344,12 +1474,15 @@ class DiscordBridgeClient(discord.Client):
         self,
         interaction: discord.Interaction,
         text: str,
-    ) -> None:
+    ) -> list[Any]:
+        sent: list[Any] = []
         for chunk in split_for_discord(text):
-            await interaction.followup.send(
+            sent.append(await interaction.followup.send(
                 chunk,
                 allowed_mentions=self.safe_mentions,
-            )
+                wait=True,
+            ))
+        return sent
 
 
 def parse_args() -> argparse.Namespace:

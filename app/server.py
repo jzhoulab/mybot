@@ -29,6 +29,7 @@ from pathlib import Path
 from typing import Any
 
 from app.auth import SyncAuthStore
+from app.feedback import FEEDBACK_TURN_PREFIX, FeedbackStore, last_exchange
 from app.gui import GUI_HTML, build_gui_state
 from app.api_auth import load_or_create_api_key
 from app.model_catalog import codex_default_model
@@ -1898,6 +1899,7 @@ class AppState:
         self.workspace = PromptWorkspace(config.workspace_dir)
         self.sessions = SessionStore(config.state_dir)
         self.people = PersonRegistry(config.state_dir)
+        self.feedback = FeedbackStore(config.state_dir)
         self._identity_lock = threading.Lock()
         self._identity_investigating = False
         self._identity_error = ""
@@ -4278,7 +4280,12 @@ class AppState:
             "## Response Rule\n"
             "Answer concisely and factually — you are an information source, not a persona. "
             "Mention uncertainty when the answer is not grounded in the retrieved memory or "
-            "current session context."
+            "current session context. When you could not find what they asked about, or the "
+            "question could mean several things, say so in one line and ask what they were "
+            "after, so they can point you at it. A turn that starts with "
+            f"'{FEEDBACK_TURN_PREFIX}' is the asker saying your last answer missed: treat their "
+            "note as a correction, look again where needed, and give the better answer instead "
+            "of restating or defending the old one."
         )
         return (
             "\n\n".join(section for section in sections if section),
@@ -4671,6 +4678,9 @@ class ChatHandler(BaseHTTPRequestHandler):
         if self.path == "/sessions/reset":
             self.handle_session_reset(body)
             return
+        if self.path == "/feedback":
+            self.handle_feedback(body)
+            return
         self.respond_json(404, {"ok": False, "error": "not found"})
 
     def handle_owner_profile(self, body: dict[str, Any]) -> None:
@@ -4788,6 +4798,10 @@ class ChatHandler(BaseHTTPRequestHandler):
         channel_label = normalize_text(str(body.get("channel_label") or ""), 120)
         author_label = normalize_text(str(body.get("author_label") or actor_display_name), 80)
         raw_message = message
+        # A note on an answer that missed (the bridges send it after a 👎).
+        is_feedback = normalize_text(str(body.get("feedback") or ""), 16).lower() == "down"
+        if is_feedback:
+            message = f"{FEEDBACK_TURN_PREFIX} {message}"
         if channel_kind == "group" and author_label:
             # Attributed turns keep a shared channel session readable when
             # several people talk to the bot in the same conversation.
@@ -4810,11 +4824,12 @@ class ChatHandler(BaseHTTPRequestHandler):
             new_session=False,
         )
         force_new = coerce_bool(body.get("new_session"))
-        if is_group or coerce_bool(body.get("pin_session")):
+        if is_group or is_feedback or coerce_bool(body.get("pin_session")):
             # Channels are ongoing; don't roll them on idle — the recent-window
             # filter below bounds context instead. Pinned sessions are explicit
             # named chats (the menu's chat list): one key stays one thread, so a
             # reopened chat continues in place instead of rolling to a new epoch.
+            # Feedback is about the last answer, so it stays with it too.
             idle_seconds: float | None = None
         else:
             prev_active = sessions.peek_active_key(logical_key)
@@ -4833,6 +4848,16 @@ class ChatHandler(BaseHTTPRequestHandler):
 
         use_memory = coerce_bool(body.get("use_trajectory_memory"), True)
         all_messages = sessions.load_messages(session_key, limit=None)
+        if is_feedback:
+            try:
+                self.server.state.feedback.record(
+                    actor_id=actor_id, session_key=session_key, comment=raw_message,
+                    exchange=last_exchange(all_messages),
+                    platform=normalize_text(str(body.get("platform") or ""), 16),
+                    display_name=actor_display_name, channel_label=channel_label,
+                )
+            except OSError:
+                log.warning("feedback record failed", exc_info=True)
         summary_state = sessions.get_session_summary(session_key) or {}
         # Group sessions blend many people's parallel threads; a rolling summary
         # of that conflates them, so groups rely on the recent window only.
@@ -5861,6 +5886,37 @@ class ChatHandler(BaseHTTPRequestHandler):
         limit = int(body.get("limit", 100))
         threads = self.server.state.sessions.list_sessions(prefix, limit=limit)
         self.respond_json(200, {"ok": True, "threads": threads})
+
+    def handle_feedback(self, body: dict[str, Any]) -> None:
+        """action=record: a 👎 on an answer (the bridges call this, so the
+        rating is kept even if no note follows). action=list: the owner's
+        review list. Agent grants never reach here (not an agent path)."""
+        state = self.server.state
+        action = str(body.get("action") or "record").strip().lower()
+        if action == "list":
+            limit = max(1, min(500, int(body.get("limit") or 50)))
+            self.respond_json(200, {"ok": True, "feedback": state.feedback.recent(limit)})
+            return
+        if action != "record":
+            self.respond_json(400, {"ok": False, "error": "action must be 'record' or 'list'"})
+            return
+        user = str(body.get("user") or body.get("actor_id") or DEFAULT_SESSION_MAIN_KEY)
+        actor_id = normalize_text(str(body.get("actor_id") or user), 128)
+        if not body.get("session_key"):
+            self.respond_json(400, {"ok": False, "error": "session_key is required"})
+            return
+        logical_key = safe_session_key(user=user, requested=str(body["session_key"]))
+        session_key = state.sessions.peek_active_key(logical_key)
+        entry = state.feedback.record(
+            actor_id=actor_id, session_key=session_key,
+            rating=normalize_text(str(body.get("rating") or "down"), 16).lower(),
+            comment=normalize_text(str(body.get("comment") or ""), 4000),
+            exchange=last_exchange(state.sessions.load_messages(session_key, limit=40)),
+            platform=normalize_text(str(body.get("platform") or ""), 16),
+            display_name=normalize_text(str(body.get("actor_display_name") or ""), 80),
+            channel_label=normalize_text(str(body.get("channel_label") or ""), 120),
+        )
+        self.respond_json(200, {"ok": True, "feedback": entry})
 
     def handle_session_reset(self, body: dict[str, Any]) -> None:
         logical_key = safe_session_key(

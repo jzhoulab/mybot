@@ -31,6 +31,7 @@ except ImportError as exc:  # pragma: no cover - import guard for runtime only
         "slack_bolt is required. Install it with: python3 -m pip install -U slack_bolt"
     ) from exc
 
+from app import feedback as fb
 from app import relay_protocol
 from app.api_auth import authorize
 from app.logging_setup import get_logger
@@ -200,6 +201,7 @@ class ChatbotApi:
         channel_kind: str = "",
         channel_label: str = "",
         thread_context: str = "",
+        feedback: str = "",
     ) -> dict[str, Any]:
         payload: dict[str, Any] = {
             "actor_id": actor_id,
@@ -218,6 +220,9 @@ class ChatbotApi:
             payload["channel_label"] = channel_label
         if thread_context:
             payload["thread_context"] = thread_context
+        if feedback:
+            payload["feedback"] = feedback
+            payload["platform"] = "slack"
         if target_user_id:
             payload["target_user_id"] = target_user_id
         return self._post("/chat", payload)
@@ -248,6 +253,16 @@ class ChatbotApi:
             if "HTTP 404" in str(exc):
                 return {"ok": True, "already_empty": True}
             raise
+
+    def record_feedback(
+        self, *, actor_id: str, user_key: str, session_key: str,
+        display_name: str = "", channel_label: str = "",
+    ) -> dict[str, Any]:
+        return self._post("/feedback", {
+            "action": "record", "rating": "down", "platform": "slack",
+            "actor_id": actor_id, "user": user_key, "session_key": session_key,
+            "actor_display_name": display_name, "channel_label": channel_label,
+        })
 
     def promote_memory(self, *, actor_id: str, scope: str, text: str) -> dict[str, Any]:
         return self._post("/memory/promote", {"actor_id": actor_id, "scope": scope, "text": text})
@@ -302,6 +317,8 @@ class SlackBridge:
             v.strip() for v in os.environ.get("MYBOT_SIBLING_BOT_IDS", "").split(",") if v.strip()
         }
         self.relay_limiter = relay_protocol.RateLimiter()
+        # Who was asked what missed after a 👎, by (channel:thread, user).
+        self.pending_feedback = fb.PendingFeedback()
 
     def channel_allowed(self, channel_id: str, is_dm: bool) -> bool:
         return is_dm or channel_id in self.allowed_channels or channel_id in self.team_channel_ids
@@ -539,6 +556,13 @@ def build_bridge() -> tuple[App, SlackBridge, str]:
         if not bridge.member_allowed(client, event):
             return
         addressed = is_dm or (bridge.bot_user_id and bridge.bot_user_id in (event.get("text") or ""))
+        # After a 👎, the person's next message in that thread (or DM) is
+        # their note on the answer, mention or not; a command cancels it.
+        feedback_on = bridge.pending_feedback.take(f"{channel_id}:{thread_ts}", user_id, time.monotonic())
+        if feedback_on is not None and not text.startswith("!"):
+            addressed = True
+        else:
+            feedback_on = None
         actor_id = user_id  # transport-neutral: the raw Slack user id
         user_key = bridge.user_key(user_id)
         session_key = bridge.session_key(
@@ -587,6 +611,7 @@ def build_bridge() -> tuple[App, SlackBridge, str]:
                 channel_kind="dm" if is_dm else "group",
                 channel_label="" if is_dm else bridge.channel_label(client, channel_id),
                 thread_context="" if is_dm else conversation_context(client, bridge, event),
+                feedback="down" if feedback_on is not None else "",
             )
             slow.cancel()
             result["text"] = to_slack_mrkdwn(str(result.get("text") or ""))
@@ -595,6 +620,50 @@ def build_bridge() -> tuple[App, SlackBridge, str]:
             slow.cancel()
             log.exception("chat failed for user=%s", user_id)
             reply(say, f"Sorry — I couldn't answer that ({exc}). Please try again.", thread_ts=reply_thread)
+
+    @app.event("reaction_added")
+    def on_reaction(event, client, logger):  # noqa: ANN001
+        """A 👎 on one of our answers: keep the rating for the owner, ask
+        what missed, and take the person's next message there as feedback.
+        Needs the reactions:read scope and the reaction_added event."""
+        item = event.get("item") or {}
+        user_id = event.get("user") or ""
+        if item.get("type") != "message" or event.get("item_user") != bridge.bot_user_id:
+            return
+        if not user_id or user_id == bridge.bot_user_id or not fb.is_thumbs_down(event.get("reaction") or ""):
+            return
+        channel_id = item.get("channel") or ""
+        is_dm = channel_id.startswith("D")
+        if not bridge.channel_allowed(channel_id, is_dm) or not bridge.member_allowed(client, event):
+            return
+        try:
+            found = client.conversations_replies(channel=channel_id, ts=item.get("ts"), limit=1)
+            root = ((found.get("messages") or [{}])[0]).get("thread_ts") or ""
+        except Exception:
+            log.warning("feedback: could not look up the answer's thread", exc_info=True)
+            return
+        if not is_dm and not root:
+            return  # a top-level post (team item), not an answer in a thread
+        session_key = bridge.session_key(
+            channel_id=channel_id, channel_type="im" if is_dm else "channel",
+            user_id=user_id, thread_ts=root,
+        )
+        display = bridge.display_name(client, user_id)
+        label = "" if is_dm else bridge.channel_label(client, channel_id)
+        try:
+            api.record_feedback(
+                actor_id=user_id, user_key=bridge.user_key(user_id), session_key=session_key,
+                display_name=display, channel_label=label,
+            )
+        except RuntimeError:
+            log.warning("feedback record failed", exc_info=True)
+        ask = fb.FEEDBACK_ASK if is_dm else f"<@{user_id}> {fb.FEEDBACK_ASK}"
+        try:
+            client.chat_postMessage(channel=channel_id, text=ask, thread_ts=root or None)
+        except Exception:
+            log.warning("feedback ask failed", exc_info=True)
+            return
+        bridge.pending_feedback.expect(f"{channel_id}:{root}", user_id, {"session_key": session_key}, time.monotonic())
 
     return app, bridge, app_token
 
