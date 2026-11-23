@@ -125,6 +125,7 @@ class SlackReactionTest(unittest.TestCase):
         self.client.users_info.return_value = {"user": {"team_id": "T1"}}
         self.client.conversations_info.return_value = {"channel": {"id": "C1", "is_member": True}}
         self.client.conversations_replies.return_value = {"messages": [{"ts": "10.1", "thread_ts": "10.1"}]}
+        self.client.conversations_history.return_value = {"messages": []}
         self.handlers: dict = {}
         app = Mock()
         app.client = self.client
