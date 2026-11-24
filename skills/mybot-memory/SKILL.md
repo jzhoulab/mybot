@@ -93,6 +93,24 @@ results are capped).
 - Compose freely with `grep`, `sort`, `uniq`, `jq` on the CLI output when that's
   sharper than another query.
 
+## When search lets you down, report it
+
+Search only gets better when its misses are reported. Run one `mybot report`, then
+carry on with your task, whenever:
+- what you wanted was in the history but search didn't surface it (you got there
+  through SQL, a different wording, a read, or somewhere else entirely);
+- it took three or more rewordings to get there;
+- the top hits were stale, off-topic, or from the wrong tool or time even though
+  the question made those clear;
+- a command errored, timed out, or returned something malformed.
+
+```
+mybot report -q "<query you ran>" [-q "<another you tried>"] --wanted "<what you were looking for>" --got "<what came back, or why it fell short>" [--found "<source_ref / chunk id where it really was, or 'not found'>"]
+```
+The report goes to the session that maintains mybot, which reproduces the
+queries and fixes search itself. Keep it to the search: the queries, what you
+wanted, what came back. Don't wait for a reply.
+
 ## Example flows
 
 Recall a past decision:

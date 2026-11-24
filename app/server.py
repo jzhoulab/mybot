@@ -29,7 +29,7 @@ from pathlib import Path
 from typing import Any
 
 from app.auth import SyncAuthStore
-from app.feedback import FEEDBACK_TURN_PREFIX, FeedbackStore, last_exchange
+from app.feedback import FEEDBACK_TURN_PREFIX, FeedbackStore, SearchReports, last_exchange
 from app.gui import GUI_HTML, build_gui_state
 from app.api_auth import load_or_create_api_key
 from app.model_catalog import codex_default_model
@@ -1900,6 +1900,8 @@ class AppState:
         self.sessions = SessionStore(config.state_dir)
         self.people = PersonRegistry(config.state_dir)
         self.feedback = FeedbackStore(config.state_dir)
+        self.search_reports = SearchReports(config.state_dir)
+        self.search_notifier: Any = None  # set at startup (needs hop)
         self._identity_lock = threading.Lock()
         self._identity_investigating = False
         self._identity_error = ""
@@ -5895,10 +5897,14 @@ class ChatHandler(BaseHTTPRequestHandler):
         action = str(body.get("action") or "record").strip().lower()
         if action == "list":
             limit = max(1, min(500, int(body.get("limit") or 50)))
-            self.respond_json(200, {"ok": True, "feedback": state.feedback.recent(limit)})
+            self.respond_json(200, {"ok": True, "feedback": state.feedback.recent(limit),
+                                    "search_reports": state.search_reports.recent(limit)})
+            return
+        if action == "search":
+            self.handle_search_report(body)
             return
         if action != "record":
-            self.respond_json(400, {"ok": False, "error": "action must be 'record' or 'list'"})
+            self.respond_json(400, {"ok": False, "error": "action must be 'record', 'search' or 'list'"})
             return
         user = str(body.get("user") or body.get("actor_id") or DEFAULT_SESSION_MAIN_KEY)
         actor_id = normalize_text(str(body.get("actor_id") or user), 128)
@@ -5917,6 +5923,31 @@ class ChatHandler(BaseHTTPRequestHandler):
             channel_label=normalize_text(str(body.get("channel_label") or ""), 120),
         )
         self.respond_json(200, {"ok": True, "feedback": entry})
+
+    def handle_search_report(self, body: dict[str, Any]) -> None:
+        """An agent on this machine says trajectory search came up short
+        (`mybot report`). Kept, then passed on to the maintainer session."""
+        state = self.server.state
+        queries = [normalize_text(str(q), 500) for q in (body.get("queries") or []) if str(q).strip()][:10]
+        wanted = normalize_text(str(body.get("wanted") or ""), 1000)
+        if not queries or not wanted:
+            self.respond_json(400, {"ok": False, "error": "queries and wanted are required"})
+            return
+        report = {
+            "queries": queries, "wanted": wanted,
+            "got": normalize_text(str(body.get("got") or ""), 2000),
+            "found": normalize_text(str(body.get("found") or ""), 1000),
+            **{key: normalize_text(str(body.get(key) or ""), 300)
+               for key in ("agent", "hop_session", "conversation", "cwd")},
+        }
+        entry = state.search_reports.record(report)
+        notifier = state.search_notifier
+        if notifier is not None:
+            notifier.schedule()
+        self.respond_json(200, {
+            "ok": True, "report": entry["id"],
+            "passed_to": notifier.session_name if notifier is not None else "",
+        })
 
     def handle_session_reset(self, body: dict[str, Any]) -> None:
         logical_key = safe_session_key(
@@ -6178,6 +6209,27 @@ def main() -> None:
     state.briefing = state.briefings.get("claude") or next(iter(state.briefings.values()))
     for runner in state.briefings.values():
         runner.start_scheduler()
+    # Search reports go to the hop session that maintains mybot ("" turns it off).
+    from app.feedback import SearchFeedbackNotifier
+
+    def find_hop_session(name: str) -> str:
+        try:
+            proc = subprocess.run(["hopa", "sessions", "--json"], capture_output=True, text=True, timeout=30)
+            listing = json.loads(proc.stdout or "[]")
+        except (OSError, subprocess.SubprocessError, json.JSONDecodeError):
+            return ""
+        for item in listing if isinstance(listing, list) else (listing.get("sessions") or []):
+            if item.get("name") == name and item.get("live") and item.get("agentPermitted"):
+                return str(item.get("internalName") or "")
+        return ""
+
+    state.search_notifier = SearchFeedbackNotifier(
+        state.search_reports,
+        session_name=os.environ.get("MYBOT_MAINTAINER_HOP_SESSION", "Mybot").strip(),
+        find_session=find_hop_session,
+        send=state.briefing._send_to_session,
+        delay_seconds=float(os.environ.get("MYBOT_SEARCH_FEEDBACK_DELAY", "120") or 120),
+    )
     def republish_for_hop() -> None:
         # Which hop session holds each item's conversation changes all day;
         # keep the phone's copy current so a tap reaches the live session.

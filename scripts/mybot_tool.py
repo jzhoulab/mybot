@@ -101,6 +101,22 @@ def post_json(base_url: str, path: str, payload: dict[str, Any]) -> dict[str, An
     return parsed
 
 
+def reporter_identity() -> dict[str, str]:
+    """Who is reporting, so the maintainer can read the conversation."""
+    if os.environ.get("CLAUDE_CODE_SESSION_ID"):
+        agent, conversation = "claude", f"claude:{os.environ['CLAUDE_CODE_SESSION_ID']}"
+    elif os.environ.get("CODEX_THREAD_ID"):
+        agent, conversation = "codex", f"codex:{os.environ['CODEX_THREAD_ID']}"
+    elif os.environ.get("CLAUDECODE"):
+        agent, conversation = "claude", ""
+    elif any(name.startswith("CODEX_") for name in os.environ):
+        agent, conversation = "codex", ""
+    else:
+        agent, conversation = "", ""
+    return {"agent": agent, "conversation": conversation,
+            "hop_session": os.environ.get("HOP_SESSION", ""), "cwd": os.getcwd()}
+
+
 def actor_payload(args: argparse.Namespace) -> dict[str, Any]:
     actor_id = (
         args.actor_id
@@ -458,6 +474,17 @@ def main() -> int:
 
     subparsers.add_parser("trajectory-stats", help="Inspect trajectory index stats")
 
+    report_parser = subparsers.add_parser(
+        "report",
+        help="Tell mybot's maintainer that search came up short, so search itself gets fixed",
+    )
+    report_parser.add_argument("-q", "--query", action="append", required=True,
+                               help="A query you ran (repeat for each one you tried)")
+    report_parser.add_argument("--wanted", required=True, help="What you were looking for")
+    report_parser.add_argument("--got", default="", help="What came back instead, or why it fell short")
+    report_parser.add_argument("--found", default="",
+                               help="Where it really was, if you found it (source_ref, chunk id, file), or 'not found'")
+
     budget_parser = subparsers.add_parser(
         "budget", help="Show the retrieval budget for this request, or extend it (--extend N --reason ...)"
     )
@@ -510,6 +537,12 @@ def main() -> int:
 
     if args.command == "trajectory-stats":
         call_and_print(args, "/trajectory/index/stats", payload)
+        return 0
+
+    if args.command == "report":
+        payload.update({"action": "search", "queries": args.query, "wanted": args.wanted,
+                        "got": args.got, "found": args.found, **reporter_identity()})
+        print_json(post_json(args.base_url, "/feedback", payload))  # not a search: no budget
         return 0
 
     raise SystemExit(f"Unknown command: {args.command}")
