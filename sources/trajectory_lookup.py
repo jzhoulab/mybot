@@ -248,9 +248,14 @@ def _summarize_codex_payload(payload: dict[str, Any]) -> str:
     return f"[{name}] {_compact_json(arguments or payload, 1000)}"
 
 
-# Cap how much of a huge session an evidence read will scan (memory + latency);
-# line-level bounding comes from iter_bounded_jsonl_lines.
-_READ_MAX_TOTAL_BYTES = 64 * 1024 * 1024
+# No total-byte cap on reading a session. Indexing chunks every event, and a
+# read's event numbers have to match the index's, so both read to the end.
+# The 64 MB cap that used to sit here silently cut the longest Claude sessions
+# (75 MB to 1.1 GB on disk) at their first 64 MB: months of their newest turns
+# never reached the index, and a read's "tail" was really that cut-off point.
+# Lines stay bounded by iter_bounded_jsonl_lines. A 1.1 GB transcript parses in
+# about 2 s at a ~100 MB peak, and the document cache bounds what stays in memory.
+_READ_MAX_TOTAL_BYTES: int | None = None
 
 
 def _iter_bounded_lines(path: str):
