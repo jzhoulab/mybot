@@ -195,6 +195,17 @@ def raw_match_score(source: dict[str, Any]) -> float:
     return float(source.get("match_score") or source.get("score") or 0.0)
 
 
+def query_term_coverage(source: dict[str, Any], query: str) -> int:
+    """How many of the query's own terms a match's evidence text contains."""
+    tokens = set(query_tokens(focus_query(query) or query))
+    if not tokens:
+        return 0
+    parts = [str(source.get(key) or "") for key in ("text", "snippet", "text_preview")]
+    parts.extend(str(snippet) for snippet in (source.get("snippets") or []))
+    haystack = " ".join(parts).lower()
+    return sum(1 for token in tokens if token in haystack)
+
+
 def merge_trajectory_source(
     by_ref: dict[str, dict[str, Any]],
     source: dict[str, Any],
@@ -253,6 +264,15 @@ def merge_trajectory_source(
         return
 
     if raw_match_score(item) > raw_match_score(existing):
+        if query_term_coverage(existing, query) > query_term_coverage(item, query):
+            # A refinement query (often another hit's title) can outscore the
+            # chunk that holds the words that were actually asked for: the
+            # title query matches the session's opening chunk. Keep the chunk
+            # that answers the query as the session's evidence, at the higher score.
+            for key in ("score", "match_score"):
+                if key in item:
+                    existing[key] = item[key]
+            return
         by_ref[source_ref] = item
 
 

@@ -24,5 +24,29 @@ class SearchOperatorsTest(unittest.TestCase):
             self.assertEqual(split_search_operators(query), (query, {}))
 
 
+class MergeKeepsTheAnsweringChunkTest(unittest.TestCase):
+    def test_a_title_refinement_does_not_replace_the_chunk_with_the_query_terms(self) -> None:
+        from app.server import merge_trajectory_source
+
+        by_ref: dict = {}
+        answer = {"source_type": "trajectory", "source_ref": "claude:s", "score": 57.0, "_chunk_index": True,
+                  "metadata": {"chunk_id": 2, "event_start": 19904},
+                  "snippets": ["Job 18358699 is verified complete"]}
+        opening = {"source_type": "trajectory", "source_ref": "claude:s", "score": 917.0, "_chunk_index": True,
+                   "metadata": {"chunk_id": 1, "event_start": 0},
+                   "snippets": ["can you use the nebula mcp to read the notebook"]}
+        merge_trajectory_source(by_ref, answer, query="18358699", channel="initial")
+        merge_trajectory_source(by_ref, opening, query="18358699", channel="refine:5")
+        kept = by_ref["claude:s"]
+        self.assertEqual((kept["metadata"]["chunk_id"], kept["metadata"]["event_start"], kept["score"]), (2, 19904, 917.0))
+        self.assertEqual(kept["snippets"], ["Job 18358699 is verified complete"])
+
+        # A better-scoring hit that also has the query's terms still wins.
+        better = dict(answer, score=1000.0, metadata={"chunk_id": 3, "event_start": 19950},
+                      snippets=["18358699 follow-through done"])
+        merge_trajectory_source(by_ref, better, query="18358699", channel="refine:6")
+        self.assertEqual(by_ref["claude:s"]["metadata"]["chunk_id"], 3)
+
+
 if __name__ == "__main__":
     unittest.main()
