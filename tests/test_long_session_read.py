@@ -37,5 +37,32 @@ class LongClaudeSessionTest(unittest.TestCase):
                              ["early question", "the newest question", "the newest answer"])
 
 
+class MovedSessionTest(unittest.TestCase):
+    def test_a_session_moved_to_another_account_is_listed_once_newest_copy(self) -> None:
+        from unittest.mock import patch
+
+        from sources.models import NormalizedTrajectory
+
+        def session(path: str, updated_at: str) -> NormalizedTrajectory:
+            return NormalizedTrajectory(source_name="claude", session_id="s-1", file_path=path,
+                                        title="t", updated_at=updated_at, metadata={}, turns=[],
+                                        short_summary="", detailed_summary="")
+
+        old_root = SimpleAdapter([session("/a/.claude/projects/p/s-1.jsonl", "2026-11-24T15:24:19+00:00")])
+        new_root = SimpleAdapter([session("/a/.claude_fable/projects/p/s-1.jsonl", "2026-11-26T00:49:03+00:00")])
+        lookup = tl.TrajectoryLookup(source_names=["claude"], max_files_per_tool=10)
+        with patch.object(tl, "get_source_adapters", return_value=[new_root, old_root]):
+            listed = lookup.sessions()
+        self.assertEqual([s.file_path for s in listed], ["/a/.claude_fable/projects/p/s-1.jsonl"])
+
+
+class SimpleAdapter:
+    def __init__(self, sessions: list) -> None:
+        self._sessions = sessions
+
+    def discover_sessions(self, max_files: int = 0) -> list:
+        return list(self._sessions)
+
+
 if __name__ == "__main__":
     unittest.main()

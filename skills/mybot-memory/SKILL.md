@@ -27,7 +27,8 @@ mybot trajectory-search -q "<query>" [--limit N] [--after YYYY-MM-DD] [--before 
 Hybrid lexical + semantic search over sessions. Each hit reports `source_ref`,
 `title`, `cwd`, `updated_at`, a `snippet`, and in `metadata`: `event_start`,
 `event_end`, and `chunk_id` — the coordinates for a follow-up windowed read.
-`--after/--before` filter by date; `--source` restricts to one tool.
+`--after/--before` filter by date; `--source` restricts to one tool. The same
+filters also work inside the query (`source:claude after:2026-11-25`).
 
 ```
 mybot memory-search -q "<query>" [--limit N]

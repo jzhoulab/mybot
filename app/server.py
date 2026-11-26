@@ -256,6 +256,28 @@ def merge_trajectory_source(
         by_ref[source_ref] = item
 
 
+SEARCH_OPERATOR_RE = re.compile(
+    r"(?<!\S)(after|before|since|until|source):(\d{4}-\d{2}-\d{2}(?:T[\d:.]+Z?)?|codex|claude|antigravity)(?!\S)",
+    re.IGNORECASE,
+)
+
+
+def split_search_operators(query: str) -> tuple[str, dict[str, str]]:
+    """Agents write filters search-engine style inside the query
+    ("18358699 source:claude after:2026-11-25"). Those tokens never match
+    transcript text and only add noise to the lexical and semantic match, so
+    lift them out into the real filters: after/since, before/until, source."""
+    found: dict[str, str] = {}
+
+    def lift(match: re.Match[str]) -> str:
+        key = {"since": "after", "until": "before"}.get(match.group(1).lower(), match.group(1).lower())
+        found.setdefault(key, match.group(2).lower() if key == "source" else match.group(2))
+        return " "
+
+    rest = normalize_text(SEARCH_OPERATOR_RE.sub(lift, query))
+    return (rest, found) if rest else (query, {})
+
+
 def date_filter_keys(after: str, before: str) -> tuple[str, str]:
     """ISO-prefix comparison keys for hard time filters. A date-only `before`
     is made inclusive of that whole day ('~' sorts after every ISO char)."""
@@ -5272,8 +5294,9 @@ class ChatHandler(BaseHTTPRequestHandler):
             self.respond_json(403, {"ok": False, "error": "local trajectory lookup is not allowed for this actor/scope"})
             return
         limit = int(body.get("limit", self.server.state.config.trajectory_search_limit))
-        after = normalize_text(str(body.get("after") or ""), 32)
-        before = normalize_text(str(body.get("before") or ""), 32)
+        query, operators = split_search_operators(query)
+        after = normalize_text(str(body.get("after") or operators.get("after") or ""), 32)
+        before = normalize_text(str(body.get("before") or operators.get("before") or ""), 32)
         for label, value in (("after", after), ("before", before)):
             if value and not re.fullmatch(r"\d{4}-\d{2}-\d{2}([T ].*)?", value):
                 self.respond_json(
@@ -5281,7 +5304,7 @@ class ChatHandler(BaseHTTPRequestHandler):
                     {"ok": False, "error": f"{label} must be an ISO date (YYYY-MM-DD or full timestamp), got {value!r}"},
                 )
                 return
-        source_filter = normalize_text(str(body.get("source") or ""), 32).lower()
+        source_filter = normalize_text(str(body.get("source") or operators.get("source") or ""), 32).lower()
         compact = coerce_bool(body.get("compact"), False)
         if coerce_bool(body.get("full_scan"), False):
             results = self.server.state.trajectory_lookup.search(

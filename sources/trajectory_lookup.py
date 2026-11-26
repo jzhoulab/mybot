@@ -819,6 +819,16 @@ class TrajectoryLookup:
         for adapter in get_source_adapters(self.source_names):
             sessions.extend(adapter.discover_sessions(max_files=self.max_files_per_tool))
         sessions.sort(key=lambda session: session.updated_at, reverse=True)
+        # One session can sit under two roots: hop moves a live conversation to
+        # another account (e.g. ~/.claude -> ~/.claude_fable), leaving the old
+        # transcript behind while the new one keeps growing. Both carry the same
+        # source_ref. Keep only the newest copy. Otherwise the index, which keys
+        # sessions by source_ref, kept whichever copy came last (the oldest) and
+        # never saw the conversation's newer turns.
+        newest: dict[str, NormalizedTrajectory] = {}
+        for session in sessions:
+            newest.setdefault(source_ref_for(session), session)
+        sessions = list(newest.values())
 
         with self._lock:
             self._sessions = sessions
