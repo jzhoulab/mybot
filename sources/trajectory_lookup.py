@@ -143,6 +143,30 @@ def query_tokens(query: str) -> list[str]:
     return tokens
 
 
+_PATH_SEPARATOR_RE = re.compile(r"[/:]+")
+_WORD_PIECE_RES = (re.compile(r"[a-z0-9_]{3,}"), re.compile(r"[a-z0-9]{3,}"))
+
+
+def text_tokens(text: str) -> list[str]:
+    """The words of a text as a query's words are matched against them: each
+    word as TOKEN_RE reads it, followed by its pieces when it is a path or a
+    joined name. The FTS index splits `orca-superres-1d2d/experiments`, so it
+    finds the chunk for a query of `1d2d`; checked against the whole word only,
+    that chunk was then thrown away as not containing the query's words."""
+    tokens: list[str] = []
+    for token in TOKEN_RE.findall((text or "").lower()):
+        tokens.append(token)
+        if token.isalnum():
+            continue
+        pieces = {token}
+        for piece in [*_PATH_SEPARATOR_RE.split(token), *(match for regex in _WORD_PIECE_RES for match in regex.findall(token))]:
+            piece = piece.strip(".-")
+            if len(piece) >= 3 and piece not in pieces:
+                pieces.add(piece)
+                tokens.append(piece)
+    return tokens
+
+
 def anchor_tokens(tokens: list[str]) -> set[str]:
     return {
         token
@@ -566,7 +590,7 @@ def snippets_for_query(text: str, query: str, *, limit: int = 3, width: int = 90
 
 def score_text(*, text: str, title: str, cwd: str, query: str, tokens: list[str], candidate_boost: float) -> tuple[float, str]:
     lowered = text.lower()
-    token_list = TOKEN_RE.findall(lowered)
+    token_list = text_tokens(lowered)
     haystack_tokens = Counter(token_list)
     title_lower = title.lower()
     cwd_lower = cwd.lower()

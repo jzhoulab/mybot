@@ -57,7 +57,9 @@ Read-only SQL over the cleaned, included-only index. Tables:
   typed (Claude Code, Codex, Antigravity) with ISO `ts` and project dir; FTS5
   `prompt_history_fts(text, cwd)`. Durable: it survives transcript deletion, so it
   places work in time and names the session (`source_name:session_id`) even when
-  `trajectory_chunks` has nothing. `trajectory-search` also returns `prompt_history` hits.
+  `trajectory_chunks` has nothing. `trajectory-search` also returns `prompt_history` hits;
+  one with `"transcript": false` has no readable transcript, so a read of it returns
+  only the prompts typed in that session.
   Messages other agents sent through hop sit there too, starting `[hop message`
   (search hits mark them `from_agent`). For only what the user typed, add
   `text NOT LIKE '[hop message%'`. Their prompts are short and often misspelled
@@ -78,6 +80,14 @@ Your text-tool equivalents run **inside** the query:
 - `json_extract(metadata_json, '$.key')` — jq over metadata
 - `GROUP BY` / `COUNT` — aggregation
 
+**Narrow with FTS first.** There are ~400k chunks: a `REGEXP` or `LIKE '%…%'`
+over all of `trajectory_chunks` runs into the 10 s limit ("SQL error:
+interrupted"). Pick the rows with the FTS index, then refine them:
+`WHERE id IN (SELECT rowid FROM trajectory_chunks_fts WHERE trajectory_chunks_fts MATCH '"p95 latency"') AND text REGEXP '…'`.
+FTS matches whole words, including the parts of paths and joined names
+(`"1d2d"` finds `orca-superres-1d2d/experiments`), not arbitrary substrings. A
+date window (`updated_at >= '2026-11-20'`) also narrows enough for a week or two.
+
 A row's `id` is the `--chunk-id` for `trajectory-read`, so SQL-find → read-context
 is one flow. Only `SELECT` runs (writes, `ATTACH`, multi-statement are refused;
 results are capped).
@@ -89,7 +99,7 @@ results are capped).
   values.
 - **Live numbers hide in command output.** Versions, quotas, job states,
   benchmark results were usually printed by a past command — hunt for the literal
-  line (`mybot sql -q "SELECT text FROM trajectory_chunks WHERE text LIKE '%p95 latency%' ORDER BY updated_at DESC LIMIT 3"`)
+  line (`mybot sql -q "SELECT text FROM trajectory_chunks WHERE id IN (SELECT rowid FROM trajectory_chunks_fts WHERE trajectory_chunks_fts MATCH '\"p95 latency\"') ORDER BY updated_at DESC LIMIT 3"`)
   before concluding there's no record.
 - **Find, then zoom.** Search or SQL to locate the session/chunk, then
   `trajectory-read` the exact window for full context rather than trusting a
@@ -127,10 +137,10 @@ mybot trajectory-read --source-ref "codex:019e…" --chunk-id 637926 -q "streami
 
 Enumerate + aggregate:
 ```
-mybot sql -q "SELECT source_name, substr(updated_at,1,7) AS month, COUNT(DISTINCT source_ref) AS sessions FROM trajectory_chunks WHERE text REGEXP 'deploy' GROUP BY 1,2 ORDER BY 2 DESC"
+mybot sql -q "SELECT source_name, substr(updated_at,1,7) AS month, COUNT(DISTINCT source_ref) AS sessions FROM trajectory_chunks WHERE id IN (SELECT rowid FROM trajectory_chunks_fts WHERE trajectory_chunks_fts MATCH 'deploy') GROUP BY 1,2 ORDER BY 2 DESC"
 ```
 
 Find a literal value with its date:
 ```
-mybot sql -q "SELECT substr(updated_at,1,10) AS day, regexp_extract(text,'p95 latency:? [0-9.]+ ?ms') AS p95 FROM trajectory_chunks WHERE text REGEXP 'p95 latency' ORDER BY updated_at DESC LIMIT 8"
+mybot sql -q "SELECT substr(updated_at,1,10) AS day, regexp_extract(text,'p95 latency:? [0-9.]+ ?ms') AS p95 FROM trajectory_chunks WHERE id IN (SELECT rowid FROM trajectory_chunks_fts WHERE trajectory_chunks_fts MATCH '\"p95 latency\"') ORDER BY updated_at DESC LIMIT 8"
 ```

@@ -35,6 +35,7 @@ from sources.trajectory_lookup import (
     render_events,
     snippet_around,
     snippets_for_query,
+    text_tokens,
     token_match_is_strong_enough,
 )
 
@@ -989,7 +990,12 @@ class TrajectoryChunkIndex:
         after: str = "",
         before: str = "",
         source: str = "",
+        intent_query: str = "",
     ) -> list[dict[str, Any]]:
+        """`intent_query` is what the user asked when `query` is a follow-up
+        built from it (a refinement or a planned query): what the user meant —
+        recency, asking about mybot itself — is read from the user's words, so
+        a follow-up made from a hit's title cannot switch those on."""
         mode = (mode or "hybrid").lower()
         eligible_ids = self._eligible_chunk_ids(after=after, before=before, source=source)
         if eligible_ids is not None and not eligible_ids:
@@ -1029,7 +1035,8 @@ class TrajectoryChunkIndex:
             ).fetchall()
 
         now = datetime.now(timezone.utc)
-        recency_intent = bool(RECENCY_INTENT_RE.search(query or ""))
+        intent = intent_query or query
+        recency_intent = bool(RECENCY_INTENT_RE.search(intent or ""))
         payloads: list[dict[str, Any]] = []
         chunk_texts: dict[int, str] = {}
         for row in rows:
@@ -1046,7 +1053,7 @@ class TrajectoryChunkIndex:
                 score = exact + vector
                 match_kind = "hybrid"
             score = self._adjust_score(
-                score, row=row, query=query, now=now, recency_intent=recency_intent
+                score, row=row, query=query, now=now, recency_intent=recency_intent, intent_query=intent
             )
             payload = self._row_to_payload(row, score=score, match_kind=match_kind)
             payload["metadata"]["exact_score"] = round(exact, 4)
@@ -1107,9 +1114,10 @@ class TrajectoryChunkIndex:
         query: str,
         now: datetime | None = None,
         recency_intent: bool = False,
+        intent_query: str = "",
     ) -> float:
         tokens = set(query_tokens(query))
-        title_tokens = set(TOKEN_RE.findall(str(row["title"] or "").lower()))
+        title_tokens = set(text_tokens(str(row["title"] or "")))
         title_hits = len(tokens & title_tokens)
         if title_hits:
             score += title_hits * 35.0
@@ -1119,7 +1127,7 @@ class TrajectoryChunkIndex:
         # genuinely fresh evidence deep in their chunk stream.
         if int(row["chunk_index"]) > 120 and title_hits == 0:
             score *= 0.8
-        if not SELF_ECHO_QUERY_EXEMPT_RE.search(query or ""):
+        if not SELF_ECHO_QUERY_EXEMPT_RE.search(intent_query or query or ""):
             body_lower = _chunk_body(str(row["text"] or "")).lower()
             if any(marker in body_lower for marker in SELF_ECHO_MARKERS):
                 score *= 0.35
@@ -1335,7 +1343,7 @@ class TrajectoryChunkIndex:
                     rowid = int(row["id"])
                     if rowid in exclude_ids:
                         continue
-                    token_list = TOKEN_RE.findall(str(row["text"] or "").lower())
+                    token_list = text_tokens(str(row["text"] or ""))
                     distinct = len(set(tokens) & set(token_list))
                     token_score = float(distinct * distinct * 3)
                     near_score = proximity_score(token_list, tokens)
@@ -1368,7 +1376,7 @@ class TrajectoryChunkIndex:
                     if rowid in exclude_ids:
                         continue
                     row_text = str(row["text"] or "").lower()
-                    row_tokens = set(TOKEN_RE.findall(row_text))
+                    row_tokens = set(text_tokens(row_text))
                     density = len(set(tokens) & row_tokens)
                     correction_bonus = 360.0 if any(marker in row_text for marker in CORRECTION_MARKERS) else 0.0
                     # Recency dominates: the current state of an entity is its most
@@ -1576,7 +1584,7 @@ class TrajectoryChunkIndex:
                     tokens = query_tokens(query)
                     for row in rows:
                         bm25_score = 50.0 / (1.0 + abs(float(row["rank"])))
-                        token_list = TOKEN_RE.findall(str(row["text"] or "").lower())
+                        token_list = text_tokens(str(row["text"] or ""))
                         matched = set(tokens) & set(token_list)
                         if not token_match_is_strong_enough(tokens, matched):
                             continue

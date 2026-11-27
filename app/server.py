@@ -2081,6 +2081,9 @@ class AppState:
         except Exception as exc:  # pragma: no cover - never let the side index break a turn
             log.warning("prompt history search failed: %s", exc)
             return []
+        return self.visible_prompt_hits(hits, viewer_id=viewer_id)
+
+    def visible_prompt_hits(self, hits: list[dict[str, Any]], *, viewer_id: str) -> list[dict[str, Any]]:
         if self.actor_is_owner(viewer_id):
             return hits
         return [
@@ -2092,6 +2095,28 @@ class AppState:
                     f"{hit.get('source_name')}:{hit.get('session_id')}",
                 ))
         ]
+
+    def missing_trajectory_payload(self, source_ref: str, *, viewer_id: str) -> dict[str, Any]:
+        """A 404 for a read. When the transcript is gone (deleted, compressed,
+        or written on another machine) the CLI's prompt log may still hold what
+        was typed in the session: hand that back instead of a bare not-found."""
+        payload: dict[str, Any] = {"ok": False, "error": "trajectory not found in allowed sources"}
+        source_name, _, session_id = source_ref.partition(":")
+        if not session_id:
+            return payload
+        try:
+            prompts = self.prompt_history.session_prompts(source_name, session_id)
+        except Exception as exc:  # pragma: no cover - never let the side index break a read
+            log.warning("prompt history lookup failed: %s", exc)
+            return payload
+        prompts = self.visible_prompt_hits(prompts, viewer_id=viewer_id)
+        if prompts:
+            payload["error"] = (
+                "no transcript of this session can be read here (deleted, compressed, or recorded on "
+                "another machine); prompt_history below is what was typed in it, from the CLI's prompt log"
+            )
+            payload["prompt_history"] = prompts
+        return payload
 
     def refresh_trajectory_chunk_index(self, *, include_vectors: bool = False) -> dict[str, Any]:
         result = self.trajectory_chunk_index.refresh_changed(
@@ -2922,6 +2947,7 @@ class AppState:
         after: str = "",
         before: str = "",
         source_filter: str = "",
+        intent_query: str = "",
     ) -> list[dict[str, Any]]:
         channel_limit = max(limit * 2, self.config.trajectory_search_limit, 8)
         after_key, before_key = date_filter_keys(after, before)
@@ -2958,6 +2984,7 @@ class AppState:
                     after=after,
                     before=before,
                     source=source_filter,
+                    intent_query=intent_query,
                 )
                 counts[f"index:{mode}"] = len(index_matches)
                 seconds[f"index:{mode}"] = round(time.monotonic() - channel_started, 2)
@@ -3323,6 +3350,7 @@ class AppState:
                     after=after,
                     before=before,
                     source_filter=source_filter,
+                    intent_query=query,
                 )
                 for match in step_matches:
                     merge_trajectory_source(combined_by_ref, match, query=query, channel=f"refine:{step_index}")
@@ -3389,6 +3417,7 @@ class AppState:
                         after=after,
                         before=before,
                         source_filter=source_filter,
+                        intent_query=query,
                     )
                     for match in step_matches:
                         merge_trajectory_source(
@@ -4207,7 +4236,10 @@ class AppState:
                 "search, use --after/--before. Your grep/sed/awk/jq equivalents live INSIDE "
                 "this sandbox: `text REGEXP '...'` (case-insensitive), `regexp_extract(text, pattern[, group])`, "
                 "`regexp_count(text, pattern)`, SQLite JSON1 (`json_extract(metadata_json,'$.key')`), plus "
-                "GROUP BY/COUNT for aggregation. A row's `id` works as `--chunk-id` in trajectory-read to "
+                "GROUP BY/COUNT for aggregation. There are ~400k chunks: a REGEXP or LIKE over all of "
+                "trajectory_chunks times out, so narrow with FTS first (`WHERE id IN (SELECT rowid FROM "
+                "trajectory_chunks_fts WHERE trajectory_chunks_fts MATCH '\"word\"') AND text REGEXP '...'`) "
+                "or with a date window. A row's `id` works as `--chunk-id` in trajectory-read to "
                 "pull full context around a SQL hit.\n"
                 f"- `{tool_command} budget` — your retrieval-time budget for THIS request (default 90s "
                 "across all searches; a per-request override may apply). It is a pacing default the "
@@ -4220,7 +4252,7 @@ class AppState:
                 "Be relentlessly proactive: dig with these until the answer is grounded in real evidence, "
                 "then say what's certain vs not (with dates for time-sensitive values). Live numbers "
                 "(balances, quotas, job states) usually ARE recorded in past command output — hunt for the "
-                "literal output line (e.g. text LIKE '%Current Balance%') before concluding there's no "
+                "literal output line (e.g. FTS MATCH '\"Current Balance\"') before concluding there's no "
                 "record. Don't touch raw session files directly.\n"
                 "Recall protocol — when asked what they did/asked/decided before:\n"
                 "1. Search FIRST, anchored to the asker's own words. Candidates you already hold from "
@@ -5471,7 +5503,15 @@ class ChatHandler(BaseHTTPRequestHandler):
             rows = cursor.fetchmany(limit + 1)
             columns = [desc[0] for desc in cursor.description] if cursor.description else []
         except (sqlite3.Error, sqlite3.Warning) as exc:
-            self.respond_json(400, {"ok": False, "error": f"SQL error: {exc}"})
+            error = f"SQL error: {exc}"
+            if "interrupted" in str(exc):
+                error += (
+                    f" (over {self.TRAJECTORY_SQL_TIMEOUT_SECONDS:.0f}s: a REGEXP or LIKE over every chunk is too slow."
+                    " Narrow with the FTS index first: WHERE id IN (SELECT rowid FROM trajectory_chunks_fts"
+                    " WHERE trajectory_chunks_fts MATCH '\"word\"') AND text REGEXP '...',"
+                    " or a date window, updated_at >= '<date>')"
+                )
+            self.respond_json(400, {"ok": False, "error": error})
             return
         finally:
             if conn is not None:
@@ -5611,7 +5651,7 @@ class ChatHandler(BaseHTTPRequestHandler):
                 )
                 return
             if window is None:
-                self.respond_json(404, {"ok": False, "error": "trajectory not found in allowed sources"})
+                self.respond_json(404, self.server.state.missing_trajectory_payload(source_ref, viewer_id=actor_id))
                 return
             if not self.server.state.source_allowed_by_visibility(window):
                 self.respond_json(403, {"ok": False, "error": "trajectory is hidden by visibility policy"})
@@ -5656,7 +5696,7 @@ class ChatHandler(BaseHTTPRequestHandler):
                 max_chars=max_chars,
             )
         if result is None:
-            self.respond_json(404, {"ok": False, "error": "trajectory not found in allowed sources"})
+            self.respond_json(404, self.server.state.missing_trajectory_payload(source_ref, viewer_id=actor_id))
             return
         if not self.server.state.source_allowed_by_visibility(result):
             self.respond_json(403, {"ok": False, "error": "trajectory is hidden by visibility policy"})

@@ -334,21 +334,59 @@ class PromptHistoryStore:
             if key in seen_text:
                 continue
             seen_text.add(key)
-            out.append(
-                {
-                    "source_type": "prompt_history",
-                    "source_name": str(row["source_name"]),
-                    "source_ref": f"{row['source_name']}:{row['session_id']}",
-                    "session_id": str(row["session_id"]),
-                    "ts": str(row["ts"]),
-                    "cwd": str(row["cwd"]),
-                    "text": normalize_text(str(row["text"]), 600),
-                    "from_agent": relayed_by_agent(str(row["text"])),
-                }
-            )
+            out.append(self._hit(row))
             if len(out) >= limit:
                 break
+        self._mark_transcripts(out)
         return out
+
+    def session_prompts(self, source_name: str, session_id: str, *, limit: int = 40) -> list[dict[str, Any]]:
+        """What was typed in one session, oldest first (the last `limit`)."""
+        with self._connect() as conn:
+            rows = conn.execute(
+                """
+                SELECT * FROM (
+                    SELECT id, source_name, session_id, ts, cwd, text FROM prompt_history
+                    WHERE source_name = ? AND session_id = ? ORDER BY ts DESC LIMIT ?
+                ) ORDER BY ts
+                """,
+                (source_name, session_id, limit),
+            ).fetchall()
+        return [self._hit(row) for row in rows]
+
+    @staticmethod
+    def _hit(row: sqlite3.Row) -> dict[str, Any]:
+        return {
+            "source_type": "prompt_history",
+            "source_name": str(row["source_name"]),
+            "source_ref": f"{row['source_name']}:{row['session_id']}",
+            "session_id": str(row["session_id"]),
+            "ts": str(row["ts"]),
+            "cwd": str(row["cwd"]),
+            "text": normalize_text(str(row["text"]), 600),
+            "from_agent": relayed_by_agent(str(row["text"])),
+        }
+
+    def _mark_transcripts(self, hits: list[dict[str, Any]]) -> None:
+        """Say on each hit whether its session's transcript is in the chunk
+        index (same database), so an agent does not try to read a session
+        whose file was deleted or never existed on this machine."""
+        refs = sorted({hit["source_ref"] for hit in hits})
+        if not refs:
+            return
+        try:
+            with self._connect() as conn:
+                indexed = {
+                    str(row[0])
+                    for row in conn.execute(
+                        f"SELECT DISTINCT source_ref FROM trajectory_chunks WHERE source_ref IN ({','.join('?' for _ in refs)})",
+                        refs,
+                    )
+                }
+        except sqlite3.OperationalError:  # no chunk index in this database
+            return
+        for hit in hits:
+            hit["transcript"] = hit["source_ref"] in indexed
 
     def stats(self) -> dict[str, Any]:
         with self._connect() as conn:
