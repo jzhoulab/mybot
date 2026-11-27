@@ -1210,26 +1210,27 @@ class ProviderClient:
             settings.update(json.loads(self._claude_sandbox_settings_json()))
         return ["--strict-mcp-config", "--setting-sources", "", "--settings", json.dumps(settings)]
 
-    def _run_claude(
-        self,
-        *,
-        system_prompt: str,
-        message: str,
-        model: str,
-        thinking: str,
-        ephemeral: bool,
-        tool_env: dict[str, str] | None,
-        on_event: Any = None,
-    ) -> dict[str, Any]:
-        # Claude has named effort levels (low/medium/high/xhigh/max) via --effort.
-        # The internal planner (ephemeral) runs tool-free + cheap; the user-facing
-        # answer gets restricted Bash to run mybot_tool + the configured effort.
-        effort = (self.config.claude_planner_thinking if ephemeral else thinking).strip().lower()
-        streaming = on_event is not None
+    def _claude_owner_args(self) -> list[str]:
+        """The owner asking where only they read the answer gets their own
+        Claude Code: their user settings (CLAUDE.md, auto-mode rules, allow
+        rules, MCP servers, claude.ai connectors), auto mode, and all of home
+        to work in. Two things stay off: their hooks (hop's session hooks and
+        notification sounds are for terminals they watch, not a headless run)
+        and auto-memory (notes from these runs would land in their memory)."""
+        settings = {"disableAllHooks": True, "autoMemoryEnabled": False}
+        return ["--setting-sources", "user", "--settings", json.dumps(settings), "--add-dir", str(Path.home())]
 
+    def claude_answer_cmd(
+        self, *, model: str, effort: str, system_prompt: str, ephemeral: bool, streaming: bool,
+        owner_mode: bool = False,
+    ) -> list[str]:
+        owner_mode = owner_mode and not ephemeral
         cmd = [self.config.claude_command, "-p", "--model", model,
-               "--permission-mode", "default"]
-        cmd.extend(self._claude_isolation_args(sandbox=(not ephemeral) and self.config.claude_bash_sandbox))
+               "--permission-mode", "auto" if owner_mode else "default"]
+        if owner_mode:
+            cmd.extend(self._claude_owner_args())
+        else:
+            cmd.extend(self._claude_isolation_args(sandbox=(not ephemeral) and self.config.claude_bash_sandbox))
         if streaming:
             cmd.extend(["--output-format", "stream-json", "--include-partial-messages", "--verbose"])
         else:
@@ -1248,7 +1249,8 @@ class ProviderClient:
         # (autoAllowBashIfSandboxed), and failIfUnavailable means we fail loud
         # rather than silently running Bash unsandboxed. The legacy fallback is
         # the strict single-prefix whitelist. Planner (ephemeral) gets no tools.
-        if not ephemeral:
+        # In owner mode, auto mode decides, as in the owner's own terminal.
+        if not ephemeral and not owner_mode:
             if self.config.claude_bash_sandbox:
                 cmd.extend(["--allowedTools", "Bash"])
             else:
@@ -1256,6 +1258,27 @@ class ProviderClient:
                 cmd.extend(["--allowedTools", f"Bash({tool_prefix}:*)"])
         # NOTE: prompt goes via stdin, NOT as a positional arg — the variadic
         # --allowedTools/--append flags would otherwise swallow it.
+        return cmd
+
+    def _run_claude(
+        self,
+        *,
+        system_prompt: str,
+        message: str,
+        model: str,
+        thinking: str,
+        ephemeral: bool,
+        tool_env: dict[str, str] | None,
+        on_event: Any = None,
+        owner_mode: bool = False,
+    ) -> dict[str, Any]:
+        # Claude has named effort levels (low/medium/high/xhigh/max) via --effort.
+        # The internal planner (ephemeral) runs tool-free + cheap; the user-facing
+        # answer gets restricted Bash to run mybot_tool + the configured effort.
+        effort = (self.config.claude_planner_thinking if ephemeral else thinking).strip().lower()
+        streaming = on_event is not None
+        cmd = self.claude_answer_cmd(model=model, effort=effort, system_prompt=system_prompt,
+                                     ephemeral=ephemeral, streaming=streaming, owner_mode=owner_mode)
 
         env = agent_subprocess_env(tool_env)
 
@@ -1630,6 +1653,7 @@ class ProviderClient:
         ephemeral: bool = False,
         tool_env: dict[str, str] | None = None,
         on_event: Any = None,
+        owner_mode: bool = False,
     ) -> dict[str, Any]:
         active = self.active_model()
         if active["backend"] == "claude_cli":
@@ -1644,6 +1668,7 @@ class ProviderClient:
                 ephemeral=ephemeral,
                 tool_env=tool_env,
                 on_event=on_event,
+                owner_mode=owner_mode,
             )
 
         if active["backend"] == "codex_cli":
@@ -1696,6 +1721,7 @@ class ProviderClient:
         temperature: float | None = None,
         tool_env: dict[str, str] | None = None,
         on_event: Any = None,
+        owner_mode: bool = False,
     ) -> dict[str, Any]:
         return self.complete(
             system_prompt=system_prompt,
@@ -1707,6 +1733,7 @@ class ProviderClient:
             ephemeral=False,
             tool_env=tool_env,
             on_event=on_event,
+            owner_mode=owner_mode,
         )
 
     def summarize_conversation(self, *, existing_summary: str, new_messages: list[dict[str, Any]]) -> str:
@@ -3987,6 +4014,36 @@ class AppState:
             policy.update(overrides[mode])
         return policy
 
+    def owner_full_access(self, *, actor_id: str, channel_kind: str) -> bool:
+        """The owner, asking where only they read the answer (their own
+        clients, email carrying their domain's DKIM signature, a DM from their
+        account), gets an answer agent with the reach of their own Claude Code.
+        A group channel never does: others read the answer there. Off with
+        MYBOT_OWNER_FULL_ACCESS=0; Claude backend only (the others keep the
+        sandbox)."""
+        if os.environ.get("MYBOT_OWNER_FULL_ACCESS", "1").strip().lower() in {"0", "false", "no", "off"}:
+            return False
+        if channel_kind == "group" or not self.actor_is_owner(actor_id):
+            return False
+        return self.provider.active_model()["backend"] == "claude_cli"
+
+    def owner_mode_section(self) -> str:
+        owner_name = self.owner_name() or "the owner"
+        return (
+            "## Owner Mode\n"
+            f"This is {owner_name} asking where only they read the answer (their own app, email they "
+            "signed, or a direct message from their account). Work as their own Claude Code would. The "
+            "limits meant for teammates don't apply: their grants and reviews, personal matters and any "
+            "of their files are fine to read and discuss with them. You can read anywhere under their "
+            "home (Downloads, ~/Code, cloud drives under ~/Library/CloudStorage such as Box-Box), run "
+            "commands and use the web; auto mode blocks risky actions as it does in their terminal. "
+            "They can't answer you mid-turn, so take no irreversible or outward-facing step on your own "
+            "(sending messages or email, pushing code, deleting or overwriting their files, submitting "
+            "jobs, changing shared settings): do the reading and preparation, say exactly what you would "
+            "do, and do it once they confirm in a reply. Write anything you produce for them to a new "
+            "file and give its path."
+        )
+
     @staticmethod
     def conduct_mode(channel_kind: str) -> str:
         # Bridges always tag requests with a channel kind (dm/group); the
@@ -4122,6 +4179,7 @@ class AppState:
         thread_context: str = "",
         carry_forward: str = "",
         viewer_id: str | None = None,
+        owner_mode: bool = False,
     ) -> tuple[str, list[dict[str, Any]], bool]:
         # viewer_id: whose visibility rules apply to what goes into the answer.
         # It differs from actor_id when the owner asks in a shared channel.
@@ -4151,7 +4209,7 @@ class AppState:
                 thread_context=thread_context,
             )
         )
-        conduct = self.conduct_section(self.conduct_mode(channel_kind))
+        conduct = self.owner_mode_section() if owner_mode else self.conduct_section(self.conduct_mode(channel_kind))
         if conduct:
             sections.append(conduct)
 
@@ -4212,9 +4270,15 @@ class AppState:
             tool_command = f"{shlex.quote(self.config.mybot_tool_python)} {shlex.quote(self.config.mybot_tool_path)}"
             sections.append(
                 "## Local Tools\n"
-                "Your shell runs in a read-restricted sandbox (no secrets, no raw session files, "
-                "localhost-only network). The mybot tool below is your data source (actor + scope "
-                "preset via env vars); you may compose its output with standard text tools — "
+                + (
+                    "The mybot tool below is your index of the owner's past sessions (actor + scope "
+                    "preset via env vars); search it before their raw session files. You may compose its "
+                    "output with standard text tools — "
+                    if owner_mode else
+                    "Your shell runs in a read-restricted sandbox (no secrets, no raw session files, "
+                    "localhost-only network). The mybot tool below is your data source (actor + scope "
+                    "preset via env vars); you may compose its output with standard text tools — "
+                ) +
                 "grep, sed, awk, jq, sort, uniq, pipes — when that's sharper than SQL:\n"
                 f"- `{tool_command}` — memory-search, trajectory-search, trajectory-read, trajectory-stats "
                 "(semantic/fuzzy search + focused evidence reads). trajectory-search takes --after/--before "
@@ -4959,6 +5023,7 @@ class ChatHandler(BaseHTTPRequestHandler):
             history_for_model.append({"role": entry.get("role", "user"), "content": text})
         history_for_model.reverse()
 
+        owner_mode = self.server.state.owner_full_access(actor_id=actor_id, channel_kind=channel_kind)
         try:
             system_prompt, memory_sources, session_summary_used = self.server.state.build_system_prompt(
                 query=message,
@@ -4974,6 +5039,7 @@ class ChatHandler(BaseHTTPRequestHandler):
                 thread_context=str(body.get("thread_context") or "")[:8000],
                 carry_forward=carry_forward if not summary_text else "",
                 viewer_id=viewer_id,
+                owner_mode=owner_mode,
             )
         except ValueError as exc:
             return None, (400, str(exc))
@@ -5011,6 +5077,7 @@ class ChatHandler(BaseHTTPRequestHandler):
             "summary_text": summary_text, "summary_state": summary_state,
             "compacted_message_count": compacted_message_count,
             "retrieval_budget_log_path": retrieval_budget_log_path, "tool_env": tool_env,
+            "owner_mode": owner_mode,
         }, None
 
     def _chat_persist(self, body, ctx, provider_result, answer, retrieval_budgets) -> dict[str, Any]:
@@ -5137,14 +5204,14 @@ class ChatHandler(BaseHTTPRequestHandler):
         if err:
             self.respond_json(err[0], {"ok": False, "error": err[1]})
             return
-        log.info("chat start user=%s session=%s msg_chars=%d",
-                 ctx["user"], ctx["session_key"], len(ctx["message"]))
+        log.info("chat start user=%s session=%s msg_chars=%d owner_mode=%s",
+                 ctx["user"], ctx["session_key"], len(ctx["message"]), ctx["owner_mode"])
         try:
             provider_result = self.server.state.provider.chat(
                 system_prompt=ctx["system_prompt"], history=ctx["history_for_model"],
                 message=ctx["message"],
                 backend_session_id=(self.server.state.sessions.get_backend_state(ctx["session_key"]) or {}).get("backend_session_id"),
-                tool_env=ctx["tool_env"],
+                tool_env=ctx["tool_env"], owner_mode=ctx["owner_mode"],
             )
         except RuntimeError as exc:
             log.warning("chat provider failed user=%s: %s", ctx["user"], exc)
@@ -5165,7 +5232,7 @@ class ChatHandler(BaseHTTPRequestHandler):
         if err:
             self.respond_json(err[0], {"ok": False, "error": err[1]})
             return
-        log.info("chat stream start user=%s session=%s", ctx["user"], ctx["session_key"])
+        log.info("chat stream start user=%s session=%s owner_mode=%s", ctx["user"], ctx["session_key"], ctx["owner_mode"])
 
         self.send_response(200)
         self.send_header("Content-Type", "text/event-stream")
@@ -5186,7 +5253,7 @@ class ChatHandler(BaseHTTPRequestHandler):
                 message=ctx["message"],
                 backend_session_id=(self.server.state.sessions.get_backend_state(ctx["session_key"]) or {}).get("backend_session_id"),
                 tool_env=ctx["tool_env"],
-                on_event=emit,
+                on_event=emit, owner_mode=ctx["owner_mode"],
             )
         except _ClientGone:
             log.info("chat stream: client disconnected user=%s", ctx["user"])

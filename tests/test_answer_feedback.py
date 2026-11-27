@@ -79,7 +79,7 @@ class ServerFeedbackTurnTest(unittest.TestCase):
         state = SimpleNamespace(
             sessions=self.sessions, config=config, feedback=fb.FeedbackStore(self.tmp.name),
             actor_is_owner=lambda actor: False, build_system_prompt=build_system_prompt,
-            tool_env_for_request=lambda **kw: {},
+            tool_env_for_request=lambda **kw: {}, owner_full_access=lambda **kw: False,
         )
         self.handler = SimpleNamespace(server=SimpleNamespace(state=state))
         self.state = state
