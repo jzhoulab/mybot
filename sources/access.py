@@ -446,7 +446,79 @@ def _coerce_accounts(source_name: str, raw: Any) -> list[TrajectoryAccessAccount
     return accounts or default_access_config().sources[source_name]
 
 
+def _merged(accounts: list[TrajectoryAccessAccount], field_name: str, first: list[str]) -> list[str]:
+    values = list(first)
+    for account in accounts:
+        for value in getattr(account, field_name):
+            if value not in values:
+                values.append(value)
+    return values
+
+
+def with_sibling_claude_homes(accounts: list[TrajectoryAccessAccount]) -> list[TrajectoryAccessAccount]:
+    """Add every Claude CLI home that sits next to a configured one.
+
+    hop moves a live conversation to another account when one hits a usage
+    limit, and each account is its own CLI home (~/.claude, ~/.claude2,
+    ~/.claude_fable, ~/.claude_gpta, ...). A home missing from the config meant
+    every turn after the move went unindexed and the session looked frozen at
+    its last move. A discovered home follows the default root's policy and adds
+    every configured Claude root's exclusions and owner-only workdirs, so
+    nothing excluded or private elsewhere becomes visible. It keeps plain session
+    ids because a second home holds the same conversations under the same ids.
+    A home listed in the config, enabled or not, is left as configured.
+    MYBOT_DISCOVER_CLAUDE_HOMES=0 turns this off."""
+    if os.environ.get("MYBOT_DISCOVER_CLAUDE_HOMES", "1").strip().lower() in ("0", "false", "no", "off"):
+        return accounts
+    configured = {os.path.realpath(account.expanded_base_dir) for account in accounts}
+    parents: list[Path] = []
+    for account in accounts:
+        base = Path(account.expanded_base_dir)
+        if base.name == "projects" and base.parent.name.startswith(".claude") and base.parent.parent not in parents:
+            parents.append(base.parent.parent)
+    if not parents:
+        return accounts
+    default_dir = expand_path(DEFAULT_BASE_DIRS["claude"])
+    template = next((a for a in accounts if a.expanded_base_dir == default_dir), accounts[0])
+    names = {account.name for account in accounts}
+    home = str(Path.home())
+    added: list[TrajectoryAccessAccount] = []
+    for parent in parents:
+        for projects in sorted(parent.glob(".claude*/projects")):
+            if not projects.is_dir() or os.path.realpath(projects) in configured:
+                continue
+            configured.add(os.path.realpath(projects))
+            label = projects.parent.name[len(".claude"):].strip("_-.") or projects.parent.name.lstrip(".")
+            name = label if label not in names else projects.parent.name.lstrip(".")
+            names.add(name)
+            base_dir = str(projects)
+            if base_dir.startswith(home + os.sep):
+                base_dir = "~" + base_dir[len(home):]
+            added.append(dataclasses.replace(
+                template,
+                name=name,
+                base_dir=base_dir,
+                enabled=True,
+                scope_session_ids=False,
+                excluded_workdirs=_merged(accounts, "excluded_workdirs", template.excluded_workdirs),
+                excluded_workdir_classes=_merged(accounts, "excluded_workdir_classes", template.excluded_workdir_classes),
+                excluded_entrypoints=_merged(accounts, "excluded_entrypoints", template.excluded_entrypoints),
+                excluded_session_ids=_merged(accounts, "excluded_session_ids", template.excluded_session_ids),
+                excluded_origin_details=_merged(accounts, "excluded_origin_details", template.excluded_origin_details),
+                private_workdirs=_merged(accounts, "private_workdirs", template.private_workdirs),
+                private_workdir_classes=_merged(accounts, "private_workdir_classes", template.private_workdir_classes),
+                exclude_automated=any(account.exclude_automated for account in accounts),
+            ))
+    return accounts + added
+
+
 def load_access_config(path: str | os.PathLike[str] | None = None) -> TrajectoryAccessConfig:
+    config = _load_access_config(path)
+    config.sources["claude"] = with_sibling_claude_homes(config.sources.get("claude") or [])
+    return config
+
+
+def _load_access_config(path: str | os.PathLike[str] | None = None) -> TrajectoryAccessConfig:
     if path is None:
         config_path = default_config_path()
     else:
