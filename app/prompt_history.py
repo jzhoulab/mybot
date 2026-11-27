@@ -53,6 +53,15 @@ def _text_hash(text: str) -> str:
     return hashlib.sha1(text.encode("utf-8", errors="replace")).hexdigest()[:16]
 
 
+AGENT_RELAY_PREFIXES = ("[hop message",)
+
+
+def relayed_by_agent(text: str) -> bool:
+    """hop delivers other agents' messages by typing them into the terminal, so
+    they land in the CLI's prompt log beside what the owner typed."""
+    return text.lstrip().startswith(AGENT_RELAY_PREFIXES)
+
+
 class PromptHistoryStore:
     def __init__(self, db_path: str) -> None:
         self.db_path = db_path
@@ -311,10 +320,11 @@ class PromptHistoryStore:
             rows = run(" OR ".join(quoted), limit * 12)
         lowered_tokens = [t.lower().replace('""', '"') for t in tokens]
 
-        def score(row: sqlite3.Row) -> tuple[int, float, str]:
+        def score(row: sqlite3.Row) -> tuple[int, bool, float]:
             text = f"{row['text']} {row['cwd']}".lower()
             hits = sum(1 for t in lowered_tokens if t in text)
-            return (-hits, float(row["rank"]), "")
+            # On a tie, the owner's own words come before an agent's relayed message.
+            return (-hits, relayed_by_agent(str(row["text"])), float(row["rank"]))
 
         ranked = sorted(rows, key=score)
         out: list[dict[str, Any]] = []
@@ -333,6 +343,7 @@ class PromptHistoryStore:
                     "ts": str(row["ts"]),
                     "cwd": str(row["cwd"]),
                     "text": normalize_text(str(row["text"]), 600),
+                    "from_agent": relayed_by_agent(str(row["text"])),
                 }
             )
             if len(out) >= limit:

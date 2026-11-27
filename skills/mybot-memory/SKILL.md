@@ -58,6 +58,11 @@ Read-only SQL over the cleaned, included-only index. Tables:
   `prompt_history_fts(text, cwd)`. Durable: it survives transcript deletion, so it
   places work in time and names the session (`source_name:session_id`) even when
   `trajectory_chunks` has nothing. `trajectory-search` also returns `prompt_history` hits.
+  Messages other agents sent through hop sit there too, starting `[hop message`
+  (search hits mark them `from_agent`). For only what the user typed, add
+  `text NOT LIKE '[hop message%'`. Their prompts are short and often misspelled
+  ("roght now only randi option is open"), so search them with a few plain key
+  terms, not a paraphrase of the decision.
 
 **Column types:** `updated_at` is the ISO timestamp and the ONLY date column —
 filter/sort time with it (`WHERE updated_at >= '2026-07-06'`, `ORDER BY
