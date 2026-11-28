@@ -1161,6 +1161,9 @@ class ProviderClient:
         elif backend == "codex_cli":
             model = str(override.get("model") or self.config.model_name or codex_default_model())
             thinking = str(override.get("thinking") or self.config.codex_reasoning_effort)
+        elif backend == "antigravity_cli":
+            model = str(override.get("model") or "gemini-4-neon")
+            thinking = str(override.get("thinking") or "high")
         else:
             model = str(override.get("model") or self.config.model_name or "")
             thinking = str(override.get("thinking") or "")
@@ -1586,15 +1589,19 @@ class ProviderClient:
         effort: str = "",
         cwd: str | None = None,
         timeout: int | None = None,
+        add_dirs: list[str] | None = None,
     ) -> dict[str, Any]:
-        """One headless `agy -p` turn, for the owner's own pulse only. agy's
-        built-in tools (browser, scheduling, subagents) can't be turned off
-        and its terminal sandbox blocks localhost (the mybot tool) while still
-        reading the home folder, so it runs unsandboxed and must never answer
-        teammates. The conversation it leaves in agy's history is removed."""
+        """One headless `agy -p` turn, for the owner only: their pulse, and
+        their own questions in owner mode. agy's built-in tools (browser,
+        scheduling, subagents) can't be turned off and its terminal sandbox
+        blocks localhost (the mybot tool) while still reading the home folder,
+        so it runs unsandboxed and must never answer teammates. The
+        conversation it leaves in agy's history is removed."""
         command = os.environ.get("ANTIGRAVITY_COMMAND") or shutil.which("agy") or "agy"
         cmd = [command, "--dangerously-skip-permissions", "--output-format", "json",
                "--disable-slash-commands"]
+        for directory in add_dirs or ():
+            cmd.extend(["--add-dir", directory])
         if model:
             cmd.extend(["--model", model])
         if effort:
@@ -1669,6 +1676,24 @@ class ProviderClient:
                 tool_env=tool_env,
                 on_event=on_event,
                 owner_mode=owner_mode,
+            )
+
+        if active["backend"] == "antigravity_cli":
+            if owner_mode and not ephemeral:
+                # agy has no separate system prompt in print mode.
+                prompt = self._build_codex_prompt(system_prompt=system_prompt, history=history, message=message)
+                return self.run_antigravity_task(
+                    prompt=prompt, tool_env=tool_env, model=active["model"], effort=active["thinking"],
+                    cwd=self.config.codex_cwd, add_dirs=[str(Path.home())],
+                )
+            # agy can't be sandboxed, so everyone else (teammates, group
+            # channels, background jobs, the search planner) keeps the
+            # sandboxed Claude agent on the startup Claude model.
+            user_prompt = self._build_codex_prompt(system_prompt="", history=history, message=message)
+            return self._run_claude(
+                system_prompt=system_prompt, message=user_prompt, model=self.config.claude_model,
+                thinking=self.config.claude_thinking, ephemeral=ephemeral, tool_env=tool_env,
+                on_event=on_event,
             )
 
         if active["backend"] == "codex_cli":
@@ -4019,24 +4044,30 @@ class AppState:
         clients, email carrying their domain's DKIM signature, a DM from their
         account), gets an answer agent with the reach of their own Claude Code.
         A group channel never does: others read the answer there. Off with
-        MYBOT_OWNER_FULL_ACCESS=0; Claude backend only (the others keep the
-        sandbox)."""
+        MYBOT_OWNER_FULL_ACCESS=0; Claude and Antigravity (Gemini) backends
+        only (the others keep the sandbox)."""
         if os.environ.get("MYBOT_OWNER_FULL_ACCESS", "1").strip().lower() in {"0", "false", "no", "off"}:
             return False
         if channel_kind == "group" or not self.actor_is_owner(actor_id):
             return False
-        return self.provider.active_model()["backend"] == "claude_cli"
+        return self.provider.active_model()["backend"] in {"claude_cli", "antigravity_cli"}
 
     def owner_mode_section(self) -> str:
         owner_name = self.owner_name() or "the owner"
+        # Claude runs in auto mode, which screens risky actions; agy has no
+        # such check, so the agent's own care is the only guard.
+        guard = ("auto mode blocks risky actions as it does in their terminal"
+                 if self.provider.active_model()["backend"] == "claude_cli"
+                 else "nothing screens your commands, so check each one yourself")
         return (
             "## Owner Mode\n"
             f"This is {owner_name} asking where only they read the answer (their own app, email they "
-            "signed, or a direct message from their account). Work as their own Claude Code would. The "
+            "signed, or a direct message from their account). Work as their own agent in their terminal "
+            "would. The "
             "limits meant for teammates don't apply: their grants and reviews, personal matters and any "
             "of their files are fine to read and discuss with them. You can read anywhere under their "
             "home (Downloads, ~/Code, cloud drives under ~/Library/CloudStorage such as Box-Box), run "
-            "commands and use the web; auto mode blocks risky actions as it does in their terminal. "
+            f"commands and use the web; {guard}. "
             "They can't answer you mid-turn, so take no irreversible or outward-facing step on your own "
             "(sending messages or email, pushing code, deleting or overwriting their files, submitting "
             "jobs, changing shared settings): do the reading and preparation, say exactly what you would "

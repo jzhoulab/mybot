@@ -37,6 +37,46 @@ class OwnerFullAccessTest(unittest.TestCase):
             self.assertFalse(AppState.owner_full_access(state(), actor_id="owner", channel_kind="dm"))
         with patch.dict(os.environ, {"MYBOT_OWNER_FULL_ACCESS": "1"}):
             self.assertFalse(AppState.owner_full_access(state("codex_cli"), actor_id="owner", channel_kind="dm"))
+            self.assertTrue(AppState.owner_full_access(state("antigravity_cli"), actor_id="owner", channel_kind="dm"))
+            self.assertFalse(AppState.owner_full_access(state("antigravity_cli"), actor_id="owner",
+                                                        channel_kind="group"))
+
+
+class GeminiEngineTest(unittest.TestCase):
+    """With Gemini (agy) as the engine, only the owner's own questions reach
+    it: agy can't be sandboxed, so everyone else keeps the sandboxed Claude."""
+
+    def provider(self) -> SimpleNamespace:
+        calls: list[tuple[str, dict]] = []
+        fake = SimpleNamespace(
+            calls=calls,
+            config=SimpleNamespace(codex_cwd="/rt", claude_model="opus", claude_thinking="xhigh"),
+            active_model=lambda: {"backend": "antigravity_cli", "model": "gemini-4-neon", "thinking": "xhigh"},
+            run_antigravity_task=lambda **kw: calls.append(("agy", kw)) or {"text": "gemini"},
+            _run_claude=lambda **kw: calls.append(("claude", kw)) or {"text": "claude"},
+        )
+        fake._build_codex_prompt = types.MethodType(ProviderClient._build_codex_prompt, fake)
+        return fake
+
+    def ask(self, **kwargs) -> tuple[str, dict]:
+        fake = self.provider()
+        ProviderClient.complete(fake, system_prompt="sys", history=[], message="hi", **kwargs)
+        return fake.calls[0]
+
+    def test_the_owner_gets_gemini_with_their_home(self) -> None:
+        engine, call = self.ask(owner_mode=True)
+        self.assertEqual(engine, "agy")
+        self.assertEqual((call["model"], call["effort"]), ("gemini-4-neon", "xhigh"))
+        self.assertEqual(call["add_dirs"], [os.path.expanduser("~")])
+        self.assertIn("sys", call["prompt"])
+        self.assertIn("hi", call["prompt"])
+
+    def test_everyone_else_and_background_calls_keep_sandboxed_claude(self) -> None:
+        for kwargs in ({}, {"owner_mode": True, "ephemeral": True}):
+            engine, call = self.ask(**kwargs)
+            self.assertEqual(engine, "claude")
+            self.assertEqual((call["model"], call["thinking"]), ("opus", "xhigh"))
+            self.assertNotIn("owner_mode", call)
 
 
 class ClaudeCommandTest(unittest.TestCase):
@@ -80,11 +120,14 @@ class ClaudeCommandTest(unittest.TestCase):
 
 class OwnerModePromptTest(unittest.TestCase):
     def test_owner_mode_drops_the_teammate_limits(self) -> None:
-        fake = SimpleNamespace(owner_name=lambda: "Jian")
-        section = AppState.owner_mode_section(fake)
-        self.assertIn("grants and reviews", section)
-        self.assertIn("Box-Box", section)
-        self.assertIn("confirm", section)
+        for backend, guard in (("claude_cli", "auto mode"), ("antigravity_cli", "nothing screens")):
+            fake = SimpleNamespace(owner_name=lambda: "Jian", provider=SimpleNamespace(
+                active_model=lambda backend=backend: {"backend": backend}))
+            section = AppState.owner_mode_section(fake)
+            self.assertIn("grants and reviews", section)
+            self.assertIn("Box-Box", section)
+            self.assertIn("confirm", section)
+            self.assertIn(guard, section)
 
 
 if __name__ == "__main__":

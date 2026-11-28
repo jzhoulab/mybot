@@ -679,7 +679,10 @@ struct ContentView: View {
         var order: [String] = []
         var groups: [String: [ModelPreset]] = [:]
         for p in model.modelPresets {
-            let key = "\(p.family == "claude" ? "Claude" : "Codex") \(p.model.capitalized)"
+            // Gemini models already carry their name ("gemini-4-neon"); the label has it spelled out.
+            let key = p.family == "antigravity"
+                ? String(p.label.split(separator: "·").first ?? "").trimmingCharacters(in: .whitespaces)
+                : "\(p.family == "claude" ? "Claude" : "Codex") \(p.model.capitalized)"
             if groups[key] == nil { order.append(key) }
             groups[key, default: []].append(p)
         }

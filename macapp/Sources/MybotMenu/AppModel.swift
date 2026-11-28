@@ -703,7 +703,7 @@ final class AppModel: ObservableObject {
                 guard let id = p["id"] as? String, let label = p["label"] as? String,
                       let backend = p["backend"] as? String else { return nil }
                 return ModelPreset(id: id, label: label,
-                                   family: backend == "claude_cli" ? "claude" : "codex",
+                                   family: ["claude_cli": "claude", "antigravity_cli": "antigravity"][backend] ?? "codex",
                                    model: (p["model"] as? String) ?? "",
                                    thinking: (p["thinking"] as? String) ?? "")
             }

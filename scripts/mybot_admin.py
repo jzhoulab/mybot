@@ -878,17 +878,51 @@ def _discover_codex() -> dict[str, Any] | None:
             "model_labels": {m["slug"]: m["label"] for m in catalog}}
 
 
+def _discover_antigravity() -> dict[str, Any] | None:
+    """Gemini models from `agy models`, whose ids carry the effort
+    ("gemini-4-neon-high"); split into model + effort. Only Gemini: agy's
+    Claude and GPT entries duplicate the other backends."""
+    cmd = os.environ.get("ANTIGRAVITY_COMMAND") or shutil.which("agy")
+    if not cmd:
+        return None
+    try:
+        out = subprocess.run([cmd, "models"], capture_output=True, text=True, timeout=20).stdout
+    except (OSError, subprocess.SubprocessError):
+        return None
+    model_efforts: dict[str, list[str]] = {}
+    model_labels: dict[str, str] = {}
+    for line in out.splitlines():
+        slug, _, label = line.partition("\t")
+        match = re.fullmatch(r"(gemini-[a-z0-9.-]+?)-(low|medium|high|xhigh|max)", slug.strip())
+        if not match:
+            continue
+        model, effort = match.groups()
+        model_efforts.setdefault(model, []).append(effort)
+        model_labels[model] = re.sub(r"\s*\([^)]*\)$", "", label.strip()) or model
+    if not model_efforts:
+        return None
+    order = ["low", "medium", "high", "xhigh", "max"]
+    for efforts in model_efforts.values():
+        efforts.sort(key=order.index)
+    return {"backend": "antigravity_cli", "command": cmd, "models": list(model_efforts),
+            "efforts": ["high"], "model_efforts": model_efforts, "model_labels": model_labels}
+
+
 def _capabilities() -> dict[str, Any]:
-    backends = [b for b in (_discover_claude(), _discover_codex()) if b]
+    backends = [b for b in (_discover_claude(), _discover_codex(), _discover_antigravity()) if b]
     return {"backends": backends}
 
 
+PRESET_FAMILIES = {"claude_cli": "claude", "codex_cli": "codex", "antigravity_cli": "antigravity"}
+
+
 def _preset_id(backend: str, model: str, effort: str) -> str:
-    fam = "claude" if backend == "claude_cli" else "codex"
-    return f"{fam}:{model}:{effort}"
+    return f"{PRESET_FAMILIES.get(backend, 'codex')}:{model}:{effort}"
 
 
 def _label_for(backend: str, model: str, effort: str) -> str:
+    if backend == "antigravity_cli":
+        return f"{model} · {effort}"
     fam = "Claude" if backend == "claude_cli" else "Codex"
     name = model.capitalize() if backend == "claude_cli" else model
     return f"{fam} {name} · {effort}"
@@ -935,8 +969,9 @@ def cmd_model(args: argparse.Namespace) -> dict[str, Any]:
         if not preset:
             # accept a raw "backend:model:effort" id even if discovery is stale
             parts = args.preset.split(":")
-            if len(parts) == 3 and parts[0] in ("claude", "codex"):
-                backend = "claude_cli" if parts[0] == "claude" else "codex_cli"
+            backends = {family: backend for backend, family in PRESET_FAMILIES.items()}
+            if len(parts) == 3 and parts[0] in backends:
+                backend = backends[parts[0]]
                 preset = {"id": args.preset, "backend": backend,
                           "model": parts[1], "thinking": parts[2]}
             else:
