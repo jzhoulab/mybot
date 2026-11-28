@@ -1903,6 +1903,13 @@ def forget_antigravity_conversation(conversation_id: str, home: Path | None = No
     shutil.rmtree(root / "brain" / conversation_id, ignore_errors=True)
 
 
+def answered_by(provider_result: dict[str, Any], configured_backend: str) -> str:
+    """The CLI backend that produced an answer (its provider_style), else the
+    configured backend (an OpenAI-compatible API reports its API style)."""
+    style = str(provider_result.get("provider_style") or "")
+    return style if style.endswith("_cli") else configured_backend
+
+
 def agent_subprocess_env(tool_env: dict[str, str] | None = None) -> dict[str, str]:
     extra = {
         name.strip()
@@ -5217,7 +5224,9 @@ class ChatHandler(BaseHTTPRequestHandler):
             "ok": True,
             "session_key": ctx.get("logical_key") or session_key,
             "text": answer,
-            "provider_backend": self.server.state.config.provider_backend,
+            # The engine that answered: with Gemini selected, teammates are
+            # still answered by Claude, and the startup config names neither.
+            "provider_backend": answered_by(provider_result, self.server.state.config.provider_backend),
             "backend_session_id": backend_session_id,
             "memory_scope_used": memory_scope,
             "session_summary_used": session_summary_used,

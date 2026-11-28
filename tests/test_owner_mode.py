@@ -71,6 +71,13 @@ class GeminiEngineTest(unittest.TestCase):
         self.assertIn("sys", call["prompt"])
         self.assertIn("hi", call["prompt"])
 
+    def test_the_reply_names_the_engine_that_answered(self) -> None:
+        from app.server import answered_by
+
+        self.assertEqual(answered_by({"provider_style": "antigravity_cli"}, "claude_cli"), "antigravity_cli")
+        self.assertEqual(answered_by({"provider_style": "chat_completions"}, "openai_compatible"),
+                         "openai_compatible")
+
     def test_everyone_else_and_background_calls_keep_sandboxed_claude(self) -> None:
         for kwargs in ({}, {"owner_mode": True, "ephemeral": True}):
             engine, call = self.ask(**kwargs)
